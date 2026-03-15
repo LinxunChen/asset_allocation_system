@@ -1,0 +1,39 @@
+{
+  "replay_path": "../tests/fixtures/events.jsonl",
+  "days": 14,
+  "limit": 10,
+  "recommendation": {
+    "weights": {
+      "alerts_sent": 4.0,
+      "cards_generated": 2.0,
+      "events_processed": 1.0,
+      "strictness": 0.75,
+      "priority_proximity": 0.25,
+      "failures": 3.0
+    }
+  },
+  "experiments": [
+    {
+      "name": "baseline",
+      "note": "default thresholds",
+      "overrides": {
+        "event_score_threshold": 60.0,
+        "swing_market_score_threshold": 55.0,
+        "position_market_score_threshold": 55.0,
+        "swing_priority_threshold": 75.0,
+        "position_priority_threshold": 75.0
+      }
+    },
+    {
+      "name": "tuned",
+      "note": "stricter confirmation",
+      "overrides": {
+        "event_score_threshold": 65.0,
+        "swing_market_score_threshold": 58.0,
+        "position_market_score_threshold": 60.0,
+        "swing_priority_threshold": 78.0,
+        "position_priority_threshold": 80.0
+      }
+    }
+  ]
+}

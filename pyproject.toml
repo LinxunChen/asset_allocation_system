@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "satellite-agent"
+version = "0.1.0"
+description = "Event-driven satellite portfolio opportunity agent."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "Codex" }]
+dependencies = []
+
+[project.optional-dependencies]
+dev = []
+
+[project.scripts]
+satellite-agent = "satellite_agent.main:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,137 @@
+{
+  "_meta": {
+    "description": "更易维护的观察池模板。推荐只维护 stock_groups 和 etf_groups，程序会自动拍平成实际 watchlist。",
+    "how_to_use": [
+      "复制为 config/agent.json。",
+      "按分组增删标的，不需要手动维护第二份平铺列表。",
+      "修改完成后执行 satellite-agent sync-watchlist，让数据库里的实际观察池更新生效。"
+    ],
+    "notes": {
+      "google_news": "Google News 会读取整个 watchlist（股票 + ETF）。",
+      "sec_filings": "SEC 只读取股票池。"
+    }
+  },
+  "runtime": {
+    "cross_source_dedup_hours": 12,
+    "poll_seconds": 60
+  },
+  "sources": {
+    "google_news": true,
+    "google_research": false,
+    "sec_filings": true
+  },
+  "strategy": {
+    "event_score_threshold": 60.0,
+    "horizons": {
+      "position": {
+        "market_score_threshold": 55.0,
+        "priority_threshold": 75.0
+      },
+      "swing": {
+        "market_score_threshold": 55.0,
+        "priority_threshold": 75.0
+      }
+    }
+  },
+  "watchlist": {
+    "etf_groups": {
+      "core_index": [
+        "SPY",
+        "QQQ",
+        "QQQM",
+        "VOO",
+        "SCHD"
+      ],
+      "leveraged_and_tactical": [
+        "TQQQ",
+        "SQQQ"
+      ],
+      "macro_and_alternatives": [
+        "GLD",
+        "TLT",
+        "IBIT",
+        "ETHA"
+      ],
+      "non_us_markets": [
+        "BBJP",
+        "EMXC",
+        "FRDM",
+        "EWY",
+        "VNM"
+      ],
+      "sectors_and_themes": [
+        "SMH",
+        "XBI",
+        "ARKK"
+      ]
+    },
+    "stock_groups": {
+      "core_platforms": [
+        "NVDA",
+        "MSFT",
+        "AAPL",
+        "AMZN",
+        "META",
+        "GOOG",
+        "TSLA"
+      ],
+      "financials_and_fintech": [
+        "FUTU",
+        "BRK.B",
+        "JPM",
+        "GS",
+        "MS",
+        "BLK",
+        "SCHW",
+        "V",
+        "MA",
+        "AXP",
+        "HOOD"
+      ],
+      "healthcare": [
+        "UNH",
+        "HIMS",
+        "LLY",
+        "ISRG",
+        "VRTX"
+      ],
+      "international_and_consumer": [
+        "SE",
+        "TCEHY",
+        "LVMHF",
+        "MELI"
+      ],
+      "semiconductors_and_ai": [
+        "AMD",
+        "AVGO",
+        "QCOM",
+        "MU",
+        "ARM",
+        "TSM",
+        "ASML",
+        "AMAT",
+        "LRCX",
+        "KLAC",
+        "MRVL",
+        "NBIS"
+      ],
+      "software_and_cloud": [
+        "CRM",
+        "ORCL",
+        "SNOW",
+        "PLTR",
+        "NOW",
+        "ADBE",
+        "MDB",
+        "DDOG",
+        "NET"
+      ],
+      "special_situations": [
+        "IREN",
+        "EOSE",
+        "RDW",
+        "RKLB"
+      ]
+    }
+  }
+}
