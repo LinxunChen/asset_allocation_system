@@ -121,6 +121,10 @@
     "cross_source_dedup_hours": 12,
     "poll_seconds": 60
   },
+  "notifications": {
+    "feishu_webhook": "",
+    "dry_run": false
+  },
   "strategy": {
     "event_score_threshold": 60.0,
     "horizons": {

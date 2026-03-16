@@ -143,6 +143,7 @@ class SignalScorer:
             "sec": "公告事件",
             "research": "研报事件",
             "m&a": "并购事件",
+            "strategic": "战略事件",
             "product": "产品事件",
             "news": "新闻事件",
         }.get(event_type, "事件")

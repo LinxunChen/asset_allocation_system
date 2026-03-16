@@ -32,9 +32,26 @@ class RuleBasedExtractor:
             positive=("beat", "raise", "upgrade", "surge", "launch", "approval", "partnership"),
             negative=("miss", "cut", "downgrade", "lawsuit", "probe", "delay", "recall"),
         )
-        importance = 85.0 if event_type in {"earnings", "guidance", "sec", "m&a"} else 68.0
+        importance = 85.0 if event_type in {"earnings", "guidance", "sec", "m&a", "strategic"} else 68.0
         credibility = 90.0 if event.source_type in {"filing", "earnings", "press_release"} else 75.0
-        novelty = 80.0 if any(word in text for word in ("new", "first", "launch", "initiate")) else 62.0
+        novelty = 80.0 if any(
+            word in text
+            for word in (
+                "new",
+                "first",
+                "launch",
+                "initiate",
+                "investment",
+                "invests",
+                "invested",
+                "strategic",
+                "partnership",
+                "collaboration",
+                "stake",
+                "funding",
+                "backed",
+            )
+        ) else 62.0
         theme_relevance = 78.0 if any(word in text for word in ("ai", "cloud", "chip", "data center")) else 60.0
         bull_case = self._bull_case(event_type, sentiment)
         bear_case = self._bear_case(event_type, sentiment)
@@ -69,6 +86,21 @@ class RuleBasedExtractor:
             return "research"
         if any(word in text for word in ("merger", "acquisition", "buyout")):
             return "m&a"
+        if any(
+            word in text
+            for word in (
+                "strategic partnership",
+                "partnership",
+                "collaboration",
+                "investment",
+                "invests",
+                "invested",
+                "stake",
+                "backed",
+                "funding",
+            )
+        ):
+            return "strategic"
         if any(word in text for word in ("launch", "release", "announce", "product")):
             return "product"
         return "news"
@@ -98,6 +130,7 @@ class RuleBasedExtractor:
             "sec": f"检测到与 {event.symbol} 相关的公告或监管披露，建议结合原文确认关键变动。",
             "research": f"检测到与 {event.symbol} 相关的研究评级资讯，建议核对评级或目标价是否调整。",
             "m&a": f"检测到与 {event.symbol} 相关的并购资讯，建议确认交易条款与潜在影响。",
+            "strategic": f"检测到与 {event.symbol} 相关的战略合作或资本加持资讯，建议重点核对合作规模、投资方与后续兑现路径。",
             "product": f"检测到与 {event.symbol} 相关的产品或发布动态，需确认是否能转化为经营催化。",
             "news": f"检测到与 {event.symbol} 相关的新闻事件，建议结合原文判断是否构成有效交易催化。",
         }
@@ -110,6 +143,7 @@ class RuleBasedExtractor:
             "sec": "公告催化",
             "research": "研报催化",
             "m&a": "并购催化",
+            "strategic": "战略催化",
             "product": "产品催化",
             "news": "新闻催化",
         }.get(event_type, "事件催化")

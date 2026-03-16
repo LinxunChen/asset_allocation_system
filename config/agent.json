@@ -15,6 +15,10 @@
     "cross_source_dedup_hours": 12,
     "poll_seconds": 60
   },
+  "notifications": {
+    "feishu_webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/d95e35dc-289f-476b-b107-e8e85a48f650",
+    "dry_run": false
+  },
   "sources": {
     "google_news": true,
     "google_research": false,

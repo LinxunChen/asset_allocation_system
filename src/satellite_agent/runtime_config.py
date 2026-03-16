@@ -28,6 +28,12 @@ class RuntimeOverrides:
 
 
 @dataclass(frozen=True)
+class NotificationConfig:
+    feishu_webhook: str | None = None
+    dry_run: bool | None = None
+
+
+@dataclass(frozen=True)
 class HorizonStrategyOverrides:
     ttl_days: int | None = None
     market_score_threshold: float | None = None
@@ -71,6 +77,7 @@ class AgentRuntimeConfig:
     watchlist: WatchlistConfig = field(default_factory=WatchlistConfig)
     sources: SourceConfig = field(default_factory=SourceConfig)
     runtime: RuntimeOverrides = field(default_factory=RuntimeOverrides)
+    notifications: NotificationConfig = field(default_factory=NotificationConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
 
     @classmethod
@@ -95,6 +102,10 @@ class AgentRuntimeConfig:
                     payload.get("runtime", {}).get("cross_source_dedup_hours")
                 ),
             ),
+            notifications=NotificationConfig(
+                feishu_webhook=_optional_str(payload.get("notifications", {}).get("feishu_webhook")),
+                dry_run=_optional_bool(payload.get("notifications", {}).get("dry_run")),
+            ),
             strategy=StrategyConfig(
                 event_score_threshold=_optional_float(payload.get("strategy", {}).get("event_score_threshold")),
                 swing=_load_horizon_strategy(payload.get("strategy", {}).get("horizons", {}).get("swing", {})),
@@ -116,6 +127,10 @@ class AgentRuntimeConfig:
             overrides["poll_seconds"] = self.runtime.poll_seconds
         if self.runtime.cross_source_dedup_hours is not None:
             overrides["cross_source_dedup_hours"] = self.runtime.cross_source_dedup_hours
+        if self.notifications.feishu_webhook is not None:
+            overrides["feishu_webhook"] = self.notifications.feishu_webhook
+        if self.notifications.dry_run is not None:
+            overrides["dry_run"] = self.notifications.dry_run
         next_settings = settings.with_overrides(**overrides) if overrides else settings
         next_settings = next_settings.with_strategy_overrides(
             event_score_threshold=self.strategy.event_score_threshold,
@@ -143,6 +158,10 @@ class AgentRuntimeConfig:
             "runtime": {
                 "poll_seconds": self.runtime.poll_seconds,
                 "cross_source_dedup_hours": self.runtime.cross_source_dedup_hours,
+            },
+            "notifications": {
+                "feishu_webhook_configured": bool(self.notifications.feishu_webhook),
+                "dry_run": self.notifications.dry_run,
             },
             "strategy": self.strategy.to_record(),
         }
@@ -206,6 +225,12 @@ def _optional_float(value: Any) -> float | None:
     if value is None:
         return None
     return float(value)
+
+
+def _optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(value).strip()
 
 
 def _load_horizon_strategy(payload: dict[str, Any]) -> HorizonStrategyOverrides:

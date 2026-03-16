@@ -92,6 +92,24 @@ python3 -m unittest discover -s tests -v
 - 修改 `config/agent.json` 后，需要执行一次 `satellite-agent sync-watchlist`，数据库中的实际观察池才会更新。
 - 如果数据库里已经有 watchlist，程序启动时不会自动用配置覆盖它；这就是为什么“改了配置但运行结果没变”通常需要再做一次同步。
 
+## 飞书通知配置
+
+- 现在可以直接在 [agent.json](/Users/linxun/CodeSpace/asset_allocation_system/config/agent.json) 中维护通知配置：
+
+```json
+{
+  "notifications": {
+    "feishu_webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/xxxx",
+    "dry_run": false
+  }
+}
+```
+
+- `feishu_webhook` 为空时，不会真实外发，只会在运行记录里标记 `no_transport_configured`。
+- `dry_run: true` 时，会保留提醒判定与落盘，但跳过真正的 webhook 调用。
+- `send-test-notification`、`run-once`、`serve` 会统一读取这份通知配置。
+- 也仍然支持使用环境变量 `SATELLITE_FEISHU_WEBHOOK`；如果两边都配置，当前以 `config/agent.json` 为准。
+
 ## Strategy Tuning
 
 - `config/agent.json` can now carry a `strategy` block with global and per-horizon threshold overrides.

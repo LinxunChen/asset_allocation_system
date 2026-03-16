@@ -18,6 +18,7 @@ def _display_event_type(event_type: str) -> str:
         "sec": "公告",
         "research": "研报",
         "m&a": "并购",
+        "strategic": "战略合作",
         "product": "产品",
         "news": "新闻",
     }.get(event_type, event_type)

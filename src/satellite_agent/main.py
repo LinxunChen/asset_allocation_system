@@ -976,7 +976,10 @@ def _build_test_notification_card(symbol: str = "NVDA") -> OpportunityCard:
 
 def send_test_notification(settings: Settings, *, symbol: str = "NVDA") -> dict:
     if not settings.feishu_webhook:
-        raise ValueError("SATELLITE_FEISHU_WEBHOOK is not configured.")
+        raise ValueError(
+            "飞书 webhook 未配置。请在 config/agent.json 的 notifications.feishu_webhook 中填写，"
+            "或设置 SATELLITE_FEISHU_WEBHOOK 环境变量。"
+        )
     transport = FeishuTransport(settings.feishu_webhook)
     card = _build_test_notification_card(symbol=symbol)
     transport.send_card(card)

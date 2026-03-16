@@ -32,6 +32,10 @@ class RuntimeConfigTests(unittest.TestCase):
                             "google_research": False,
                         },
                         "runtime": {"poll_seconds": 120, "cross_source_dedup_hours": 6},
+                        "notifications": {
+                            "feishu_webhook": "https://example.feishu.cn/webhook/test",
+                            "dry_run": True,
+                        },
                         "strategy": {
                             "event_score_threshold": 65,
                             "horizons": {
@@ -59,6 +63,8 @@ class RuntimeConfigTests(unittest.TestCase):
             self.assertTrue(settings.use_google_news_source)
             self.assertEqual(settings.poll_seconds, 120)
             self.assertEqual(settings.cross_source_dedup_hours, 6)
+            self.assertEqual(settings.feishu_webhook, "https://example.feishu.cn/webhook/test")
+            self.assertTrue(settings.dry_run)
             self.assertEqual(settings.event_score_threshold, 65)
             self.assertEqual(settings.horizons["swing"].market_score_threshold, 58)
             self.assertEqual(settings.horizons["swing"].priority_threshold, 78)
