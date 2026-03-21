@@ -10,6 +10,16 @@ from .models import EventInsight, SourceEvent, utcnow
 
 
 JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
+SEC_FILING_PATTERNS = (
+    re.compile(r"\b8-k\b"),
+    re.compile(r"\b10-q\b"),
+    re.compile(r"\b10-k\b"),
+    re.compile(r"\bsec filing(s)?\b"),
+    re.compile(r"\bsecurities and exchange commission\b"),
+    re.compile(r"\bfiled with the sec\b"),
+    re.compile(r"\bfiled an? (8-k|10-q|10-k)\b"),
+    re.compile(r"\bfiling(s)?\b"),
+)
 
 
 def _keyword_score(text: str, positive: tuple[str, ...], negative: tuple[str, ...]) -> float:
@@ -20,6 +30,12 @@ def _keyword_score(text: str, positive: tuple[str, ...], negative: tuple[str, ..
         return 0.0
     total = positive_hits + negative_hits
     return (positive_hits - negative_hits) / total
+
+
+def _estimate_tokens(text: str) -> int:
+    if not text:
+        return 0
+    return max(1, (len(text) + 3) // 4)
 
 
 @dataclass
@@ -80,7 +96,7 @@ class RuleBasedExtractor:
             return "earnings"
         if any(word in text for word in ("guidance", "outlook", "forecast")):
             return "guidance"
-        if any(word in text for word in ("8-k", "10-q", "10-k", "sec", "filing")):
+        if any(pattern.search(text) for pattern in SEC_FILING_PATTERNS):
             return "sec"
         if any(word in text for word in ("upgrade", "downgrade", "price target", "analyst")):
             return "research"
@@ -156,14 +172,42 @@ class OpenAIExtractor(RuleBasedExtractor):
         self.base_url = base_url
 
     def extract(self, event: SourceEvent) -> EventInsight:
+        insight, _ = self.extract_with_metadata(event)
+        return insight
+
+    def extract_with_metadata(self, event: SourceEvent) -> tuple[EventInsight, Dict[str, Any]]:
         if not self.api_key:
-            return super().extract(event)
+            return super().extract(event), {
+                "used_llm": False,
+                "success": False,
+                "reason": "missing_api_key",
+                "model": self.model,
+                "prompt_tokens_estimate": 0,
+                "completion_tokens_estimate": 0,
+            }
         prompt = self._build_prompt(event)
+        prompt_tokens = _estimate_tokens(prompt)
         try:
             payload = self._call_api(prompt)
-            return self._payload_to_insight(event, payload)
-        except Exception:
-            return super().extract(event)
+            insight = self._payload_to_insight(event, payload)
+            completion_tokens = _estimate_tokens(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            return insight, {
+                "used_llm": True,
+                "success": True,
+                "reason": "ok",
+                "model": self.model,
+                "prompt_tokens_estimate": prompt_tokens,
+                "completion_tokens_estimate": completion_tokens,
+            }
+        except Exception as exc:
+            return super().extract(event), {
+                "used_llm": True,
+                "success": False,
+                "reason": f"api_error:{exc.__class__.__name__}",
+                "model": self.model,
+                "prompt_tokens_estimate": prompt_tokens,
+                "completion_tokens_estimate": 0,
+            }
 
     def _build_prompt(self, event: SourceEvent) -> str:
         return (

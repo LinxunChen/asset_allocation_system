@@ -2,9 +2,9 @@
   "_meta": {
     "description": "更易维护的观察池模板。推荐只维护 stock_groups 和 etf_groups，程序会自动拍平成实际 watchlist。",
     "how_to_use": [
-      "复制为 config/agent.json。",
+      "复制为 config/satellite_agent/agent.json。",
       "按分组增删标的，不需要手动维护第二份平铺列表。",
-      "修改完成后执行 satellite-agent sync-watchlist，让数据库里的实际观察池更新生效。"
+      "修改完成后直接运行 run-once 或 serve，程序会自动同步 watchlist。"
     ],
     "notes": {
       "sec_filings": "SEC 只读取股票池。",
@@ -120,6 +120,19 @@
   "runtime": {
     "cross_source_dedup_hours": 12,
     "poll_seconds": 60
+  },
+  "runtime_window": {
+    "enabled": false,
+    "timezone": "Asia/Shanghai",
+    "weekdays": [
+      "mon",
+      "tue",
+      "wed",
+      "thu",
+      "fri"
+    ],
+    "start_time": "18:00",
+    "end_time": "04:00"
   },
   "notifications": {
     "feishu_webhook": "",

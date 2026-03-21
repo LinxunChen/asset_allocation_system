@@ -57,6 +57,66 @@ class SlowHealthySourceAdapter(SourceAdapter):
         return [self.event] if self.event.published_at > ts else []
 
 
+class DegradedButFetchableSourceAdapter(SourceAdapter):
+    def __init__(self, event: SourceEvent) -> None:
+        self.event = event
+
+    @property
+    def name(self) -> str:
+        return "degraded_feed"
+
+    def health_check(self) -> SourceHealthCheck:
+        return SourceHealthCheck(source_name=self.name, status="unhealthy", detail="ssl eof")
+
+    def should_fetch_after_unhealthy_healthcheck(self) -> bool:
+        return True
+
+    def fetch_since(self, ts: datetime) -> list[SourceEvent]:
+        return [self.event] if self.event.published_at > ts else []
+
+
+class CountingHealthySourceAdapter(SourceAdapter):
+    def __init__(self) -> None:
+        self.health_calls = 0
+        self.fetch_calls = 0
+
+    @property
+    def name(self) -> str:
+        return "counting_feed"
+
+    def health_check(self) -> SourceHealthCheck:
+        self.health_calls += 1
+        return SourceHealthCheck(source_name=self.name, status="healthy", detail="counting ok")
+
+    def fetch_since(self, ts: datetime) -> list[SourceEvent]:
+        self.fetch_calls += 1
+        return []
+
+
+class FetchProbeSourceAdapter(SourceAdapter):
+    def __init__(self, should_fail: bool = False) -> None:
+        self.health_calls = 0
+        self.fetch_calls = 0
+        self.should_fail = should_fail
+
+    @property
+    def name(self) -> str:
+        return "probe_feed"
+
+    def skips_pre_fetch_health_check(self) -> bool:
+        return True
+
+    def health_check(self) -> SourceHealthCheck:
+        self.health_calls += 1
+        return SourceHealthCheck(source_name=self.name, status="healthy", detail="unused")
+
+    def fetch_since(self, ts: datetime) -> list[SourceEvent]:
+        self.fetch_calls += 1
+        if self.should_fail:
+            raise RuntimeError("probe failed")
+        return []
+
+
 def _daily_bars() -> list[Bar]:
     base = datetime(2026, 1, 1, tzinfo=timezone.utc)
     return [
@@ -189,6 +249,126 @@ class SourceHealthTests(unittest.TestCase):
 
             self.assertEqual(result["events_processed"], 2)
             self.assertLess(elapsed, 0.45)
+
+    def test_degraded_source_can_still_fetch_when_adapter_allows_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+            store.seed_watchlist(["NVDA"], "stock")
+            provider = InMemoryMarketDataProvider(
+                {("NVDA", "1d"): _daily_bars(), ("NVDA", "5m"): _intraday_bars()}
+            )
+            event = SourceEvent(
+                event_id="evt-degraded-1",
+                source="Degraded Feed",
+                source_type="news",
+                symbol="NVDA",
+                headline="Nvidia secures a major AI infrastructure contract",
+                summary="Despite a flaky health check, the underlying feed still returns data.",
+                published_at=datetime.now(timezone.utc) - timedelta(hours=2),
+                url="https://example.com/degraded",
+            )
+            service = SatelliteAgentService(
+                settings=Settings(database_path=db_path, dry_run=True),
+                store=store,
+                source_adapter=CompositeSourceAdapter([DegradedButFetchableSourceAdapter(event)]),
+                normalizer=EventNormalizer(),
+                extractor=RuleBasedExtractor(),
+                market_data=MarketDataEngine(provider),
+                scorer=SignalScorer(Settings(database_path=db_path, dry_run=True)),
+                entry_exit=EntryExitEngine(),
+                notifier=Notifier(store=store, transport=None, dry_run=True),
+            )
+
+            result = service.run_once()
+
+            self.assertEqual(result["events_processed"], 1)
+            run = store.load_latest_run()
+            summary = json.loads(run["summary_json"])
+            self.assertEqual(summary["source_health_failures"], 1)
+            self.assertEqual(summary["source_fetch_failures"], 0)
+
+    def test_recent_healthy_source_check_is_cached_between_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+            adapter = CountingHealthySourceAdapter()
+            settings = Settings(
+                database_path=db_path,
+                dry_run=True,
+                source_health_cache_seconds=300,
+            )
+            service = SatelliteAgentService(
+                settings=settings,
+                store=store,
+                source_adapter=CompositeSourceAdapter([adapter]),
+                normalizer=EventNormalizer(),
+                extractor=RuleBasedExtractor(),
+                market_data=MarketDataEngine(InMemoryMarketDataProvider({})),
+                scorer=SignalScorer(settings),
+                entry_exit=EntryExitEngine(),
+                notifier=Notifier(store=store, transport=None, dry_run=True),
+            )
+            service.run_once()
+            service.run_once()
+
+            self.assertEqual(adapter.health_calls, 1)
+            self.assertEqual(adapter.fetch_calls, 2)
+
+    def test_feed_probe_source_skips_pre_fetch_health_check(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+            adapter = FetchProbeSourceAdapter()
+            settings = Settings(database_path=db_path, dry_run=True)
+            service = SatelliteAgentService(
+                settings=settings,
+                store=store,
+                source_adapter=CompositeSourceAdapter([adapter]),
+                normalizer=EventNormalizer(),
+                extractor=RuleBasedExtractor(),
+                market_data=MarketDataEngine(InMemoryMarketDataProvider({})),
+                scorer=SignalScorer(settings),
+                entry_exit=EntryExitEngine(),
+                notifier=Notifier(store=store, transport=None, dry_run=True),
+            )
+
+            service.run_once()
+
+            self.assertEqual(adapter.health_calls, 0)
+            self.assertEqual(adapter.fetch_calls, 1)
+            latest = store.load_latest_source_health()
+            self.assertEqual(latest[0]["status"], "healthy")
+            self.assertIn("probe", latest[0]["detail"])
+
+    def test_feed_probe_failure_counts_as_fetch_failure_not_health_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+            adapter = FetchProbeSourceAdapter(should_fail=True)
+            settings = Settings(database_path=db_path, dry_run=True)
+            service = SatelliteAgentService(
+                settings=settings,
+                store=store,
+                source_adapter=CompositeSourceAdapter([adapter]),
+                normalizer=EventNormalizer(),
+                extractor=RuleBasedExtractor(),
+                market_data=MarketDataEngine(InMemoryMarketDataProvider({})),
+                scorer=SignalScorer(settings),
+                entry_exit=EntryExitEngine(),
+                notifier=Notifier(store=store, transport=None, dry_run=True),
+            )
+
+            service.run_once()
+
+            run = store.load_latest_run()
+            summary = json.loads(run["summary_json"])
+            self.assertEqual(summary["source_health_failures"], 0)
+            self.assertEqual(summary["source_fetch_failures"], 1)
 
 
 if __name__ == "__main__":

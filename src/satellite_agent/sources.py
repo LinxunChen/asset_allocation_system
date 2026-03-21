@@ -10,10 +10,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 from urllib import parse, request
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 import xml.etree.ElementTree as ET
 from xml.etree.ElementTree import ParseError
 import email.utils
+from http.client import IncompleteRead
 
 from .models import SourceEvent, SourceHealthCheck
 
@@ -32,6 +33,12 @@ class SourceAdapter(ABC):
 
     def child_adapters(self) -> list["SourceAdapter"]:
         return [self]
+
+    def should_fetch_after_unhealthy_healthcheck(self) -> bool:
+        return False
+
+    def skips_pre_fetch_health_check(self) -> bool:
+        return False
 
 
 class CompositeSourceAdapter(SourceAdapter):
@@ -255,12 +262,20 @@ class GenericFeedSourceAdapter(SourceAdapter):
         source_name: str,
         source_type: str,
         user_agent: str = "satellite-agent/0.1",
+        request_timeout_seconds: int = 12,
+        health_timeout_seconds: int = 6,
+        max_retries: int = 2,
+        max_workers: int = 6,
     ) -> None:
         self.symbols = [symbol.upper() for symbol in symbols]
         self.url_builder = url_builder
         self.source_name = source_name
         self.source_type = source_type
         self.user_agent = user_agent
+        self.request_timeout_seconds = request_timeout_seconds
+        self.health_timeout_seconds = health_timeout_seconds
+        self.max_retries = max(max_retries, 1)
+        self.max_workers = max(max_workers, 1)
         self.last_fetch_errors: list[dict[str, str]] = []
         self.max_events_per_symbol = 0
 
@@ -268,10 +283,20 @@ class GenericFeedSourceAdapter(SourceAdapter):
     def name(self) -> str:
         return self.source_name.lower().replace(" ", "_")
 
+    def should_fetch_after_unhealthy_healthcheck(self) -> bool:
+        # Feed-based sources occasionally fail health checks with transient SSL/EOF
+        # errors even though a subsequent full fetch succeeds on retry.
+        return True
+
+    def skips_pre_fetch_health_check(self) -> bool:
+        # For feed-based sources, the actual fetch is a better probe than an extra
+        # health-check request and saves one network round-trip per run.
+        return True
+
     def fetch_since(self, ts: datetime) -> list[SourceEvent]:
         events: list[SourceEvent] = []
         errors: list[dict[str, str]] = []
-        with ThreadPoolExecutor(max_workers=min(len(self.symbols), 8) or 1) as executor:
+        with ThreadPoolExecutor(max_workers=min(len(self.symbols), self.max_workers) or 1) as executor:
             futures = {
                 executor.submit(self._fetch_symbol_feed, symbol, ts): symbol
                 for symbol in self.symbols
@@ -298,7 +323,11 @@ class GenericFeedSourceAdapter(SourceAdapter):
         started = time.monotonic()
         symbol = self.symbols[0]
         try:
-            payload = self._read_url(self.url_builder(symbol), timeout=10)
+            payload = self._read_url(
+                self.url_builder(symbol),
+                timeout=self.health_timeout_seconds,
+                retries=1,
+            )
             root = ET.fromstring(payload)
             tag = self._strip_namespace(root.tag).lower()
             if tag not in {"feed", "rss"}:
@@ -320,7 +349,11 @@ class GenericFeedSourceAdapter(SourceAdapter):
             )
 
     def _fetch_symbol_feed(self, symbol: str, ts: datetime) -> list[SourceEvent]:
-        payload = self._read_url(self.url_builder(symbol), timeout=20)
+        payload = self._read_url(
+            self.url_builder(symbol),
+            timeout=self.request_timeout_seconds,
+            retries=self.max_retries,
+        )
         root = ET.fromstring(payload)
         tag = self._strip_namespace(root.tag).lower()
         if tag == "feed":
@@ -329,9 +362,9 @@ class GenericFeedSourceAdapter(SourceAdapter):
             return self._parse_rss(root, symbol, ts)
         raise ValueError("Unsupported feed type")
 
-    def _read_url(self, url: str, *, timeout: int) -> bytes:
+    def _read_url(self, url: str, *, timeout: int, retries: int) -> bytes:
         last_error: Exception | None = None
-        for attempt in range(3):
+        for attempt in range(max(retries, 1)):
             req = request.Request(
                 url,
                 headers={
@@ -343,9 +376,9 @@ class GenericFeedSourceAdapter(SourceAdapter):
             try:
                 with request.urlopen(req, timeout=timeout) as response:
                     return response.read()
-            except URLError as exc:
+            except (URLError, HTTPError, IncompleteRead, TimeoutError) as exc:
                 last_error = exc
-                if attempt == 2:
+                if attempt == retries - 1:
                     break
                 time.sleep(0.5 * (attempt + 1))
         if last_error is not None:

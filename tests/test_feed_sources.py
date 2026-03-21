@@ -116,6 +116,46 @@ class MockHTTPResponse(BytesIO):
 
 
 class FeedSourceTests(unittest.TestCase):
+    def test_generic_feed_health_check_uses_single_attempt(self) -> None:
+        adapter = GenericFeedSourceAdapter(
+            symbols=["NVDA"],
+            url_builder=lambda symbol: f"https://example.com/{symbol}.rss",
+            source_name="Sample RSS",
+            source_type="news",
+        )
+        attempts = {"count": 0}
+
+        def fake_urlopen(req, timeout=0):
+            attempts["count"] += 1
+            raise URLError("temporary outage")
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            health = adapter.health_check()
+
+        self.assertEqual(health.status, "unhealthy")
+        self.assertEqual(attempts["count"], 1)
+
+    def test_generic_feed_fetch_retries_timeout_errors(self) -> None:
+        adapter = GenericFeedSourceAdapter(
+            symbols=["NVDA"],
+            url_builder=lambda symbol: f"https://example.com/{symbol}.rss",
+            source_name="Sample RSS",
+            source_type="news",
+        )
+        attempts = {"count": 0}
+
+        def fake_urlopen(req, timeout=0):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise TimeoutError("timed out")
+            return MockHTTPResponse(RSS_FEED)
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            events = adapter.fetch_since(datetime(2026, 3, 14, 13, 0, tzinfo=timezone.utc))
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(attempts["count"], 2)
+
     def test_generic_feed_adapter_parses_rss_items(self) -> None:
         adapter = GenericFeedSourceAdapter(
             symbols=["NVDA"],

@@ -4,22 +4,35 @@ import argparse
 import csv
 import json
 import time
-from datetime import timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 import re
+from statistics import median
 import sys
+from typing import Any
+from zoneinfo import ZoneInfo
 
 from .config import Settings
+from .archive import archive_decision_history
 from .entry_exit import EntryExitEngine
 from .event_normalizer import EventNormalizer
 from .llm import OpenAIExtractor
-from .market_data import CachedMarketDataProvider, MarketDataEngine, YahooFinanceMarketDataProvider
+from .decision_engines.mappers import build_delivery_view_from_record
+from .market_data import (
+    CachedMarketDataProvider,
+    MarketDataEngine,
+    MultiSourceMarketDataProvider,
+    StooqDailyMarketDataProvider,
+    YahooFinanceMarketDataProvider,
+)
 from .notifier import FeishuTransport, Notifier
+from .outcomes import backfill_decision_outcomes, backfill_recent_decision_outcomes, explain_decision_outcome
 from .reporting import (
     _config_summary,
     format_batch_index,
     format_batch_comparison,
     format_batch_replay,
+    format_recent_performance_review,
     format_run_review,
     summarize_run_health,
     format_error_summary,
@@ -58,7 +71,1141 @@ from .sources import (
 from .store import Store
 from .models import Bar, utcnow
 from .models import OpportunityCard, PriceRange
-from .timefmt import format_beijing_minute
+from .theme_linkage import build_symbol_theme_map_from_watchlist_payload, theme_tags_for_symbol
+from .timefmt import BEIJING_TZ, format_beijing_minute
+
+
+SEC_EXCLUDED_SYMBOLS = {
+    "ARM",
+    "NBIS",
+}
+RECENT_PERFORMANCE_WINDOW_DAYS = 30
+OUTCOME_SAMPLE_AUDIT_LIMIT = 10
+DEFAULT_ARCHIVE_DB_PATH = Path("./data/satellite_agent/archive/decision_history.db")
+HISTORICAL_EFFECT_REVIEW_VERSION = "v1"
+MANUAL_OUTCOME_AUDIT_STATE_KEY = "historical_effect_manual_audit"
+HISTORICAL_EFFECT_BASELINE_STATE_KEY = "historical_effect_review_baseline"
+EXECUTABLE_DECISION_ACTIONS = ("试探建仓", "确认做多")
+OBSERVATION_DECISION_ACTION = "加入观察"
+US_MARKET_TZ = ZoneInfo("America/New_York")
+SERVE_HISTORICAL_EFFECT_REFRESH_SECONDS = 3600
+RUN_ONCE_WORKSPACE_DIR = "./data/satellite_agent/run_once"
+SERVE_WORKSPACE_DIR = "./data/satellite_agent/serve"
+DAILY_RUN_WORKSPACE_DIR = "./data/satellite_agent/daily_run"
+BATCH_RUNS_DIR = "./data/satellite_agent/experiments/batch_runs"
+DEMO_FLOW_DIR = "./data/satellite_agent/experiments/demo_flow"
+SATELLITE_BATCH_REPLAY_TEMPLATE_PATH = "./config/satellite_agent/batch_replay.template.json"
+LEGACY_BATCH_REPLAY_TEMPLATE_PATH = "./config/batch_replay.template.json"
+
+
+def _parse_local_date(value: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise SystemExit(f"Invalid date: {value}. Expected YYYY-MM-DD.") from exc
+
+
+def _historical_effect_event_type_label(event_type: str) -> str:
+    return {
+        "earnings": "财报",
+        "guidance": "指引",
+        "sec": "公告",
+        "research": "研报",
+        "m&a": "并购",
+        "strategic": "战略合作",
+        "product": "产品",
+        "news": "新闻",
+        "prewatch": "预备观察",
+        "uncategorized": "未分类",
+    }.get(event_type, event_type)
+
+
+def _historical_effect_pool_label(pool: str) -> str:
+    return {
+        "prewatch": "预备池",
+        "confirmation": "确认池",
+        "exit": "兑现池",
+        "unknown": "未分类",
+    }.get(pool, pool or "未分类")
+
+
+def _historical_effect_action_label(action: str) -> str:
+    return {
+        "试探建仓": "试探建仓",
+        "确认做多": "确认做多",
+        "加入观察": "加入观察",
+        "unknown": "未分类",
+    }.get(action, action or "未分类")
+
+
+def _historical_effect_trigger_mode_label(trigger_mode: str) -> str:
+    return {
+        "event": "事件触发",
+        "structure": "结构预热成卡",
+        "resonance": "共振触发",
+        "direct": "直接成卡",
+        "promoted": "升池触发",
+        "unknown": "未分类",
+    }.get(trigger_mode, trigger_mode or "未分类")
+
+
+def _historical_effect_priority_label(priority: str) -> str:
+    return {
+        "high": "高优先级",
+        "normal": "普通",
+        "suppressed": "压制",
+        "unknown": "未分类",
+    }.get(priority, priority or "未分类")
+
+
+def _historical_effect_exit_reason_label(reason: str) -> str:
+    return {
+        "hit_take_profit": "止盈退出",
+        "hit_invalidation": "失效退出",
+        "window_complete": "复盘窗口结算",
+        "insufficient_lookahead": "观察中",
+        "not_entered": "未进场",
+    }.get(reason, reason or "未回补")
+
+
+def _historical_effect_status_label(*, entered: bool, close_reason: str) -> str:
+    if not entered:
+        return "未进场"
+    return _historical_effect_exit_reason_label(close_reason)
+
+
+def _serialize_ranked_decision_rows(
+    rows: list[dict[str, Any]],
+    *,
+    metric_field: str,
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        items.append(
+            {
+                "created_at": str(row.get("created_at") or ""),
+                "symbol": str(row.get("symbol") or ""),
+                "event_type": str(row.get("event_type") or ""),
+                "event_type_display": _historical_effect_event_type_label(str(row.get("event_type") or "")),
+                "action": str(row.get("action") or ""),
+                "action_display": _historical_effect_action_label(str(row.get("action") or "")),
+                "status_label": _historical_effect_status_label(
+                    entered=bool(row.get("entered")),
+                    close_reason=str(row.get("close_reason") or ""),
+                ),
+                "real_exit_label": (
+                    "已真实退出"
+                    if str(row.get("close_reason") or "") in {"hit_take_profit", "hit_invalidation", "window_complete"}
+                    and row.get("realized_return") is not None
+                    else "未真实退出"
+                ),
+                "entry_price": row.get("entry_price"),
+                "exit_price": row.get("exit_price"),
+                "realized_return": row.get("realized_return"),
+                "t_plus_7_return": row.get("t_plus_7_return"),
+                "t_plus_10_return": row.get("t_plus_10_return"),
+                "holding_days": row.get("holding_days"),
+                "rank_metric_field": metric_field,
+            }
+        )
+    return items
+
+
+def _resolve_review_window(*, days: int, start_date: str = "", end_date: str = "") -> dict[str, Any]:
+    today = utcnow().astimezone(BEIJING_TZ).date()
+    start_raw = str(start_date or "").strip()
+    end_raw = str(end_date or "").strip()
+    if end_raw and not start_raw:
+        raise SystemExit("end-date requires start-date. Use --start-date YYYY-MM-DD --end-date YYYY-MM-DD, or use --days.")
+    if start_raw:
+        start_day = _parse_local_date(start_raw)
+        end_day = _parse_local_date(end_raw) if end_raw else today
+    else:
+        if days <= 0:
+            raise SystemExit("days must be positive.")
+        end_day = today
+        start_day = end_day - timedelta(days=days - 1)
+    if end_day < start_day:
+        raise SystemExit("end-date must be on or after start-date.")
+    start_dt = datetime.combine(start_day, datetime.min.time(), tzinfo=BEIJING_TZ)
+    end_exclusive_dt = datetime.combine(end_day + timedelta(days=1), datetime.min.time(), tzinfo=BEIJING_TZ)
+    return {
+        "start_date": start_day.isoformat(),
+        "end_date": end_day.isoformat(),
+        "window_days": (end_day - start_day).days + 1,
+        "since": start_dt.astimezone(timezone.utc).isoformat(),
+        "until": end_exclusive_dt.astimezone(timezone.utc).isoformat(),
+    }
+
+
+def _mean(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return round(sum(values) / len(values), 2)
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return round(float(median(values)), 2)
+
+
+def _percentage(numerator: int, denominator: int) -> float | None:
+    if denominator <= 0:
+        return None
+    return round((numerator / denominator) * 100.0, 2)
+
+
+def _merge_decision_rows(
+    primary_rows: list[dict[str, Any]] | list[object],
+    secondary_rows: list[dict[str, Any]] | list[object],
+) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for rows in (secondary_rows, primary_rows):
+        for raw_row in rows:
+            row = dict(raw_row)
+            decision_id = str(row.get("decision_id") or "")
+            if not decision_id:
+                continue
+            merged[decision_id] = row
+    return sorted(
+        merged.values(),
+        key=lambda row: (
+            str(row.get("created_at") or ""),
+            str(row.get("symbol") or ""),
+            str(row.get("pool") or ""),
+        ),
+    )
+
+
+def _aggregate_historical_effect_rows(
+    rows: list[dict[str, Any]],
+    *,
+    key_fn,
+    label_fn,
+) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        key = str(key_fn(row) or "").strip()
+        if not key:
+            key = "unknown"
+        grouped.setdefault(key, []).append(row)
+    items: list[dict[str, Any]] = []
+    for key, group_rows in grouped.items():
+        entered_rows = [row for row in group_rows if bool(row.get("entered"))]
+        exited_rows = [
+            row
+            for row in entered_rows
+            if str(row.get("close_reason") or "") in {"hit_take_profit", "hit_invalidation", "window_complete"}
+            and row.get("realized_return") is not None
+        ]
+        realized_values = [float(row["realized_return"]) for row in exited_rows]
+        take_profit_count = sum(1 for row in entered_rows if str(row.get("close_reason") or "") == "hit_take_profit")
+        invalidation_count = sum(1 for row in entered_rows if str(row.get("close_reason") or "") == "hit_invalidation")
+        window_complete_count = sum(1 for row in entered_rows if str(row.get("close_reason") or "") == "window_complete")
+        items.append(
+            {
+                "key": key,
+                "label": label_fn(key),
+                "decision_count": len(group_rows),
+                "entered_count": len(entered_rows),
+                "take_profit_exit_count": take_profit_count,
+                "invalidation_exit_count": invalidation_count,
+                "window_complete_count": window_complete_count,
+                "avg_realized_return": _mean(realized_values),
+                "win_rate": _percentage(sum(1 for value in realized_values if value > 0), len(realized_values)),
+            }
+        )
+    return sorted(
+        items,
+        key=lambda row: (
+            -(row["avg_realized_return"] if row["avg_realized_return"] is not None else float("-inf")),
+            -int(row["decision_count"]),
+            str(row["label"]),
+        ),
+    )
+
+
+def _best_completed_group(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    completed = [row for row in rows if row.get("avg_realized_return") is not None]
+    if not completed:
+        return None
+    return max(
+        completed,
+        key=lambda row: (
+            float(row.get("avg_realized_return") or 0.0),
+            int(row.get("decision_count") or 0),
+        ),
+    )
+
+
+def _worst_completed_group(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    completed = [row for row in rows if row.get("avg_realized_return") is not None]
+    if not completed:
+        return None
+    return min(
+        completed,
+        key=lambda row: (
+            float(row.get("avg_realized_return") or 0.0),
+            -int(row.get("decision_count") or 0),
+        ),
+    )
+
+
+def _build_historical_effect_review_data(
+    store: Store,
+    *,
+    days: int,
+    limit: int,
+    start_date: str = "",
+    end_date: str = "",
+) -> dict[str, Any]:
+    window = _resolve_review_window(days=days, start_date=start_date, end_date=end_date)
+    archive_store, archive_db_path = _open_archive_store_if_available()
+    try:
+        main_rows = store.load_decision_records_for_window(
+            since=window["since"],
+            until=window["until"],
+            actions=EXECUTABLE_DECISION_ACTIONS,
+        )
+        archive_rows = (
+            archive_store.load_decision_records_for_window(
+                since=window["since"],
+                until=window["until"],
+                actions=EXECUTABLE_DECISION_ACTIONS,
+            )
+            if archive_store is not None
+            else []
+        )
+        observation_rows = store.load_decision_records_for_window(
+            since=window["since"],
+            until=window["until"],
+            actions=[OBSERVATION_DECISION_ACTION],
+        )
+        archive_observation_rows = (
+            archive_store.load_decision_records_for_window(
+                since=window["since"],
+                until=window["until"],
+                actions=[OBSERVATION_DECISION_ACTION],
+            )
+            if archive_store is not None
+            else []
+        )
+    finally:
+        if archive_store is not None:
+            archive_store.close()
+
+    rows = _merge_decision_rows(list(main_rows), list(archive_rows))
+    observation_rows_merged = _merge_decision_rows(list(observation_rows), list(archive_observation_rows))
+    entered_rows = [row for row in rows if bool(row.get("entered"))]
+    not_entered_rows = [row for row in rows if not bool(row.get("entered"))]
+    take_profit_rows = [row for row in entered_rows if str(row.get("close_reason") or "") == "hit_take_profit"]
+    invalidation_rows = [row for row in entered_rows if str(row.get("close_reason") or "") == "hit_invalidation"]
+    window_complete_rows = [row for row in entered_rows if str(row.get("close_reason") or "") == "window_complete"]
+    exited_rows = take_profit_rows + invalidation_rows + window_complete_rows
+    open_rows = [row for row in rows if bool(row.get("entered")) and str(row.get("close_reason") or "") == "insufficient_lookahead"]
+    completed_rows = [row for row in rows if str(row.get("close_reason") or "") not in {"", "insufficient_lookahead"}]
+    pending_rows = [row for row in rows if str(row.get("close_reason") or "") in {"", "insufficient_lookahead"}]
+    realized_values = [float(row["realized_return"]) for row in exited_rows if row.get("realized_return") is not None]
+    positive_values = [value for value in realized_values if value > 0]
+    negative_values = [value for value in realized_values if value < 0]
+    holding_days = [int(row["holding_days"]) for row in exited_rows if row.get("holding_days") is not None]
+    auxiliary_metrics = []
+    for field, label in (
+        ("t_plus_1_return", "T+1"),
+        ("t_plus_3_return", "T+3"),
+        ("t_plus_7_return", "T+7"),
+        ("t_plus_14_return", "T+14"),
+        ("t_plus_30_return", "T+30"),
+        ("max_runup", "最大浮盈"),
+        ("max_drawdown", "最大回撤"),
+    ):
+        values = [float(row[field]) for row in rows if row.get(field) is not None]
+        auxiliary_metrics.append(
+            {
+                "field": field,
+                "label": label,
+                "sample_count": len(values),
+                "avg_value": _mean(values),
+            }
+        )
+
+    event_breakdown = _aggregate_historical_effect_rows(
+        rows,
+        key_fn=lambda row: row.get("event_type") or "uncategorized",
+        label_fn=_historical_effect_event_type_label,
+    )[:limit]
+    pool_breakdown = _aggregate_historical_effect_rows(
+        rows,
+        key_fn=lambda row: row.get("pool") or "unknown",
+        label_fn=_historical_effect_pool_label,
+    )[:limit]
+    action_breakdown = _aggregate_historical_effect_rows(
+        rows,
+        key_fn=lambda row: row.get("action") or "unknown",
+        label_fn=_historical_effect_action_label,
+    )[:limit]
+    trigger_breakdown = _aggregate_historical_effect_rows(
+        rows,
+        key_fn=lambda row: row.get("trigger_mode") or "unknown",
+        label_fn=_historical_effect_trigger_mode_label,
+    )[:limit]
+    priority_breakdown = _aggregate_historical_effect_rows(
+        rows,
+        key_fn=lambda row: row.get("priority") or "unknown",
+        label_fn=_historical_effect_priority_label,
+    )[:limit]
+
+    best_event = _best_completed_group(event_breakdown)
+    worst_event = _worst_completed_group(event_breakdown)
+    best_pool = _best_completed_group(pool_breakdown)
+    worst_pool = _worst_completed_group(pool_breakdown)
+    best_trigger = _best_completed_group(trigger_breakdown)
+    worst_trigger = _worst_completed_group(trigger_breakdown)
+    recommendations: list[str] = []
+    if not rows:
+        recommendations.append("当前窗口内没有可执行建议，先继续积累样本。")
+    else:
+        if best_event is not None:
+            recommendations.append(
+                f"{best_event['label']} 是当前窗口里表现最好的事件类型，可优先保留并继续观察后续样本。"
+            )
+        if worst_event is not None and worst_event is not best_event:
+            recommendations.append(
+                f"{worst_event['label']} 表现最弱，优先回看这类事件的阈值、排序和入场时机。"
+            )
+        if best_pool is not None:
+            recommendations.append(
+                f"{best_pool['label']} 当前是表现更好的池子，可优先作为后续筛选和排序参考。"
+            )
+        if worst_pool is not None and worst_pool is not best_pool:
+            recommendations.append(
+                f"{worst_pool['label']} 当前表现偏弱，优先检查该池子的升池标准和价格计划。"
+            )
+        if best_trigger is not None:
+            recommendations.append(
+                f"{best_trigger['label']} 当前相对更稳，可继续观察这类触发方式的后续样本。"
+            )
+        if worst_trigger is not None and worst_trigger is not best_trigger:
+            recommendations.append(
+                f"{worst_trigger['label']} 当前偏弱，值得回看触发条件是否过于宽松。"
+            )
+        invalidation_rate = _percentage(len(invalidation_rows), len(entered_rows)) or 0.0
+        window_complete_rate = _percentage(len(window_complete_rows), len(entered_rows)) or 0.0
+        not_entered_rate = _percentage(len(not_entered_rows), len(rows)) or 0.0
+        take_profit_rate = _percentage(len(take_profit_rows), len(entered_rows)) or 0.0
+        avg_runup = next((row.get("avg_value") for row in auxiliary_metrics if row.get("field") == "max_runup"), None)
+        if invalidation_rate >= 40.0:
+            recommendations.append("失效退出占比偏高，优先检查入场是否过早，以及失效缓冲是否过窄。")
+        if window_complete_rate >= 40.0:
+            recommendations.append("复盘窗口结算占比偏高，说明止盈偏远或催化延续性还不够强。")
+        if not_entered_rate >= 40.0:
+            recommendations.append("未进场样本偏多，说明入场区间可能偏保守，值得回看挂单区间。")
+        if take_profit_rate == 0.0 and avg_runup is not None and float(avg_runup) > 0:
+            recommendations.append("样本中曾出现一定浮盈但没有止盈兑现，建议回看止盈区间是否偏远。")
+    if not recommendations:
+        recommendations.append("当前样本表现较均衡，继续累计更多完整样本后再调整策略。")
+    deduped_recommendations: list[str] = []
+    for line in recommendations:
+        if line not in deduped_recommendations:
+            deduped_recommendations.append(line)
+
+    ranked_completed_rows = [
+        row
+        for row in rows
+        if bool(row.get("entered")) and row.get("realized_return") is not None
+    ]
+    best_completed_decisions = sorted(
+        ranked_completed_rows,
+        key=lambda row: (
+            float(row.get("realized_return") or 0.0),
+            str(row.get("created_at") or ""),
+        ),
+        reverse=True,
+    )[:3]
+    worst_completed_decisions = sorted(
+        ranked_completed_rows,
+        key=lambda row: (
+            float(row.get("realized_return") or 0.0),
+            str(row.get("created_at") or ""),
+        ),
+    )[:3]
+    ranked_t7_rows = [row for row in rows if row.get("t_plus_7_return") is not None]
+    best_t7_decisions = sorted(
+        ranked_t7_rows,
+        key=lambda row: (
+            float(row.get("t_plus_7_return") or 0.0),
+            str(row.get("created_at") or ""),
+        ),
+        reverse=True,
+    )[:3]
+    worst_t7_decisions = sorted(
+        ranked_t7_rows,
+        key=lambda row: (
+            float(row.get("t_plus_7_return") or 0.0),
+            str(row.get("created_at") or ""),
+        ),
+    )[:3]
+
+    adjusted_price_status = _summarize_adjusted_price_readiness(store, rows)
+    adjusted_price_protection_ready = bool(adjusted_price_status["ready"])
+    sample_audit_payload = build_outcome_sample_payload(
+        store,
+        days=days,
+        limit=OUTCOME_SAMPLE_AUDIT_LIMIT,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    sample_audit = _summarize_outcome_sample_audit(sample_audit_payload)
+    manual_audit = _load_manual_outcome_audit(store)
+    manual_audit_completed = _manual_audit_matches_review(manual_audit, window)
+    review_baseline = _load_review_baseline(store)
+    baseline_frozen = _review_baseline_matches_version(review_baseline)
+    draft_reasons = [
+        "当前仍处于开发校验阶段，历史结果可能因口径修正而回溯变化。",
+    ]
+    if not adjusted_price_protection_ready:
+        if adjusted_price_status["missing_symbols"]:
+            draft_reasons.append(
+                f"以下标的缺少可核验的日线 bars：{'、'.join(adjusted_price_status['missing_symbols'][:5])}。"
+            )
+        if adjusted_price_status["unadjusted_symbols"]:
+            draft_reasons.append(
+                f"以下标的仍存在未复权日线：{'、'.join(adjusted_price_status['unadjusted_symbols'][:5])}。"
+            )
+        draft_reasons.append("复权保护未完成，正式版复盘暂不产出。")
+    formal_blockers = [
+    ]
+    if not baseline_frozen:
+        formal_blockers.append("复盘口径仍处于开发阶段，尚未冻结。")
+    if not manual_audit_completed:
+        formal_blockers.append("AI样本复核尚未完成。")
+    if sample_audit["mismatched"] > 0:
+        formal_blockers.append("程序样本抽检存在不一致结果。")
+    elif sample_audit["unavailable"] > 0:
+        formal_blockers.append("程序样本抽检仍有无法重算的样本。")
+    if not adjusted_price_protection_ready:
+        formal_blockers.append("复权日线保护尚未满足正式版要求。")
+    formal_ready = not formal_blockers
+    detail_rows = sorted(
+        rows,
+        key=lambda row: (
+            str(row.get("created_at") or ""),
+            str(row.get("symbol") or ""),
+        ),
+        reverse=True,
+    )[:20]
+    return {
+        "status": "正式" if formal_ready else "草稿",
+        "status_label": "历史效果复盘（正式）" if formal_ready else "历史效果复盘（草稿）",
+        "review_version": HISTORICAL_EFFECT_REVIEW_VERSION,
+        "review_window": window,
+        "backfill_cutoff_at": utcnow().isoformat(),
+        "adjusted_price_protection_ready": adjusted_price_protection_ready,
+        "adjusted_price_status": adjusted_price_status,
+        "sample_audit": sample_audit,
+        "manual_audit": manual_audit if manual_audit_completed else {},
+        "review_baseline": review_baseline if baseline_frozen else {},
+        "formal_readiness": {
+            "ready": formal_ready,
+            "status_label": "已满足" if formal_ready else "未满足",
+            "blockers": formal_blockers,
+        },
+        "draft_reasons": [] if formal_ready else draft_reasons,
+        "archive_db_path": str(archive_db_path) if archive_db_path is not None else "",
+        "overview": {
+            "decision_count": len(rows),
+            "entered_count": len(entered_rows),
+            "not_entered_count": len(not_entered_rows),
+            "take_profit_exit_count": len(take_profit_rows),
+            "invalidation_exit_count": len(invalidation_rows),
+            "window_complete_count": len(window_complete_rows),
+            "open_position_count": len(open_rows),
+            "avg_realized_return": _mean(realized_values),
+            "median_realized_return": _median(realized_values),
+            "win_rate": _percentage(sum(1 for value in realized_values if value > 0), len(realized_values)),
+            "profit_loss_ratio": (
+                round((_mean(positive_values) or 0.0) / abs(_mean(negative_values) or 0.0), 2)
+                if positive_values and negative_values and (_mean(negative_values) or 0.0) != 0.0
+                else None
+            ),
+        },
+        "execution_quality": {
+            "entry_hit_rate": _percentage(len(entered_rows), len(rows)),
+            "take_profit_hit_rate": _percentage(len(take_profit_rows), len(entered_rows)),
+            "invalidation_hit_rate": _percentage(len(invalidation_rows), len(entered_rows)),
+            "window_complete_rate": _percentage(len(window_complete_rows), len(entered_rows)),
+            "avg_holding_days": _mean([float(value) for value in holding_days]),
+            "completed_outcome_count": len(completed_rows),
+            "pending_outcome_count": len(pending_rows),
+        },
+        "auxiliary_observation": auxiliary_metrics,
+        "breakdowns": {
+            "event_type": event_breakdown,
+            "pool": pool_breakdown,
+            "action": action_breakdown,
+            "trigger_mode": trigger_breakdown,
+            "priority": priority_breakdown,
+        },
+        "appendix": {
+            "observation_signal_count": len(observation_rows_merged),
+        },
+        "decision_details": [
+            {
+                "created_at": str(row.get("created_at") or ""),
+                "symbol": str(row.get("symbol") or ""),
+                "event_type": str(row.get("event_type") or ""),
+                "event_type_display": _historical_effect_event_type_label(str(row.get("event_type") or "")),
+                "action": str(row.get("action") or ""),
+                "action_display": _historical_effect_action_label(str(row.get("action") or "")),
+                "status_label": _historical_effect_status_label(
+                    entered=bool(row.get("entered")),
+                    close_reason=str(row.get("close_reason") or ""),
+                ),
+                "entered": bool(row.get("entered")),
+                "entry_price": row.get("entry_price"),
+                "exit_price": row.get("exit_price"),
+                "realized_return": row.get("realized_return"),
+                "holding_days": row.get("holding_days"),
+            }
+            for row in detail_rows
+        ],
+        "best_completed_decisions": _serialize_ranked_decision_rows(
+            best_completed_decisions,
+            metric_field="realized_return",
+        ),
+        "worst_completed_decisions": _serialize_ranked_decision_rows(
+            worst_completed_decisions,
+            metric_field="realized_return",
+        ),
+        "best_t7_decisions": _serialize_ranked_decision_rows(
+            best_t7_decisions,
+            metric_field="t_plus_7_return",
+        ),
+        "worst_t7_decisions": _serialize_ranked_decision_rows(
+            worst_t7_decisions,
+            metric_field="t_plus_7_return",
+        ),
+        "recommendations": deduped_recommendations[:6],
+    }
+
+
+def _load_json_dict(value: Any) -> dict[str, Any]:
+    if not value:
+        return {}
+    if isinstance(value, dict):
+        return value
+    try:
+        payload = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _extract_sample_price_context(row: dict[str, Any]) -> dict[str, Any]:
+    packet = _load_json_dict(row.get("packet_json"))
+    price_plan = packet.get("price_plan") or {}
+    entry_plan = _load_json_dict(row.get("entry_plan_json"))
+    invalidation = _load_json_dict(row.get("invalidation_json"))
+    entry_range = price_plan.get("entry_range") or entry_plan.get("entry_range") or {}
+    take_profit_range = price_plan.get("take_profit_range") or entry_plan.get("take_profit_range") or {}
+    invalidation_level = (
+        price_plan.get("invalidation_level")
+        or entry_plan.get("invalidation_level")
+        or invalidation.get("level")
+    )
+    invalidation_reason = (
+        price_plan.get("invalidation_reason")
+        or entry_plan.get("invalidation_reason")
+        or invalidation.get("reason")
+        or ""
+    )
+    return {
+        "entry_range": entry_range if isinstance(entry_range, dict) else {},
+        "take_profit_range": take_profit_range if isinstance(take_profit_range, dict) else {},
+        "invalidation_level": invalidation_level,
+        "invalidation_reason": invalidation_reason,
+    }
+
+
+def _sample_market_session_date(value: datetime) -> date:
+    normalized = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    normalized = normalized.astimezone(timezone.utc)
+    if normalized.hour == 0 and normalized.minute == 0 and normalized.second == 0 and normalized.microsecond == 0:
+        return normalized.date()
+    return normalized.astimezone(US_MARKET_TZ).date()
+
+
+def _sample_bar_overlaps_entry(bar: Bar, *, entry_low: float, entry_high: float) -> bool:
+    return float(bar.low) <= float(entry_high) and float(bar.high) >= float(entry_low)
+
+
+def _load_sample_bars(store: Store, symbol: str) -> list[Bar]:
+    return store.load_price_bars(symbol.strip().upper(), "1d", 400)
+
+
+def _build_sample_bar_preview(store: Store, row: dict[str, Any], price_context: dict[str, Any], *, limit: int = 6) -> list[dict[str, Any]]:
+    created_at_raw = str(row.get("created_at") or "").strip()
+    if not created_at_raw:
+        return []
+    try:
+        created_at = datetime.fromisoformat(created_at_raw)
+    except ValueError:
+        return []
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    else:
+        created_at = created_at.astimezone(timezone.utc)
+    bars = _load_sample_bars(store, str(row.get("symbol") or ""))
+    if not bars:
+        return []
+    target_date = _sample_market_session_date(created_at)
+    anchor_index = None
+    for index, bar in enumerate(bars):
+        if _sample_market_session_date(bar.timestamp) >= target_date:
+            anchor_index = index
+            break
+    if anchor_index is None:
+        return []
+    entry_range = price_context.get("entry_range") or {}
+    entry_low = entry_range.get("low")
+    entry_high = entry_range.get("high")
+    take_profit_range = price_context.get("take_profit_range") or {}
+    take_profit_level = take_profit_range.get("low")
+    invalidation_level = price_context.get("invalidation_level")
+    preview: list[dict[str, Any]] = []
+    for offset, bar in enumerate(bars[anchor_index : anchor_index + max(limit, 0)]):
+        tags: list[str] = []
+        if entry_low is not None and entry_high is not None and _sample_bar_overlaps_entry(
+            bar,
+            entry_low=float(entry_low),
+            entry_high=float(entry_high),
+        ):
+            tags.append("入场触碰")
+        if take_profit_level is not None and float(bar.high) >= float(take_profit_level):
+            tags.append("止盈触碰")
+        if invalidation_level is not None and float(bar.low) <= float(invalidation_level):
+            tags.append("失效触碰")
+        if offset == 0:
+            tags.append("锚点")
+        preview.append(
+            {
+                "session_date": _sample_market_session_date(bar.timestamp).isoformat(),
+                "open": round(float(bar.open), 4),
+                "high": round(float(bar.high), 4),
+                "low": round(float(bar.low), 4),
+                "close": round(float(bar.close), 4),
+                "adjusted": bool(getattr(bar, "adjusted", False)),
+                "tags": tags,
+            }
+        )
+    return preview
+
+
+def _build_sample_recompute_check(store: Store, row: dict[str, Any]) -> dict[str, Any]:
+    bars = _load_sample_bars(store, str(row.get("symbol") or ""))
+    if not bars:
+        return {
+            "status": "无法重算",
+            "issues": ["缺少 1d bars"],
+        }
+    computation = explain_decision_outcome(row, bars)
+    recomputed = computation.outcome
+    if recomputed is None:
+        return {
+            "status": "无法重算",
+            "issues": [computation.skip_reason or "当前口径无法从样本 bars 重算结果"],
+        }
+    issues: list[str] = []
+    if bool(row.get("entered")) != bool(recomputed.entered):
+        issues.append(f"entered: 存量={bool(row.get('entered'))} / 重算={bool(recomputed.entered)}")
+    if str(row.get("close_reason") or "") != str(recomputed.close_reason or ""):
+        issues.append(
+            f"close_reason: 存量={str(row.get('close_reason') or '-') } / 重算={str(recomputed.close_reason or '-')}"
+        )
+    for field, label in (
+        ("entry_price", "entry_price"),
+        ("exit_price", "exit_price"),
+        ("realized_return", "realized_return"),
+    ):
+        stored_value = row.get(field)
+        recomputed_value = getattr(recomputed, field)
+        if stored_value is None and recomputed_value is None:
+            continue
+        if stored_value is None or recomputed_value is None:
+            issues.append(f"{label}: 存量={stored_value} / 重算={recomputed_value}")
+            continue
+        if abs(float(stored_value) - float(recomputed_value)) > 0.01:
+            issues.append(f"{label}: 存量={stored_value} / 重算={recomputed_value}")
+    return {
+        "status": "一致" if not issues else "不一致",
+        "issues": issues,
+        "recomputed": {
+            "entered": recomputed.entered,
+            "close_reason": recomputed.close_reason,
+            "entry_price": recomputed.entry_price,
+            "exit_price": recomputed.exit_price,
+            "realized_return": recomputed.realized_return,
+        },
+    }
+
+
+def _summarize_adjusted_price_readiness(store: Store, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    symbols = sorted({str(row.get("symbol") or "").strip().upper() for row in rows if str(row.get("symbol") or "").strip()})
+    adjustment_rows = store.summarize_price_bar_adjustment(symbols, "1d")
+    by_symbol = {str(row["symbol"]).upper(): row for row in adjustment_rows}
+    missing_symbols = [symbol for symbol in symbols if symbol not in by_symbol]
+    unadjusted_symbols = [
+        symbol
+        for symbol, row in by_symbol.items()
+        if int(row["total_bars"] or 0) <= 0 or int(row["adjusted_bars"] or 0) < int(row["total_bars"] or 0)
+    ]
+    return {
+        "ready": bool(symbols) and not missing_symbols and not unadjusted_symbols,
+        "symbols": symbols,
+        "missing_symbols": missing_symbols,
+        "unadjusted_symbols": unadjusted_symbols,
+        "coverage": [
+            {
+                "symbol": symbol,
+                "total_bars": int(by_symbol[symbol]["total_bars"]),
+                "adjusted_bars": int(by_symbol[symbol]["adjusted_bars"]),
+                "unadjusted_bars": int(by_symbol[symbol]["unadjusted_bars"]),
+            }
+            for symbol in symbols
+            if symbol in by_symbol
+        ],
+    }
+
+
+def _sample_status_label(row: dict[str, Any]) -> str:
+    mapping = {
+        "hit_take_profit": "止盈退出",
+        "hit_invalidation": "失效退出",
+        "window_complete": "复盘窗口结算",
+        "insufficient_lookahead": "观察中",
+        "not_entered": "未进场",
+    }
+    return mapping.get(str(row.get("close_reason") or "").strip(), "未回补")
+
+
+def build_outcome_sample_payload(
+    store: Store,
+    *,
+    days: int,
+    limit: int,
+    start_date: str = "",
+    end_date: str = "",
+) -> dict[str, Any]:
+    window = _resolve_review_window(days=days, start_date=start_date, end_date=end_date)
+    archive_store, _ = _open_archive_store_if_available()
+    try:
+        main_rows = store.load_decision_records_for_window(
+            since=window["since"],
+            until=window["until"],
+            actions=EXECUTABLE_DECISION_ACTIONS,
+        )
+        archive_rows = (
+            archive_store.load_decision_records_for_window(
+                since=window["since"],
+                until=window["until"],
+                actions=EXECUTABLE_DECISION_ACTIONS,
+            )
+            if archive_store is not None
+            else []
+        )
+    finally:
+        if archive_store is not None:
+            archive_store.close()
+
+    merged_rows = _merge_decision_rows(list(main_rows), list(archive_rows))
+    sorted_rows = sorted(
+        merged_rows,
+        key=lambda row: (
+            0
+            if str(row.get("close_reason") or "") in {"hit_take_profit", "hit_invalidation", "window_complete"}
+            else 1,
+            str(row.get("created_at") or ""),
+            str(row.get("symbol") or ""),
+        ),
+        reverse=True,
+    )
+    samples: list[dict[str, Any]] = []
+    for row in sorted_rows[: max(limit, 0)]:
+        price_context = _extract_sample_price_context(dict(row))
+        adjustment_summary = store.summarize_price_bar_adjustment([str(row["symbol"]).upper()], "1d")
+        adjustment_row = adjustment_summary[0] if adjustment_summary else None
+        recompute_check = _build_sample_recompute_check(store, dict(row))
+        samples.append(
+            {
+                "decision_id": row["decision_id"],
+                "run_id": row["run_id"],
+                "symbol": row["symbol"],
+                "event_type": row["event_type"],
+                "pool": row["pool"],
+                "action": row["action"],
+                "priority": row["priority"],
+                "trigger_mode": row["trigger_mode"],
+                "created_at": row["created_at"],
+                "status_label": _sample_status_label(dict(row)),
+                "entered": bool(row.get("entered")),
+                "entered_at": row["entered_at"],
+                "entry_price": row["entry_price"],
+                "exit_price": row["exit_price"],
+                "realized_return": row["realized_return"],
+                "holding_days": row["holding_days"],
+                "entry_range": price_context["entry_range"],
+                "take_profit_range": price_context["take_profit_range"],
+                "invalidation_level": price_context["invalidation_level"],
+                "invalidation_reason": price_context["invalidation_reason"],
+                "bar_adjustment": (
+                    {
+                        "total_bars": int(adjustment_row["total_bars"]),
+                        "adjusted_bars": int(adjustment_row["adjusted_bars"]),
+                        "unadjusted_bars": int(adjustment_row["unadjusted_bars"]),
+                    }
+                    if adjustment_row is not None
+                    else None
+                ),
+                "bar_preview": _build_sample_bar_preview(store, dict(row), price_context),
+                "recompute_check": recompute_check,
+            }
+        )
+    consistency_summary = {
+        "matched": sum(1 for item in samples if (item.get("recompute_check") or {}).get("status") == "一致"),
+        "mismatched": sum(1 for item in samples if (item.get("recompute_check") or {}).get("status") == "不一致"),
+        "unavailable": sum(1 for item in samples if (item.get("recompute_check") or {}).get("status") == "无法重算"),
+    }
+    return {
+        "review_window": window,
+        "sample_count": len(samples),
+        "consistency_summary": consistency_summary,
+        "samples": samples,
+    }
+
+
+def _summarize_outcome_sample_audit(payload: dict[str, Any]) -> dict[str, Any]:
+    consistency_summary = payload.get("consistency_summary") or {}
+    sample_count = int(payload.get("sample_count") or 0)
+    matched = int(consistency_summary.get("matched") or 0)
+    mismatched = int(consistency_summary.get("mismatched") or 0)
+    unavailable = int(consistency_summary.get("unavailable") or 0)
+    if sample_count <= 0:
+        status = "未抽到样本"
+        summary_line = "当前窗口内没有可抽检样本，暂时无法做程序一致性核对。"
+    elif mismatched > 0:
+        status = "程序抽检未通过"
+        summary_line = f"抽检 {sample_count} 条样本，其中 {mismatched} 条与当前口径不一致。"
+    elif unavailable > 0:
+        status = "程序抽检部分通过"
+        summary_line = f"抽检 {sample_count} 条样本，其中 {matched} 条一致，另有 {unavailable} 条暂时无法重算。"
+    else:
+        status = "程序抽检通过"
+        summary_line = f"抽检 {sample_count} 条样本，全部与当前复盘口径一致。"
+    return {
+        "sample_count": sample_count,
+        "matched": matched,
+        "mismatched": mismatched,
+        "unavailable": unavailable,
+        "status": status,
+        "summary_line": summary_line,
+    }
+
+
+def _load_manual_outcome_audit(store: Store) -> dict[str, Any]:
+    raw = store.get_state(MANUAL_OUTCOME_AUDIT_STATE_KEY)
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _manual_audit_matches_review(manual_audit: dict[str, Any], review_window: dict[str, Any]) -> bool:
+    if not manual_audit:
+        return False
+    if str(manual_audit.get("review_version") or "") != HISTORICAL_EFFECT_REVIEW_VERSION:
+        return False
+    if str(manual_audit.get("status") or "") != "通过":
+        return False
+    audit_window = manual_audit.get("review_window") or {}
+    return (
+        str(audit_window.get("start_date") or "") == str(review_window.get("start_date") or "")
+        and str(audit_window.get("end_date") or "") == str(review_window.get("end_date") or "")
+    )
+
+
+def _load_review_baseline(store: Store) -> dict[str, Any]:
+    raw = store.get_state(HISTORICAL_EFFECT_BASELINE_STATE_KEY)
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _review_baseline_matches_version(baseline: dict[str, Any]) -> bool:
+    if not baseline:
+        return False
+    return str(baseline.get("review_version") or "") == HISTORICAL_EFFECT_REVIEW_VERSION
+
+
+def format_outcome_sample_payload(payload: dict[str, Any]) -> str:
+    window = payload.get("review_window") or {}
+    samples = list(payload.get("samples") or [])
+    lines = [
+        "后验样本抽检：",
+        f"统计区间：{window.get('start_date', '-')} ~ {window.get('end_date', '-')}",
+        f"抽样数量：{len(samples)}",
+    ]
+    consistency_summary = payload.get("consistency_summary") or {}
+    if consistency_summary:
+        lines.append(
+            "核对摘要："
+            f" 一致 {consistency_summary.get('matched', 0)}"
+            f" / 不一致 {consistency_summary.get('mismatched', 0)}"
+            f" / 无法重算 {consistency_summary.get('unavailable', 0)}"
+        )
+    if not samples:
+        lines.append("当前窗口内没有可抽检的可执行决策样本。")
+        return "\n".join(lines)
+    for index, row in enumerate(samples, start=1):
+        entry = row.get("entry_range") or {}
+        take_profit = row.get("take_profit_range") or {}
+        entry_text = "-"
+        if entry:
+            entry_text = f"{entry.get('low', '-')}-{entry.get('high', '-')}"
+        take_profit_text = "-"
+        if take_profit:
+            take_profit_text = f"{take_profit.get('low', '-')}-{take_profit.get('high', '-')}"
+        lines.append(
+            f"{index}. {row.get('symbol', '-')} | {row.get('action', '-')} | {row.get('event_type', '-')} | {row.get('status_label', '-')}"
+        )
+        lines.append(
+            f"   决策：{row.get('decision_id', '-')} | run={row.get('run_id', '-')} | 创建时间 {row.get('created_at', '-')}"
+        )
+        lines.append(
+            f"   价格计划：入场 {entry_text}，止盈 {take_profit_text}，失效价 {row.get('invalidation_level', '-')}"
+        )
+        lines.append(
+            f"   执行结果：进场 {row.get('entered', False)}，进场时间 {row.get('entered_at', '-') or '-'}，进场价 {row.get('entry_price', '-') or '-'}，退出价 {row.get('exit_price', '-') or '-'}，真实收益 {row.get('realized_return', '-') or '-'}%，持有 {row.get('holding_days', '-') if row.get('holding_days') is not None else '-'} 天"
+        )
+        adjustment = row.get("bar_adjustment") or {}
+        if adjustment:
+            lines.append(
+                f"   日线复权：总计 {adjustment.get('total_bars', 0)}，复权 {adjustment.get('adjusted_bars', 0)}，未复权 {adjustment.get('unadjusted_bars', 0)}"
+            )
+        preview = list(row.get("bar_preview") or [])
+        recompute_check = row.get("recompute_check") or {}
+        lines.append(f"   重算核对：{recompute_check.get('status', '-')}")
+        for issue in recompute_check.get("issues", []):
+            lines.append(f"     * {issue}")
+        if preview:
+            lines.append("   K线轨迹：")
+            for bar in preview:
+                tags = " / ".join(bar.get("tags") or []) or "-"
+                lines.append(
+                    f"     - {bar.get('session_date', '-')} O={bar.get('open', '-')} H={bar.get('high', '-')} L={bar.get('low', '-')} C={bar.get('close', '-')} | 复权={'是' if bar.get('adjusted') else '否'} | 标记={tags}"
+                )
+    return "\n".join(lines)
+
+
+def build_manual_outcome_audit_payload(
+    store: Store,
+    *,
+    days: int,
+    limit: int,
+    start_date: str = "",
+    end_date: str = "",
+    reviewer: str = "codex",
+) -> dict[str, Any]:
+    sample_payload = build_outcome_sample_payload(
+        store,
+        days=days,
+        limit=limit,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    audit_summary = _summarize_outcome_sample_audit(sample_payload)
+    status = "通过" if audit_summary["mismatched"] == 0 and audit_summary["unavailable"] == 0 and audit_summary["sample_count"] > 0 else "未通过"
+    return {
+        "status": status,
+        "review_version": HISTORICAL_EFFECT_REVIEW_VERSION,
+        "review_window": sample_payload.get("review_window") or {},
+        "reviewed_at": utcnow().isoformat(),
+        "reviewer": reviewer,
+        "sample_count": audit_summary["sample_count"],
+        "matched": audit_summary["matched"],
+        "mismatched": audit_summary["mismatched"],
+        "unavailable": audit_summary["unavailable"],
+        "summary_line": audit_summary["summary_line"],
+        "decision_ids": [
+            str(sample.get("decision_id") or "")
+            for sample in sample_payload.get("samples") or []
+            if str(sample.get("decision_id") or "")
+        ],
+        "source_sample_audit": sample_payload,
+    }
+
+
+def format_manual_outcome_audit_payload(payload: dict[str, Any]) -> str:
+    window = payload.get("review_window") or {}
+    lines = [
+        "AI样本复核记录：",
+        f"状态：{payload.get('status', '-')}",
+        f"复盘口径版本：{payload.get('review_version', '-')}",
+        f"统计区间：{window.get('start_date', '-')} ~ {window.get('end_date', '-')}",
+        f"核对时间：{format_beijing_minute(payload.get('reviewed_at'))}",
+        f"核对人：{payload.get('reviewer', '-')}",
+        f"说明：{payload.get('summary_line', '-')}",
+        (
+            "样本摘要："
+            f" 抽检 {payload.get('sample_count', 0)}"
+            f" / 一致 {payload.get('matched', 0)}"
+            f" / 不一致 {payload.get('mismatched', 0)}"
+            f" / 无法重算 {payload.get('unavailable', 0)}"
+        ),
+    ]
+    decision_ids = list(payload.get("decision_ids") or [])
+    if decision_ids:
+        lines.append(f"覆盖决策：{'、'.join(decision_ids)}")
+    return "\n".join(lines)
+
+
+def build_review_baseline_payload(*, reviewer: str = "codex", note: str = "") -> dict[str, Any]:
+    return {
+        "status": "已冻结",
+        "review_version": HISTORICAL_EFFECT_REVIEW_VERSION,
+        "frozen_at": utcnow().isoformat(),
+        "reviewer": reviewer,
+        "note": note,
+    }
+
+
+def format_review_baseline_payload(payload: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "复盘口径冻结记录：",
+            f"状态：{payload.get('status', '-')}",
+            f"复盘口径版本：{payload.get('review_version', '-')}",
+            f"冻结时间：{format_beijing_minute(payload.get('frozen_at'))}",
+            f"冻结人：{payload.get('reviewer', '-')}",
+            f"备注：{payload.get('note') or '-'}",
+        ]
+    )
+
+
+def _build_remote_market_data_provider() -> MultiSourceMarketDataProvider:
+    return MultiSourceMarketDataProvider(
+        [
+            YahooFinanceMarketDataProvider(),
+            StooqDailyMarketDataProvider(),
+        ]
+    )
 
 
 def build_service(
@@ -77,15 +1224,21 @@ def build_service(
     _sync_watchlist_if_needed(store, settings, runtime_config)
     watchlist = store.load_watchlist()
     stock_watchlist = store.load_watchlist(asset_type="stock")
+    prewatch_symbols = _resolve_prewatch_symbols(runtime_config, watchlist)
+    google_feed_symbols = _limit_symbols_for_source(
+        _prioritize_symbols_for_source(prewatch_symbols, watchlist),
+        settings.max_google_feed_symbols_per_run,
+    )
     adapters = []
     if replay_path:
         adapters.append(JsonlReplaySourceAdapter(Path(replay_path)))
-    if settings.use_sec_filings_source and stock_watchlist:
-        adapters.append(SecFilingsSourceAdapter(symbols=stock_watchlist, user_agent=settings.sec_user_agent))
-    if settings.use_google_news_source and watchlist:
-        adapters.append(GoogleNewsSourceAdapter(symbols=watchlist, mode="news"))
-    if settings.use_google_research_source and watchlist:
-        adapters.append(GoogleNewsSourceAdapter(symbols=watchlist, mode="research"))
+    sec_watchlist = sorted(symbol for symbol in stock_watchlist if _is_sec_eligible_symbol(symbol))
+    if settings.use_sec_filings_source and sec_watchlist:
+        adapters.append(SecFilingsSourceAdapter(symbols=sec_watchlist, user_agent=settings.sec_user_agent))
+    if settings.use_google_news_source and google_feed_symbols:
+        adapters.append(GoogleNewsSourceAdapter(symbols=google_feed_symbols, mode="news"))
+    if settings.use_google_research_source and google_feed_symbols:
+        adapters.append(GoogleNewsSourceAdapter(symbols=google_feed_symbols, mode="research"))
     source_adapter = CompositeSourceAdapter(adapters) if adapters else StaticSourceAdapter([])
     extractor = OpenAIExtractor(
         api_key=settings.openai_api_key,
@@ -94,7 +1247,7 @@ def build_service(
     )
     transport = FeishuTransport(settings.feishu_webhook) if settings.feishu_webhook else None
     notifier = Notifier(store=store, transport=transport, dry_run=settings.dry_run)
-    provider = CachedMarketDataProvider(store=store, remote_provider=YahooFinanceMarketDataProvider())
+    provider = CachedMarketDataProvider(store=store, remote_provider=_build_remote_market_data_provider())
     return SatelliteAgentService(
         settings=settings,
         store=store,
@@ -110,25 +1263,88 @@ def build_service(
             "runtime_config": runtime_config.to_record(),
             "replay_path": replay_path,
             "active_watchlist_count": len(watchlist),
+            "active_google_feed_symbol_count": len(google_feed_symbols),
         },
         run_name=run_name,
         note=note,
+        prewatch_symbols=prewatch_symbols,
     )
 
 
 def _sync_watchlist_if_needed(store: Store, settings: Settings, runtime_config: AgentRuntimeConfig) -> None:
-    current = store.load_watchlist()
-    if current:
-        return
+    target_stocks: list[str] = []
+    target_etfs: list[str] = []
     if runtime_config.has_watchlist():
-        store.replace_watchlist(runtime_config.watchlist.stocks, runtime_config.watchlist.etfs)
+        target_stocks = runtime_config.watchlist.stocks
+        target_etfs = runtime_config.watchlist.etfs
+    else:
+        default_runtime_config = load_default_template_runtime_config()
+        if default_runtime_config.has_watchlist():
+            target_stocks = default_runtime_config.watchlist.stocks
+            target_etfs = default_runtime_config.watchlist.etfs
+    if not target_stocks and not target_etfs:
         return
-    default_runtime_config = load_default_template_runtime_config()
-    if default_runtime_config.has_watchlist():
-        store.replace_watchlist(
-            default_runtime_config.watchlist.stocks,
-            default_runtime_config.watchlist.etfs,
-        )
+    current_stocks = store.load_watchlist(asset_type="stock")
+    current_etfs = store.load_watchlist(asset_type="etf")
+    if current_stocks == set(target_stocks) and current_etfs == set(target_etfs):
+        return
+    store.replace_watchlist(target_stocks, target_etfs)
+
+
+def _is_sec_eligible_symbol(symbol: str) -> bool:
+    normalized = symbol.upper()
+    if normalized in SEC_EXCLUDED_SYMBOLS:
+        return False
+    if "." in normalized or "-" in normalized:
+        return False
+    if len(normalized) == 5 and normalized.endswith(("Y", "F")):
+        return False
+    return True
+
+
+def _resolve_prewatch_symbols(runtime_config: AgentRuntimeConfig, watchlist: set[str]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def append_symbols(symbols: list[str]) -> None:
+        for symbol in symbols:
+            normalized = symbol.upper()
+            if normalized not in watchlist or normalized in seen:
+                continue
+            seen.add(normalized)
+            ordered.append(normalized)
+
+    if runtime_config.has_watchlist():
+        append_symbols(runtime_config.watchlist.stocks)
+        append_symbols(runtime_config.watchlist.etfs)
+    else:
+        default_runtime_config = load_default_template_runtime_config()
+        if default_runtime_config.has_watchlist():
+            append_symbols(default_runtime_config.watchlist.stocks)
+            append_symbols(default_runtime_config.watchlist.etfs)
+
+    if not ordered:
+        ordered.extend(sorted(watchlist))
+
+    return ordered
+
+
+def _prioritize_symbols_for_source(preferred_symbols: list[str], watchlist: set[str]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for symbol in preferred_symbols + sorted(watchlist):
+        normalized = symbol.upper()
+        if normalized not in watchlist or normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(normalized)
+    return ordered
+
+
+def _limit_symbols_for_source(symbols: list[str], cap: int) -> list[str]:
+    if cap <= 0:
+        return list(symbols)
+    return list(symbols[:cap])
 
 
 def _add_experiment_args(parser: argparse.ArgumentParser) -> None:
@@ -230,17 +1446,214 @@ def _parse_timestamp(raw: str):
     return datetime.fromisoformat(raw)
 
 
-def build_strategy_report_payload(store: Store, *, days: int, limit: int) -> dict:
-    since = (utcnow() - timedelta(days=days)).isoformat()
-    event_types = store.aggregate_event_type_performance(since=since, limit=limit)
-    source_stability = store.aggregate_source_stability(since=since, limit=limit)
-    alert_volume = store.aggregate_alert_volume(since=since, limit=days)
-    return serialize_strategy_report(event_types, source_stability, alert_volume)
+def _round_weighted_average(total: float, sample_count: int) -> float | None:
+    if sample_count <= 0:
+        return None
+    return round(total / sample_count, 2)
+
+
+def _merge_outcome_rows(
+    primary_rows: list[dict] | list[object],
+    secondary_rows: list[dict] | list[object],
+    *,
+    key_field: str,
+) -> list[dict[str, int | float | str | None]]:
+    merged: dict[str, dict[str, int | float | str | None]] = {}
+    for rows in (primary_rows, secondary_rows):
+        for raw_row in rows:
+            row = dict(raw_row)
+            key = str(row.get(key_field) or "")
+            if not key:
+                continue
+            item = merged.setdefault(
+                key,
+                {
+                    key_field: key,
+                    "decision_count": 0,
+                    "outcome_count": 0,
+                    "pending_count": 0,
+                    "take_profit_hits": 0,
+                    "invalidation_hits": 0,
+                    "positive_t3_count": 0,
+                    "t_plus_3_sample_count": 0,
+                    "max_runup_sample_count": 0,
+                    "max_drawdown_sample_count": 0,
+                    "_t3_total": 0.0,
+                    "_runup_total": 0.0,
+                    "_drawdown_total": 0.0,
+                },
+            )
+            item["decision_count"] = int(item["decision_count"]) + int(row.get("decision_count") or 0)
+            item["outcome_count"] = int(item["outcome_count"]) + int(row.get("outcome_count") or 0)
+            item["pending_count"] = int(item["pending_count"]) + int(row.get("pending_count") or 0)
+            item["take_profit_hits"] = int(item["take_profit_hits"]) + int(row.get("take_profit_hits") or 0)
+            item["invalidation_hits"] = int(item["invalidation_hits"]) + int(row.get("invalidation_hits") or 0)
+            item["positive_t3_count"] = int(item["positive_t3_count"]) + int(row.get("positive_t3_count") or 0)
+            t3_samples = int(row.get("t_plus_3_sample_count") or 0)
+            runup_samples = int(row.get("max_runup_sample_count") or 0)
+            drawdown_samples = int(row.get("max_drawdown_sample_count") or 0)
+            item["t_plus_3_sample_count"] = int(item["t_plus_3_sample_count"]) + t3_samples
+            item["max_runup_sample_count"] = int(item["max_runup_sample_count"]) + runup_samples
+            item["max_drawdown_sample_count"] = int(item["max_drawdown_sample_count"]) + drawdown_samples
+            item["_t3_total"] = float(item["_t3_total"]) + float(row.get("avg_t_plus_3_return") or 0.0) * t3_samples
+            item["_runup_total"] = float(item["_runup_total"]) + float(row.get("avg_max_runup") or 0.0) * runup_samples
+            item["_drawdown_total"] = float(item["_drawdown_total"]) + float(row.get("avg_max_drawdown") or 0.0) * drawdown_samples
+    merged_rows: list[dict[str, int | float | str | None]] = []
+    for row in merged.values():
+        merged_rows.append(
+            {
+                key_field: row[key_field],
+                "decision_count": int(row["decision_count"]),
+                "outcome_count": int(row["outcome_count"]),
+                "pending_count": int(row["pending_count"]),
+                "take_profit_hits": int(row["take_profit_hits"]),
+                "invalidation_hits": int(row["invalidation_hits"]),
+                "positive_t3_count": int(row["positive_t3_count"]),
+                "t_plus_3_sample_count": int(row["t_plus_3_sample_count"]),
+                "max_runup_sample_count": int(row["max_runup_sample_count"]),
+                "max_drawdown_sample_count": int(row["max_drawdown_sample_count"]),
+                "avg_t_plus_3_return": _round_weighted_average(float(row["_t3_total"]), int(row["t_plus_3_sample_count"])),
+                "avg_max_runup": _round_weighted_average(float(row["_runup_total"]), int(row["max_runup_sample_count"])),
+                "avg_max_drawdown": _round_weighted_average(float(row["_drawdown_total"]), int(row["max_drawdown_sample_count"])),
+            }
+        )
+    return sorted(
+        merged_rows,
+        key=lambda row: (
+            -int(row["outcome_count"]),
+            -(float(row["avg_t_plus_3_return"]) if row["avg_t_plus_3_return"] is not None else float("-inf")),
+            -int(row["decision_count"]),
+            str(row[key_field]),
+        ),
+    )
+
+
+def _summarize_outcome_rows(rows: list[dict] | list[object]) -> dict[str, int]:
+    total_decisions = 0
+    total_outcomes = 0
+    total_pending = 0
+    for raw_row in rows:
+        row = dict(raw_row)
+        total_decisions += int(row.get("decision_count") or 0)
+        total_outcomes += int(row.get("outcome_count") or 0)
+        total_pending += int(row.get("pending_count") or 0)
+    total_completed = max(total_outcomes - total_pending, 0)
+    return {
+        "decision_count": total_decisions,
+        "outcome_count": total_outcomes,
+        "pending_count": total_pending,
+        "completed_count": total_completed,
+    }
+
+
+def _row_to_outcome_summary(row: object | dict | None) -> dict[str, int]:
+    if row is None:
+        return {
+            "decision_count": 0,
+            "outcome_count": 0,
+            "pending_count": 0,
+            "completed_count": 0,
+        }
+    payload = dict(row)
+    return {
+        "decision_count": int(payload.get("decision_count") or 0),
+        "outcome_count": int(payload.get("outcome_count") or 0),
+        "pending_count": int(payload.get("pending_count") or 0),
+        "completed_count": int(payload.get("completed_count") or 0),
+    }
+
+
+def _merge_outcome_summaries(primary: dict[str, int], secondary: dict[str, int]) -> dict[str, int]:
+    return {
+        "decision_count": int(primary.get("decision_count", 0)) + int(secondary.get("decision_count", 0)),
+        "outcome_count": int(primary.get("outcome_count", 0)) + int(secondary.get("outcome_count", 0)),
+        "pending_count": int(primary.get("pending_count", 0)) + int(secondary.get("pending_count", 0)),
+        "completed_count": int(primary.get("completed_count", 0)) + int(secondary.get("completed_count", 0)),
+    }
+
+
+def _open_archive_store_if_available(path: Path | None = None) -> tuple[Store | None, Path | None]:
+    archive_path = (path or DEFAULT_ARCHIVE_DB_PATH).resolve()
+    if not archive_path.exists():
+        return None, None
+    archive_store = Store(archive_path)
+    archive_store.initialize()
+    return archive_store, archive_path
+
+
+def build_strategy_report_payload(
+    store: Store,
+    *,
+    days: int,
+    limit: int,
+    start_date: str = "",
+    end_date: str = "",
+    archive_store: Store | None = None,
+    archive_db_path: str = "",
+) -> dict:
+    window = _resolve_review_window(days=days, start_date=start_date, end_date=end_date)
+    since = window["since"]
+    until = window["until"]
+    event_types = store.aggregate_event_type_performance(since=since, until=until, limit=limit)
+    source_stability = store.aggregate_source_stability(since=since, until=until, limit=limit)
+    alert_volume = store.aggregate_alert_volume(since=since, until=until, limit=window["window_days"])
+    main_event_outcomes = store.aggregate_decision_outcomes_by_event_type(since=since, until=until, limit=limit)
+    main_pool_outcomes = store.aggregate_decision_outcomes_by_pool(since=since, until=until, limit=limit)
+    main_summary = _row_to_outcome_summary(store.summarize_decision_outcomes(since, until))
+    archive_event_outcomes: list[dict] | list[object] = []
+    archive_pool_outcomes: list[dict] | list[object] = []
+    archive_summary = {
+        "decision_count": 0,
+        "outcome_count": 0,
+        "pending_count": 0,
+        "completed_count": 0,
+    }
+    if archive_store is not None:
+        archive_event_outcomes = archive_store.aggregate_decision_outcomes_by_event_type(since=since, until=until, limit=limit)
+        archive_pool_outcomes = archive_store.aggregate_decision_outcomes_by_pool(since=since, until=until, limit=limit)
+        archive_summary = _row_to_outcome_summary(archive_store.summarize_decision_outcomes(since, until))
+    decision_outcomes_by_event_type = _merge_outcome_rows(
+        list(main_event_outcomes),
+        list(archive_event_outcomes),
+        key_field="event_type",
+    )[:limit]
+    decision_outcomes_by_pool = _merge_outcome_rows(
+        list(main_pool_outcomes),
+        list(archive_pool_outcomes),
+        key_field="pool",
+    )[:limit]
+    scope = "main_plus_archive" if archive_store is not None else "main_only"
+    scope_label = "主库热数据 + 归档库" if archive_store is not None else "主库热数据"
+    combined_summary = _merge_outcome_summaries(main_summary, archive_summary)
+    return serialize_strategy_report(
+        event_types,
+        source_stability,
+        alert_volume,
+        decision_outcomes_by_event_type,
+        decision_outcomes_by_pool,
+        {
+            "scope": scope,
+            "scope_label": scope_label,
+            "window_days": window["window_days"],
+            "start_date": window["start_date"],
+            "end_date": window["end_date"],
+            "main_store": main_summary,
+            "archive_store": {
+                "present": archive_store is not None,
+                **archive_summary,
+            },
+            "combined": combined_summary,
+            "archive_db_path": archive_db_path,
+            "archive_label": f"归档库（{archive_db_path}）" if archive_db_path else "归档库",
+        },
+    )
 
 
 def _build_run_scoped_strategy_report(store: Store, *, run_id: str, limit: int) -> dict:
     event_type_rows = store.aggregate_event_type_performance_for_run(run_id, limit=limit)
     alert_rows = store.aggregate_alert_volume_for_run(run_id)
+    decision_outcomes_by_event_type = store.aggregate_decision_outcomes_by_event_type_for_run(run_id, limit=limit)
+    decision_outcomes_by_pool = store.aggregate_decision_outcomes_by_pool_for_run(run_id, limit=limit)
     source_health_rows = serialize_source_health(store.load_source_health(run_id))
     source_stability = []
     for row in source_health_rows:
@@ -254,18 +1667,10 @@ def _build_run_scoped_strategy_report(store: Store, *, run_id: str, limit: int) 
                 "last_checked_at": row["checked_at"],
             }
         )
-    return {
-        "event_type_performance": [
-            {
-                "event_type": row["event_type"],
-                "card_count": row["card_count"],
-                "avg_final_score": row["avg_final_score"],
-                "high_priority_count": row["high_priority_count"],
-            }
-            for row in event_type_rows
-        ],
-        "source_stability": source_stability,
-        "alert_volume": [
+    return serialize_strategy_report(
+        event_type_rows,
+        source_stability,
+        [
             {
                 "bucket_date": run_id,
                 "total_alerts": row["total_alerts"],
@@ -276,7 +1681,53 @@ def _build_run_scoped_strategy_report(store: Store, *, run_id: str, limit: int) 
             }
             for row in alert_rows
         ],
-    }
+        decision_outcomes_by_event_type,
+        decision_outcomes_by_pool,
+    )
+
+
+def _build_historical_strategy_report(
+    store: Store,
+    *,
+    days: int,
+    limit: int,
+    start_date: str = "",
+    end_date: str = "",
+) -> dict:
+    archive_store, archive_db_path = _open_archive_store_if_available()
+    try:
+        return build_strategy_report_payload(
+            store,
+            days=days,
+            limit=limit,
+            start_date=start_date,
+            end_date=end_date,
+            archive_store=archive_store,
+            archive_db_path=str(archive_db_path) if archive_db_path is not None else "",
+        )
+    finally:
+        if archive_store is not None:
+            archive_store.close()
+
+
+def _build_historical_outcome_context(store: Store, *, days: int, limit: int) -> tuple[dict[str, dict], dict[str, dict]]:
+    since = (utcnow() - timedelta(days=days)).isoformat()
+    archive_store, _archive_db_path = _open_archive_store_if_available()
+    try:
+        event_type_context_rows = _merge_outcome_rows(
+            list(store.aggregate_decision_outcomes_by_event_type(since=since, limit=limit)),
+            list(archive_store.aggregate_decision_outcomes_by_event_type(since=since, limit=limit)) if archive_store is not None else [],
+            key_field="event_type",
+        )[:limit]
+        pool_context_rows = _merge_outcome_rows(
+            list(store.aggregate_decision_outcomes_by_pool(since=since, limit=limit)),
+            list(archive_store.aggregate_decision_outcomes_by_pool(since=since, limit=limit)) if archive_store is not None else [],
+            key_field="pool",
+        )[:limit]
+    finally:
+        if archive_store is not None:
+            archive_store.close()
+    return _build_outcome_context_index(event_type_context_rows, pool_context_rows)
 
 
 def build_replay_evaluation_payload(store: Store, *, run_id: str, days: int, limit: int) -> dict:
@@ -284,12 +1735,24 @@ def build_replay_evaluation_payload(store: Store, *, run_id: str, days: int, lim
     run_detail = serialize_run_detail(run_row, store.load_logs(run_id, limit=200)) if run_row else None
     strategy_report = _build_run_scoped_strategy_report(store, run_id=run_id, limit=limit)
     source_health = serialize_source_health(store.load_source_health(run_id))
+    event_type_context, pool_context = _build_historical_outcome_context(store, days=days, limit=limit)
     card_diagnostics = _build_card_diagnostics(
         run_detail,
         store.load_opportunity_cards(run_id),
         store.load_alert_history(run_id),
     )
-    return serialize_replay_evaluation(run_detail, strategy_report, source_health, card_diagnostics)
+    decision_diagnostics = _build_decision_diagnostics(
+        store.load_decision_records(run_id),
+        event_type_context=event_type_context,
+        pool_context=pool_context,
+    )
+    return serialize_replay_evaluation(
+        run_detail,
+        strategy_report,
+        source_health,
+        card_diagnostics,
+        decision_diagnostics,
+    )
 
 
 def build_run_comparison_payload(store: Store, *, run_ids: list[str], limit: int) -> dict:
@@ -321,6 +1784,8 @@ def _build_card_diagnostics(
     config_snapshot = run_detail.get("config_snapshot", {})
     settings = config_snapshot.get("settings", {})
     horizons = settings.get("horizons", {})
+    runtime_watchlist = config_snapshot.get("runtime_config", {}).get("watchlist", {})
+    symbol_theme_map = build_symbol_theme_map_from_watchlist_payload(runtime_watchlist)
     event_threshold = settings.get("event_score_threshold")
     alert_by_card_id: dict[str, dict] = {}
     for row in alert_rows or []:
@@ -366,15 +1831,41 @@ def _build_card_diagnostics(
             else None
         )
         alert_state = alert_by_card_id.get(card["card_id"], {})
+        delivery = build_delivery_view_from_record(card)
         items.append(
             {
                 "card_id": card["card_id"],
                 "symbol": card["symbol"],
+                "display_name": card.get("display_name", ""),
                 "horizon": horizon,
                 "event_type": card["event_type"],
                 "priority": card["priority"],
+                "action_label": card.get("action_label", ""),
+                "confidence_label": card.get("confidence_label", ""),
                 "headline_summary": card.get("headline_summary", ""),
                 "reason_to_watch": card.get("reason_to_watch", ""),
+                "positioning_hint": card.get("positioning_hint", ""),
+                "delivery_view": delivery,
+                "identity": delivery["identity"],
+                "event_type_display": delivery["event_type_display"],
+                "priority_display": delivery["priority_display"],
+                "horizon_display": delivery["horizon_display"],
+                "action_label_effective": delivery["action_label_effective"],
+                "confidence_label_effective": delivery["confidence_label_effective"],
+                "source_summary": delivery["source_summary"],
+                "event_reason_line": delivery["event_reason_line"],
+                "market_reason_line": delivery["market_reason_line"],
+                "theme_reason_line": delivery["theme_reason_line"],
+                "valid_until_text": delivery["valid_until_text"],
+                "market_data_complete": delivery["market_data_complete"],
+                "promoted_from_prewatch": card.get("promoted_from_prewatch", False),
+                "prewatch_score": card.get("prewatch_score", 0.0),
+                "prewatch_setup_type": card.get("prewatch_setup_type", ""),
+                "theme_tags": card.get("theme_tags") or theme_tags_for_symbol(card["symbol"], symbol_theme_map),
+                "confirmed_peer_symbols": card.get("confirmed_peer_symbols", []),
+                "trend_state": card.get("trend_state", ""),
+                "rsi_14": card.get("rsi_14"),
+                "relative_volume": card.get("relative_volume"),
                 "source_refs": card.get("source_refs", []),
                 "event_score": card["event_score"],
                 "market_score": card["market_score"],
@@ -400,6 +1891,207 @@ def _build_card_diagnostics(
     return items
 
 
+def _build_outcome_context_index(
+    event_type_rows: list[dict] | list[object],
+    pool_rows: list[dict] | list[object],
+) -> tuple[dict[str, dict], dict[str, dict]]:
+    event_type_context: dict[str, dict] = {}
+    pool_context: dict[str, dict] = {}
+    for row in event_type_rows:
+        key = str(row["event_type"] or "").strip()
+        if not key:
+            continue
+        event_type_context[key] = {
+            "event_type": key,
+            "decision_count": row["decision_count"],
+            "outcome_count": row["outcome_count"],
+            "pending_count": row["pending_count"],
+            "take_profit_hits": row["take_profit_hits"],
+            "invalidation_hits": row["invalidation_hits"],
+            "positive_t3_count": row["positive_t3_count"],
+            "avg_t_plus_3_return": row["avg_t_plus_3_return"],
+        }
+    for row in pool_rows:
+        key = str(row["pool"] or "").strip()
+        if not key:
+            continue
+        pool_context[key] = {
+            "pool": key,
+            "decision_count": row["decision_count"],
+            "outcome_count": row["outcome_count"],
+            "pending_count": row["pending_count"],
+            "take_profit_hits": row["take_profit_hits"],
+            "invalidation_hits": row["invalidation_hits"],
+            "positive_t3_count": row["positive_t3_count"],
+            "avg_t_plus_3_return": row["avg_t_plus_3_return"],
+        }
+    return event_type_context, pool_context
+
+
+def _build_decision_diagnostics(
+    rows: list[object],
+    *,
+    event_type_context: dict[str, dict] | None = None,
+    pool_context: dict[str, dict] | None = None,
+) -> list[dict]:
+    event_type_context = event_type_context or {}
+    pool_context = pool_context or {}
+    items = []
+    for row in rows:
+        try:
+            packet = json.loads(row["packet_json"]) if row["packet_json"] else {}
+        except json.JSONDecodeError:
+            packet = {}
+        theme_ids = []
+        try:
+            theme_ids = json.loads(row["theme_ids_json"]) if row["theme_ids_json"] else []
+        except json.JSONDecodeError:
+            theme_ids = []
+        event_type = str(row["event_type"] or packet.get("event_assessment", {}).get("event_type") or "").strip()
+        items.append(
+            {
+                "decision_id": row["decision_id"],
+                "symbol": row["symbol"],
+                "event_type": event_type,
+                "pool": row["pool"],
+                "pool_label": {
+                    "prewatch": "预备池",
+                    "confirmation": "确认池",
+                    "exit": "兑现池",
+                }.get(row["pool"], row["pool"]),
+                "action": row["action"],
+                "priority": row["priority"],
+                "confidence": row["confidence"],
+                "event_score": row["event_score"],
+                "market_score": row["market_score"],
+                "theme_score": row["theme_score"],
+                "final_score": row["final_score"],
+                "trigger_mode": row["trigger_mode"],
+                "llm_used": bool(row["llm_used"]),
+                "theme_ids": theme_ids,
+                "packet": packet,
+                "created_at": row["created_at"],
+                "t_plus_1_return": row["t_plus_1_return"],
+                "t_plus_3_return": row["t_plus_3_return"],
+                "t_plus_5_return": row["t_plus_5_return"],
+                "t_plus_7_return": row["t_plus_7_return"],
+                "t_plus_10_return": row["t_plus_10_return"],
+                "t_plus_14_return": row["t_plus_14_return"],
+                "t_plus_30_return": row["t_plus_30_return"],
+                "max_runup": row["max_runup"],
+                "max_drawdown": row["max_drawdown"],
+                "hit_take_profit": bool(row["hit_take_profit"]) if row["hit_take_profit"] is not None else False,
+                "hit_invalidation": bool(row["hit_invalidation"]) if row["hit_invalidation"] is not None else False,
+                "close_reason": row["close_reason"] or "",
+                "event_type_outcome_context": event_type_context.get(event_type, {}),
+                "pool_outcome_context": pool_context.get(str(row["pool"] or ""), {}),
+            }
+        )
+    return items
+
+
+def format_decision_outcome_backfill(payload: dict) -> str:
+    lines = [
+        "决策结果回写：",
+        f"扫描记录：{payload.get('scanned', 0)}",
+        f"成功回写：{payload.get('updated', 0)}",
+        f"跳过：{payload.get('skipped', 0)}",
+        f"运行范围：{payload.get('run_id') or '全部运行'}",
+        (
+            "结果状态："
+            f"完整窗口 {payload.get('completed_window', 0)} / "
+            f"等待更多 bars {payload.get('pending_lookahead', 0)}"
+        ),
+        (
+            "命中情况："
+            f"止盈 {payload.get('take_profit_hits', 0)} / "
+            f"失效 {payload.get('invalidation_hits', 0)}"
+        ),
+    ]
+    skip_reasons = payload.get("skip_reasons") or {}
+    skip_symbol_samples = payload.get("skip_symbol_samples") or {}
+    if any(int(value or 0) > 0 for value in skip_reasons.values()):
+        lines.append(
+            "跳过原因："
+            f"缺少 bars {skip_reasons.get('missing_bars', 0)} / "
+            f"bars 过旧 {skip_reasons.get('stale_bars', 0)} / "
+            f"缺少锚点 bar {skip_reasons.get('missing_anchor_bar', 0)} / "
+            f"锚点价格无效 {skip_reasons.get('invalid_anchor_price', 0)} / "
+            f"创建时间异常 {skip_reasons.get('invalid_created_at', 0)}"
+        )
+    stale_symbols = list(skip_symbol_samples.get("stale_bars") or [])
+    if stale_symbols:
+        lines.append(f"bars 过旧标的：{'、'.join(stale_symbols)}")
+    missing_symbols = list(skip_symbol_samples.get("missing_bars") or [])
+    if missing_symbols:
+        lines.append(f"缺少 bars 标的：{'、'.join(missing_symbols)}")
+    attempted_symbols = list(payload.get("fetch_attempted_symbols") or [])
+    if attempted_symbols:
+        lines.append(f"远程补抓尝试：{'、'.join(attempted_symbols)}")
+    failed_symbols = list(payload.get("fetch_failed_symbols") or [])
+    if failed_symbols:
+        lines.append(f"远程补抓未更新：{'、'.join(failed_symbols)}")
+    failure_reasons = payload.get("fetch_failure_reasons") or {}
+    if failure_reasons:
+        parts = [f"{symbol}={reason}" for symbol, reason in failure_reasons.items()]
+        lines.append(f"远程补抓原因：{'；'.join(parts)}")
+    stale_symbol_details = payload.get("stale_symbol_details") or {}
+    if stale_symbol_details:
+        detail_parts: list[str] = []
+        for symbol in sorted(stale_symbol_details):
+            detail = stale_symbol_details.get(symbol) or {}
+            target_session = str(detail.get("target_session") or "-")
+            latest_local = str(detail.get("latest_local_session") or "-")
+            latest_remote = str(detail.get("latest_remote_session") or "-")
+            detail_parts.append(
+                f"{symbol}(目标 {target_session} / 本地最新 {latest_local} / 远程最新 {latest_remote})"
+            )
+        lines.append(f"过旧详情：{'；'.join(detail_parts)}")
+    return "\n".join(lines)
+
+
+def format_decision_history_archive(payload: dict) -> str:
+    lines = [
+        "决策历史归档：",
+        f"模式：{'正式归档' if payload.get('mode') == 'apply' else '预演'}",
+        f"归档截止：{payload.get('before', '-')}",
+        f"扫描记录：{payload.get('scanned', 0)}",
+        f"决策记录：{payload.get('decision_records', 0)}",
+        f"后验结果：{payload.get('decision_outcomes', 0)}",
+    ]
+    if payload.get("archive_db_path"):
+        lines.append(f"归档库：{payload.get('archive_db_path')}")
+    if payload.get("mode") == "apply":
+        lines.append(f"已复制：记录 {payload.get('copied_records', 0)} / 后验 {payload.get('copied_outcomes', 0)}")
+        lines.append(f"已删除：记录 {payload.get('deleted_records', 0)} / 后验 {payload.get('deleted_outcomes', 0)}")
+    else:
+        lines.append("当前仅做预演统计，未修改主库。")
+    return "\n".join(lines)
+
+
+def _auto_backfill_review_outcomes(store: Store) -> dict[str, Any]:
+    provider = _build_remote_market_data_provider()
+
+    def _fetch_bars(symbol: str, timeframe: str, limit: int) -> list[Bar]:
+        return provider.get_bars(symbol, timeframe, limit)
+
+    try:
+        payload = backfill_recent_decision_outcomes(store, fetch_bars=_fetch_bars)
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "updated": 0,
+            "scanned": 0,
+            "skipped": 0,
+            "fetched_symbols": 0,
+            "error": str(exc),
+        }
+    return {
+        "status": "ok",
+        **payload,
+    }
+
+
 def _execute_replay_evaluation(
     settings: Settings,
     runtime_config: AgentRuntimeConfig,
@@ -420,6 +2112,7 @@ def _execute_replay_evaluation(
     )
     try:
         service.run_once()
+        _auto_backfill_review_outcomes(service.store)
         latest_run = service.store.load_latest_run()
         if latest_run is None:
             raise RuntimeError("No run generated during replay evaluation.")
@@ -594,6 +2287,14 @@ def _preferred_runtime_config_path(settings: Settings) -> Path:
     if recommended.exists():
         return recommended.resolve()
     return settings.config_path.resolve()
+
+
+def _preferred_batch_replay_template_path() -> str:
+    preferred = Path(SATELLITE_BATCH_REPLAY_TEMPLATE_PATH)
+    legacy = Path(LEGACY_BATCH_REPLAY_TEMPLATE_PATH)
+    if preferred.exists() or not legacy.exists():
+        return str(preferred)
+    return str(legacy)
 
 
 def _extract_recommended_experiment(payload: dict) -> dict:
@@ -802,6 +2503,7 @@ def build_daily_run_payload(
     )
     try:
         service.run_once()
+        outcome_backfill = _auto_backfill_review_outcomes(service.store)
         latest_run = service.store.load_latest_run()
         if latest_run is None:
             raise RuntimeError("No run generated during daily run.")
@@ -814,20 +2516,51 @@ def build_daily_run_payload(
             service.store.load_opportunity_cards(run_id),
             service.store.load_alert_history(run_id),
         )
+        event_type_context, pool_context = _build_historical_outcome_context(
+            service.store,
+            days=RECENT_PERFORMANCE_WINDOW_DAYS,
+            limit=limit,
+        )
+        decision_diagnostics = _build_decision_diagnostics(
+            service.store.load_decision_records(run_id),
+            event_type_context=event_type_context,
+            pool_context=pool_context,
+        )
 
         review_path = workspace_dir / "daily_run_review.md"
         payload_path = workspace_dir / "daily_run_payload.json"
-        review_text = format_run_review(run_detail, strategy_report, source_health, card_diagnostics)
-        health_summary = summarize_run_health(run_detail, strategy_report, source_health, card_diagnostics)
+        review_text = format_run_review(
+            run_detail,
+            strategy_report,
+            source_health,
+            card_diagnostics,
+            decision_diagnostics,
+        )
+        health_summary = summarize_run_health(
+            run_detail,
+            strategy_report,
+            source_health,
+            card_diagnostics,
+            decision_diagnostics,
+        )
         review_payload = {
             "run": run_detail,
             "strategy_report": strategy_report,
             "source_health": source_health,
             "card_diagnostics": card_diagnostics,
+            "decision_diagnostics": decision_diagnostics,
             "health_summary": health_summary,
+            "outcome_backfill": outcome_backfill,
         }
         _write_report(review_path, review_text)
         _write_json(payload_path, review_payload)
+        historical_effect_payload = build_performance_review_payload(
+            service.store,
+            workspace_dir=workspace_dir,
+            run_id=run_id,
+            days=RECENT_PERFORMANCE_WINDOW_DAYS,
+            limit=limit,
+        )
 
         top_event = (
             strategy_report.get("event_type_performance", [{}])[0].get("event_type", "-")
@@ -847,7 +2580,9 @@ def build_daily_run_payload(
             "cards_generated": summary.get("cards_generated", 0),
             "alerts_sent": summary.get("alerts_sent", 0),
             "top_event": top_event,
+            "outcome_backfill": outcome_backfill,
             "review_path": str(review_path),
+            "historical_effect_review_path": historical_effect_payload.get("performance_review_path", ""),
             "payload_path": str(payload_path),
         }
     finally:
@@ -867,7 +2602,16 @@ def format_daily_run(payload: dict) -> str:
         f"卡片数：{payload.get('cards_generated', '-')}",
         f"提醒数：{payload.get('alerts_sent', '-')}",
         f"主事件类型：{payload.get('top_event', '-')}",
-        f"复盘报告：{payload.get('review_path', '-')}",
+        (
+            "后验回补："
+                f"最近 {((payload.get('outcome_backfill') or {}).get('days', '-'))} 天，"
+                f"扫描 {((payload.get('outcome_backfill') or {}).get('scanned', 0))} / "
+                f"更新 {((payload.get('outcome_backfill') or {}).get('updated', 0))} / "
+                f"跳过 {((payload.get('outcome_backfill') or {}).get('skipped', 0))} / "
+                f"补 bars {((payload.get('outcome_backfill') or {}).get('fetched_symbols', 0))}"
+            ),
+        f"运行过程复盘：{payload.get('review_path', '-')}",
+        f"历史效果复盘：{payload.get('historical_effect_review_path', '-')}",
         f"结构化数据：{payload.get('payload_path', '-')}",
     ]
     if payload.get("replay_path"):
@@ -875,33 +2619,200 @@ def format_daily_run(payload: dict) -> str:
     return "\n".join(lines)
 
 
-def write_live_run_artifacts(store: Store, *, run_id: str, workspace_dir: Path, limit: int) -> dict:
+def build_performance_review_payload(
+    store: Store,
+    *,
+    workspace_dir: Path,
+    run_id: str,
+    days: int,
+    limit: int,
+    start_date: str = "",
+    end_date: str = "",
+) -> dict:
     workspace_dir = workspace_dir.resolve()
     workspace_dir.mkdir(parents=True, exist_ok=True)
-    payload = build_replay_evaluation_payload(store, run_id=run_id, days=14, limit=limit)
-    review_path = workspace_dir / "latest_live_review.md"
-    payload_path = workspace_dir / "latest_live_payload.json"
+    historical_effect_dir = workspace_dir / "historical_effect"
+    historical_effect_dir.mkdir(parents=True, exist_ok=True)
+
+    selected_run_id = run_id
+    run_row = store.load_run(run_id) if run_id else store.load_latest_run()
+    if run_row is not None:
+        selected_run_id = str(run_row["run_id"])
+
+    run_detail = None
+    strategy_report: dict[str, Any] = serialize_strategy_report([], [], [], [], [], {})
+    source_health: list[dict[str, Any]] = []
+    card_diagnostics: list[dict[str, Any]] = []
+    decision_diagnostics: list[dict[str, Any]] = []
+    health_summary = {"status": "-", "line_items": []}
+
+    if run_row is not None and selected_run_id:
+        run_detail = serialize_run_detail(run_row, store.load_logs(selected_run_id, limit=200))
+        strategy_report = _build_run_scoped_strategy_report(store, run_id=selected_run_id, limit=limit)
+        source_health = serialize_source_health(store.load_source_health(selected_run_id))
+        card_diagnostics = _build_card_diagnostics(
+            run_detail,
+            store.load_opportunity_cards(selected_run_id),
+            store.load_alert_history(selected_run_id),
+        )
+        event_type_context, pool_context = _build_historical_outcome_context(
+            store,
+            days=days,
+            limit=limit,
+        )
+        decision_diagnostics = _build_decision_diagnostics(
+            store.load_decision_records(selected_run_id),
+            event_type_context=event_type_context,
+            pool_context=pool_context,
+        )
+        health_summary = summarize_run_health(
+            run_detail,
+            strategy_report,
+            source_health,
+            card_diagnostics,
+            decision_diagnostics,
+        )
+
+    historical_effect_review = _build_historical_effect_review_data(
+        store,
+        days=days,
+        limit=limit,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    performance_review_text = format_recent_performance_review(historical_effect_review)
+    sample_audit_payload = build_outcome_sample_payload(
+        store,
+        days=days,
+        limit=OUTCOME_SAMPLE_AUDIT_LIMIT,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    sample_audit_text = format_outcome_sample_payload(sample_audit_payload)
+
+    performance_review_path = historical_effect_dir / "review.md"
+    payload_path = historical_effect_dir / "review_payload.json"
+    sample_audit_path = historical_effect_dir / "sample_audit.md"
+    sample_audit_payload_path = historical_effect_dir / "sample_audit_payload.json"
+    payload = {
+        "workspace_dir": str(workspace_dir),
+        "database_path": str(store.database_path.resolve()),
+        "run_id": selected_run_id,
+        "window_days": historical_effect_review["review_window"]["window_days"],
+        "limit": limit,
+        "performance_review_path": str(performance_review_path),
+        "payload_path": str(payload_path),
+        "sample_audit_path": str(sample_audit_path),
+        "sample_audit_payload_path": str(sample_audit_payload_path),
+        "historical_effect_review": historical_effect_review,
+        "sample_audit": sample_audit_payload,
+        "current_run": run_detail,
+        "current_strategy_report": strategy_report,
+        "health_summary": health_summary,
+    }
+    _write_report(performance_review_path, performance_review_text)
+    _write_json(payload_path, payload)
+    _write_report(sample_audit_path, sample_audit_text)
+    _write_json(sample_audit_payload_path, sample_audit_payload)
+    return payload
+
+
+def format_performance_review_result(payload: dict) -> str:
+    review = payload.get("historical_effect_review") or {}
+    window = review.get("review_window") or {}
+    return "\n".join(
+        [
+            "历史效果复盘：",
+            f"工作目录：{payload.get('workspace_dir', '-')}",
+            f"数据库：{payload.get('database_path', '-')}",
+            f"参考运行：{payload.get('run_id', '-') or '-'}",
+            f"状态：{review.get('status', '-')}",
+            f"复盘口径版本：{review.get('review_version', '-')}",
+            f"统计区间：{window.get('start_date', '-')} ~ {window.get('end_date', '-')}",
+            f"样本抽检：{payload.get('sample_audit_path', '-')}",
+            f"报告文件：{payload.get('performance_review_path', '-')}",
+            f"结构化数据：{payload.get('payload_path', '-')}",
+        ]
+    )
+
+
+def _should_refresh_historical_effect_review(*, workspace_dir: Path, min_interval_seconds: int) -> bool:
+    if min_interval_seconds <= 0:
+        return True
+    review_path = workspace_dir / "historical_effect" / "review.md"
+    if not review_path.exists():
+        return True
+    modified_at = datetime.fromtimestamp(review_path.stat().st_mtime, tz=timezone.utc)
+    return (utcnow() - modified_at).total_seconds() >= float(min_interval_seconds)
+
+
+def write_live_run_artifacts(
+    store: Store,
+    *,
+    run_id: str,
+    workspace_dir: Path,
+    limit: int,
+    review_filename: str,
+    payload_filename: str,
+    historical_effect_min_interval_seconds: int = 0,
+) -> dict:
+    workspace_dir = workspace_dir.resolve()
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    outcome_backfill = _auto_backfill_review_outcomes(store)
+    payload = build_replay_evaluation_payload(store, run_id=run_id, days=RECENT_PERFORMANCE_WINDOW_DAYS, limit=limit)
+    review_path = workspace_dir / review_filename
+    payload_path = workspace_dir / payload_filename
     review_text = format_run_review(
         payload["run"],
         payload["strategy_report"],
         payload["source_health"],
         payload["card_diagnostics"],
+        payload.get("decision_diagnostics", []),
     )
     _write_report(review_path, review_text)
     _write_json(payload_path, payload)
+    should_refresh_historical_effect = _should_refresh_historical_effect_review(
+        workspace_dir=workspace_dir,
+        min_interval_seconds=historical_effect_min_interval_seconds,
+    )
+    historical_effect_review_path = str((workspace_dir / "historical_effect" / "review.md").resolve())
+    if should_refresh_historical_effect:
+        historical_effect_payload = build_performance_review_payload(
+            store,
+            workspace_dir=workspace_dir,
+            run_id=run_id,
+            days=RECENT_PERFORMANCE_WINDOW_DAYS,
+            limit=limit,
+        )
+        historical_effect_review_path = historical_effect_payload.get("performance_review_path", historical_effect_review_path)
     return {
         "run_id": run_id,
+        "outcome_backfill": outcome_backfill,
         "review_path": str(review_path),
+        "historical_effect_review_path": historical_effect_review_path,
+        "historical_effect_review_refreshed": should_refresh_historical_effect,
         "payload_path": str(payload_path),
     }
 
 
 def format_live_run_artifacts(payload: dict) -> str:
+    historical_effect_line = f"历史效果复盘：{payload.get('historical_effect_review_path', '-')}"
+    if not payload.get("historical_effect_review_refreshed", True):
+        historical_effect_line += "（本轮沿用上次刷新）"
     return "\n".join(
         [
             "实时运行结果已落盘：",
             f"运行 ID：{payload.get('run_id', '-')}",
-            f"复盘文档：{payload.get('review_path', '-')}",
+            (
+                "后验回补："
+                f"最近 {((payload.get('outcome_backfill') or {}).get('days', '-'))} 天，"
+                f"扫描 {((payload.get('outcome_backfill') or {}).get('scanned', 0))} / "
+                f"更新 {((payload.get('outcome_backfill') or {}).get('updated', 0))} / "
+                f"跳过 {((payload.get('outcome_backfill') or {}).get('skipped', 0))} / "
+                f"补 bars {((payload.get('outcome_backfill') or {}).get('fetched_symbols', 0))}"
+            ),
+            f"运行过程复盘：{payload.get('review_path', '-')}",
+            historical_effect_line,
             f"结构化数据：{payload.get('payload_path', '-')}",
         ]
     )
@@ -945,6 +2856,44 @@ def format_live_cycle_finished(
     )
 
 
+def format_live_cycle_paused(*, as_of, next_run_at, reason: str) -> str:
+    return "\n".join(
+        [
+            "实时监控当前处于等待窗口：",
+            f"当前时间：{format_beijing_minute(as_of)}",
+            f"等待原因：{reason}",
+            f"下次预计启动：{format_beijing_minute(next_run_at)}",
+        ]
+    )
+
+
+def _runtime_window_pause(runtime_config: AgentRuntimeConfig, *, now=None) -> tuple[bool, object | None]:
+    schedule = runtime_config.runtime_window
+    if not schedule.is_configured():
+        return False, None
+    current = now or utcnow()
+    if schedule.is_active_at(current):
+        return False, None
+    return True, schedule.next_window_start_after(current)
+
+
+def _sleep_until_runtime_window(runtime_config: AgentRuntimeConfig) -> None:
+    paused, next_run_at = _runtime_window_pause(runtime_config)
+    if not paused or next_run_at is None:
+        return
+    now = utcnow()
+    print(
+        format_live_cycle_paused(
+            as_of=now,
+            next_run_at=next_run_at,
+            reason="当前不在允许的运行时间窗内",
+        ),
+        flush=True,
+    )
+    sleep_seconds = max((next_run_at - now).total_seconds(), 1.0)
+    time.sleep(sleep_seconds)
+
+
 def _build_test_notification_card(symbol: str = "NVDA") -> OpportunityCard:
     now = utcnow()
     return OpportunityCard(
@@ -970,14 +2919,22 @@ def _build_test_notification_card(symbol: str = "NVDA") -> OpportunityCard:
         priority="high",
         dedup_key=f"test:{symbol.upper()}:feishu",
         bias="long",
+        display_name=symbol.upper(),
+        action_label="确认做多",
+        confidence_label="高",
+        confidence_score=88.0,
         reason_to_watch="如果你能在手机飞书里看到这张卡片，说明提醒链路已可用于真实监控。",
+        trend_state="bullish",
+        rsi_14=58.4,
+        relative_volume=1.62,
+        theme_tags=["测试链路"],
     )
 
 
 def send_test_notification(settings: Settings, *, symbol: str = "NVDA") -> dict:
     if not settings.feishu_webhook:
         raise ValueError(
-            "飞书 webhook 未配置。请在 config/agent.json 的 notifications.feishu_webhook 中填写，"
+            "飞书 webhook 未配置。请在 config/satellite_agent/agent.json 的 notifications.feishu_webhook 中填写，"
             "或设置 SATELLITE_FEISHU_WEBHOOK 环境变量。"
         )
     transport = FeishuTransport(settings.feishu_webhook)
@@ -1024,7 +2981,7 @@ def build_demo_flow_payload(
     batch_spec_copy_path = workspace_dir / "demo_batch_spec.json"
     batch_index_path = workspace_dir / "batch_index.md"
     batch_output_dir = workspace_dir / "batch_runs"
-    promoted_config_path = workspace_dir / "recommended_agent.json"
+    promoted_config_path = workspace_dir / "agent.recommended.json"
 
     replay_settings = settings.with_overrides(database_path=workspace_dir / "demo_replay.db")
     replay_payload = _execute_replay_evaluation(
@@ -1041,6 +2998,7 @@ def build_demo_flow_payload(
         replay_payload["strategy_report"],
         replay_payload["source_health"],
         replay_payload["card_diagnostics"],
+        replay_payload.get("decision_diagnostics", []),
     )
     _write_report(replay_report_path, replay_report)
     _write_json(replay_json_path, replay_payload)
@@ -1126,8 +3084,8 @@ def main() -> None:
     run_once_parser.add_argument("--replay-path", default="", help="JSONL event replay file")
     run_once_parser.add_argument(
         "--workspace-dir",
-        default="./data/live_run",
-        help="实时结果落盘目录，默认写入 ./data/live_run",
+        default=RUN_ONCE_WORKSPACE_DIR,
+        help=f"手动运行结果落盘目录，默认写入 {RUN_ONCE_WORKSPACE_DIR}",
     )
     run_once_parser.add_argument("--limit", type=int, default=10, help="Strategy report row limit for written artifacts")
     _add_experiment_args(run_once_parser)
@@ -1136,8 +3094,8 @@ def main() -> None:
     serve_parser.add_argument("--replay-path", default="", help="JSONL event replay file")
     serve_parser.add_argument(
         "--workspace-dir",
-        default="./data/live_run",
-        help="实时结果落盘目录，默认写入 ./data/live_run",
+        default=SERVE_WORKSPACE_DIR,
+        help=f"常驻运行结果落盘目录，默认写入 {SERVE_WORKSPACE_DIR}",
     )
     serve_parser.add_argument("--limit", type=int, default=10, help="Strategy report row limit for written artifacts")
     _add_experiment_args(serve_parser)
@@ -1175,9 +3133,55 @@ def main() -> None:
     report_sources_parser.add_argument("--json", action="store_true")
 
     report_strategy_parser = subparsers.add_parser("report-strategy")
-    report_strategy_parser.add_argument("--days", type=int, default=14)
+    report_strategy_parser.add_argument("--days", type=int, default=RECENT_PERFORMANCE_WINDOW_DAYS)
+    report_strategy_parser.add_argument("--start-date", default="", help="历史效果复盘起始日期，格式 YYYY-MM-DD")
+    report_strategy_parser.add_argument("--end-date", default="", help="历史效果复盘结束日期，格式 YYYY-MM-DD")
     report_strategy_parser.add_argument("--limit", type=int, default=10)
     report_strategy_parser.add_argument("--json", action="store_true")
+
+    performance_report_parser = subparsers.add_parser("write-performance-review")
+    performance_report_parser.add_argument("--workspace-dir", default=SERVE_WORKSPACE_DIR)
+    performance_report_parser.add_argument("--run-id", default="")
+    performance_report_parser.add_argument("--days", type=int, default=RECENT_PERFORMANCE_WINDOW_DAYS)
+    performance_report_parser.add_argument("--start-date", default="", help="历史效果复盘起始日期，格式 YYYY-MM-DD")
+    performance_report_parser.add_argument("--end-date", default="", help="历史效果复盘结束日期，格式 YYYY-MM-DD")
+    performance_report_parser.add_argument("--limit", type=int, default=10)
+    performance_report_parser.add_argument("--json", action="store_true")
+
+    outcome_sample_parser = subparsers.add_parser("report-outcome-samples")
+    outcome_sample_parser.add_argument("--days", type=int, default=RECENT_PERFORMANCE_WINDOW_DAYS)
+    outcome_sample_parser.add_argument("--start-date", default="", help="样本抽检起始日期，格式 YYYY-MM-DD")
+    outcome_sample_parser.add_argument("--end-date", default="", help="样本抽检结束日期，格式 YYYY-MM-DD")
+    outcome_sample_parser.add_argument("--limit", type=int, default=10)
+    outcome_sample_parser.add_argument("--json", action="store_true")
+
+    manual_audit_parser = subparsers.add_parser("write-outcome-audit")
+    manual_audit_parser.add_argument("--workspace-dir", default=SERVE_WORKSPACE_DIR)
+    manual_audit_parser.add_argument("--days", type=int, default=RECENT_PERFORMANCE_WINDOW_DAYS)
+    manual_audit_parser.add_argument("--start-date", default="", help="AI复核起始日期，格式 YYYY-MM-DD")
+    manual_audit_parser.add_argument("--end-date", default="", help="AI复核结束日期，格式 YYYY-MM-DD")
+    manual_audit_parser.add_argument("--limit", type=int, default=OUTCOME_SAMPLE_AUDIT_LIMIT)
+    manual_audit_parser.add_argument("--reviewer", default="codex")
+    manual_audit_parser.add_argument("--json", action="store_true")
+
+    freeze_review_parser = subparsers.add_parser("freeze-review-baseline")
+    freeze_review_parser.add_argument("--workspace-dir", default=SERVE_WORKSPACE_DIR)
+    freeze_review_parser.add_argument("--reviewer", default="codex")
+    freeze_review_parser.add_argument("--note", default="")
+    freeze_review_parser.add_argument("--json", action="store_true")
+
+    outcome_parser = subparsers.add_parser("backfill-decision-outcomes")
+    outcome_parser.add_argument("--run-id", default="")
+    outcome_parser.add_argument("--limit", type=int, default=0)
+    outcome_parser.add_argument("--recompute-existing", action="store_true")
+    outcome_parser.add_argument("--json", action="store_true")
+
+    archive_parser = subparsers.add_parser("archive-decision-history")
+    archive_parser.add_argument("--before", required=True, help="Archive decision history created before this ISO timestamp/date")
+    archive_parser.add_argument("--archive-db-path", default=str(DEFAULT_ARCHIVE_DB_PATH))
+    archive_parser.add_argument("--limit", type=int, default=0)
+    archive_parser.add_argument("--apply", action="store_true", help="Actually copy old decision history into archive DB and delete it from the main DB")
+    archive_parser.add_argument("--json", action="store_true")
 
     replay_eval_parser = subparsers.add_parser("replay-evaluate")
     replay_eval_parser.add_argument("--replay-path", required=True)
@@ -1189,7 +3193,7 @@ def main() -> None:
 
     batch_replay_parser = subparsers.add_parser("batch-replay")
     batch_replay_parser.add_argument("--spec-path", required=True)
-    batch_replay_parser.add_argument("--output-dir", default="./data/batch_runs")
+    batch_replay_parser.add_argument("--output-dir", default=BATCH_RUNS_DIR)
     batch_replay_parser.add_argument("--markdown-path", default="")
     batch_replay_parser.add_argument("--json", action="store_true")
 
@@ -1205,12 +3209,12 @@ def main() -> None:
     compare_batches_parser.add_argument("--json", action="store_true")
 
     list_batches_parser = subparsers.add_parser("list-batches")
-    list_batches_parser.add_argument("--dir", default="./data/batch_runs")
+    list_batches_parser.add_argument("--dir", default=BATCH_RUNS_DIR)
     list_batches_parser.add_argument("--limit", type=int, default=10)
     list_batches_parser.add_argument("--json", action="store_true")
 
     daily_run_parser = subparsers.add_parser("daily-run")
-    daily_run_parser.add_argument("--workspace-dir", default="./data/daily_run")
+    daily_run_parser.add_argument("--workspace-dir", default=DAILY_RUN_WORKSPACE_DIR)
     daily_run_parser.add_argument("--config-path", default="")
     daily_run_parser.add_argument("--replay-path", default="")
     daily_run_parser.add_argument("--days", type=int, default=14)
@@ -1223,15 +3227,15 @@ def main() -> None:
 
     promote_batch_parser = subparsers.add_parser("promote-batch")
     promote_batch_parser.add_argument("--manifest-path", required=True)
-    promote_batch_parser.add_argument("--output-config-path", default="./config/agent.recommended.json")
+    promote_batch_parser.add_argument("--output-config-path", default="./config/satellite_agent/agent.recommended.json")
     promote_batch_parser.add_argument("--base-config-path", default="")
     promote_batch_parser.add_argument("--force", action="store_true", help="Allow overwriting the target config")
     promote_batch_parser.add_argument("--json", action="store_true")
 
     demo_flow_parser = subparsers.add_parser("demo-flow")
-    demo_flow_parser.add_argument("--workspace-dir", default="./data/demo_flow")
+    demo_flow_parser.add_argument("--workspace-dir", default=DEMO_FLOW_DIR)
     demo_flow_parser.add_argument("--replay-path", default="tests/fixtures/events.jsonl")
-    demo_flow_parser.add_argument("--batch-spec-path", default="config/batch_replay.template.json")
+    demo_flow_parser.add_argument("--batch-spec-path", default=_preferred_batch_replay_template_path())
     demo_flow_parser.add_argument("--days", type=int, default=14)
     demo_flow_parser.add_argument("--limit", type=int, default=10)
     demo_flow_parser.add_argument("--json", action="store_true")
@@ -1280,7 +3284,7 @@ def main() -> None:
         import_bars(store, Path(args.path), args.symbol, args.timeframe)
         return
     if args.command == "sync-yahoo-bars":
-        provider = YahooFinanceMarketDataProvider()
+        provider = _build_remote_market_data_provider()
         bars = provider.get_bars(args.symbol.upper(), args.timeframe, args.limit)
         store.upsert_price_bars(args.symbol.upper(), args.timeframe, bars)
         return
@@ -1317,20 +3321,166 @@ def main() -> None:
         print(format_source_health(rows))
         return
     if args.command == "report-strategy":
-        since = (utcnow() - timedelta(days=args.days)).isoformat()
-        event_types = store.aggregate_event_type_performance(since=since, limit=args.limit)
-        source_stability = store.aggregate_source_stability(since=since, limit=args.limit)
-        alert_volume = store.aggregate_alert_volume(since=since, limit=args.days)
+        report = _build_historical_strategy_report(
+            store,
+            days=args.days,
+            limit=args.limit,
+            start_date=args.start_date,
+            end_date=args.end_date,
+        )
         if args.json:
-            print(
-                json.dumps(
-                    serialize_strategy_report(event_types, source_stability, alert_volume),
-                    indent=2,
-                    sort_keys=True,
-                )
-            )
+            print(json.dumps(report, indent=2, sort_keys=True))
             return
-        print(format_strategy_report(event_types, source_stability, alert_volume))
+        print(
+            format_strategy_report(
+                report.get("event_type_performance", []),
+                report.get("source_stability", []),
+                report.get("alert_volume", []),
+                report.get("decision_outcomes_by_event_type", []),
+                report.get("decision_outcomes_by_pool", []),
+                report.get("outcome_data_coverage"),
+            )
+        )
+        return
+    if args.command == "write-performance-review":
+        payload = build_performance_review_payload(
+            store,
+            workspace_dir=Path(args.workspace_dir),
+            run_id=args.run_id,
+            days=args.days,
+            limit=args.limit,
+            start_date=args.start_date,
+            end_date=args.end_date,
+        )
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return
+        print(format_performance_review_result(payload))
+        return
+    if args.command == "report-outcome-samples":
+        payload = build_outcome_sample_payload(
+            store,
+            days=args.days,
+            limit=args.limit,
+            start_date=args.start_date,
+            end_date=args.end_date,
+        )
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return
+        print(format_outcome_sample_payload(payload))
+        return
+    if args.command == "write-outcome-audit":
+        workspace_dir = Path(args.workspace_dir).resolve()
+        workspace_dir.mkdir(parents=True, exist_ok=True)
+        historical_effect_dir = workspace_dir / "historical_effect"
+        historical_effect_dir.mkdir(parents=True, exist_ok=True)
+        payload = build_manual_outcome_audit_payload(
+            store,
+            days=args.days,
+            limit=args.limit,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            reviewer=args.reviewer,
+        )
+        audit_path = historical_effect_dir / "ai_review.md"
+        audit_payload_path = historical_effect_dir / "ai_review_payload.json"
+        store.set_state(MANUAL_OUTCOME_AUDIT_STATE_KEY, json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        _write_report(audit_path, format_manual_outcome_audit_payload(payload))
+        _write_json(audit_payload_path, payload)
+        result = {
+            "workspace_dir": str(workspace_dir),
+            "audit_path": str(audit_path),
+            "audit_payload_path": str(audit_payload_path),
+            "audit": payload,
+        }
+        if args.json:
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return
+        print(
+            "\n".join(
+                [
+                    "AI样本复核：",
+                    f"工作目录：{workspace_dir}",
+                    f"状态：{payload.get('status', '-')}",
+                    f"统计区间：{(payload.get('review_window') or {}).get('start_date', '-')} ~ {(payload.get('review_window') or {}).get('end_date', '-')}",
+                    f"记录文件：{audit_path}",
+                    f"结构化数据：{audit_payload_path}",
+                ]
+            )
+        )
+        return
+    if args.command == "freeze-review-baseline":
+        workspace_dir = Path(args.workspace_dir).resolve()
+        workspace_dir.mkdir(parents=True, exist_ok=True)
+        historical_effect_dir = workspace_dir / "historical_effect"
+        historical_effect_dir.mkdir(parents=True, exist_ok=True)
+        payload = build_review_baseline_payload(reviewer=args.reviewer, note=args.note)
+        baseline_path = historical_effect_dir / "review_baseline.md"
+        baseline_payload_path = historical_effect_dir / "review_baseline_payload.json"
+        store.set_state(HISTORICAL_EFFECT_BASELINE_STATE_KEY, json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        _write_report(baseline_path, format_review_baseline_payload(payload))
+        _write_json(baseline_payload_path, payload)
+        result = {
+            "workspace_dir": str(workspace_dir),
+            "baseline_path": str(baseline_path),
+            "baseline_payload_path": str(baseline_payload_path),
+            "baseline": payload,
+        }
+        if args.json:
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return
+        print(
+            "\n".join(
+                [
+                    "复盘口径冻结：",
+                    f"工作目录：{workspace_dir}",
+                    f"状态：{payload.get('status', '-')}",
+                    f"复盘口径版本：{payload.get('review_version', '-')}",
+                    f"记录文件：{baseline_path}",
+                    f"结构化数据：{baseline_payload_path}",
+                ]
+            )
+        )
+        return
+    if args.command == "backfill-decision-outcomes":
+        provider = _build_remote_market_data_provider()
+
+        def _fetch_bars(symbol: str, timeframe: str, limit: int) -> list[Bar]:
+            return provider.get_bars(symbol, timeframe, limit)
+
+        payload = backfill_decision_outcomes(
+            store,
+            run_id=args.run_id,
+            limit=args.limit,
+            recompute_existing=args.recompute_existing,
+            fetch_bars=_fetch_bars,
+        )
+        payload["run_id"] = args.run_id
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return
+        print(format_decision_outcome_backfill(payload))
+        return
+    if args.command == "archive-decision-history":
+        archive_db_path = Path(args.archive_db_path).resolve()
+        archive_store = Store(archive_db_path)
+        archive_store.initialize()
+        try:
+            payload = archive_decision_history(
+                store,
+                archive_store,
+                before=args.before,
+                limit=args.limit,
+                apply=args.apply,
+            )
+        finally:
+            archive_store.close()
+        payload["archive_db_path"] = str(archive_db_path)
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return
+        print(format_decision_history_archive(payload))
         return
     if args.command == "replay-evaluate":
         evaluation_settings = settings
@@ -1354,6 +3504,7 @@ def main() -> None:
                 payload["strategy_report"],
                 payload["source_health"],
                 payload["card_diagnostics"],
+                payload.get("decision_diagnostics", []),
             )
         )
         return
@@ -1532,6 +3683,8 @@ def main() -> None:
                     run_id=latest_run["run_id"],
                     workspace_dir=Path(args.workspace_dir),
                     limit=args.limit,
+                    review_filename="run_once_review.md",
+                    payload_filename="run_once_payload.json",
                 )
                 print(format_live_run_artifacts(payload), flush=True)
             raise
@@ -1542,6 +3695,8 @@ def main() -> None:
                 run_id=latest_run["run_id"],
                 workspace_dir=Path(args.workspace_dir),
                 limit=args.limit,
+                review_filename="run_once_review.md",
+                payload_filename="run_once_payload.json",
             )
             print(format_live_run_artifacts(payload), flush=True)
             print(
@@ -1565,6 +3720,7 @@ def main() -> None:
             apply_runtime_config=False,
         )
         while True:
+            _sleep_until_runtime_window(runtime_config)
             started_at = utcnow()
             print(format_live_cycle_started(started_at=started_at, workspace_dir=Path(args.workspace_dir)), flush=True)
             try:
@@ -1577,6 +3733,9 @@ def main() -> None:
                         run_id=latest_run["run_id"],
                         workspace_dir=Path(args.workspace_dir),
                         limit=args.limit,
+                        review_filename="serve_review.md",
+                        payload_filename="serve_payload.json",
+                        historical_effect_min_interval_seconds=SERVE_HISTORICAL_EFFECT_REFRESH_SECONDS,
                     )
                     print(format_live_run_artifacts(payload), flush=True)
                 raise
@@ -1587,6 +3746,9 @@ def main() -> None:
                     run_id=latest_run["run_id"],
                     workspace_dir=Path(args.workspace_dir),
                     limit=args.limit,
+                    review_filename="serve_review.md",
+                    payload_filename="serve_payload.json",
+                    historical_effect_min_interval_seconds=SERVE_HISTORICAL_EFFECT_REFRESH_SECONDS,
                 )
                 print(format_live_run_artifacts(payload), flush=True)
                 print(

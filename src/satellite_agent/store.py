@@ -71,6 +71,7 @@ class Store:
             low REAL NOT NULL,
             close REAL NOT NULL,
             volume REAL NOT NULL,
+            adjusted INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (symbol, timestamp)
         );
         CREATE TABLE IF NOT EXISTS price_bars_1d (
@@ -81,6 +82,7 @@ class Store:
             low REAL NOT NULL,
             close REAL NOT NULL,
             volume REAL NOT NULL,
+            adjusted INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (symbol, timestamp)
         );
         CREATE TABLE IF NOT EXISTS indicator_snapshots (
@@ -151,6 +153,71 @@ class Store:
             checked_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_source_health_checks_run_id ON source_health_checks (run_id, checked_at ASC);
+        CREATE TABLE IF NOT EXISTS llm_usage (
+            usage_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            model TEXT NOT NULL,
+            used_llm INTEGER NOT NULL,
+            success INTEGER NOT NULL,
+            prompt_tokens_estimate INTEGER NOT NULL DEFAULT 0,
+            completion_tokens_estimate INTEGER NOT NULL DEFAULT 0,
+            reason TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_llm_usage_created_at ON llm_usage (created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_llm_usage_run_id ON llm_usage (run_id, created_at ASC);
+        CREATE TABLE IF NOT EXISTS decision_records (
+            decision_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            event_type TEXT NOT NULL DEFAULT '',
+            pool TEXT NOT NULL,
+            action TEXT NOT NULL,
+            priority TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            event_score REAL NOT NULL,
+            market_score REAL NOT NULL,
+            theme_score REAL NOT NULL,
+            final_score REAL NOT NULL,
+            trigger_mode TEXT NOT NULL,
+            llm_used INTEGER NOT NULL,
+            theme_ids_json TEXT NOT NULL,
+            entry_plan_json TEXT NOT NULL,
+            invalidation_json TEXT NOT NULL,
+            ttl TEXT NOT NULL,
+            packet_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_decision_records_run_id ON decision_records (run_id, created_at ASC);
+        CREATE INDEX IF NOT EXISTS idx_decision_records_symbol ON decision_records (symbol, created_at DESC);
+        CREATE TABLE IF NOT EXISTS decision_outcomes (
+            decision_id TEXT PRIMARY KEY,
+            entered INTEGER NOT NULL DEFAULT 0,
+            entered_at TEXT NOT NULL DEFAULT '',
+            entry_price REAL,
+            exit_price REAL,
+            realized_return REAL,
+            holding_days INTEGER,
+            gross_realized_return REAL,
+            net_realized_return REAL,
+            slippage_bps REAL NOT NULL DEFAULT 0,
+            t_plus_1_return REAL,
+            t_plus_3_return REAL,
+            t_plus_5_return REAL,
+            t_plus_7_return REAL,
+            t_plus_10_return REAL,
+            t_plus_14_return REAL,
+            t_plus_30_return REAL,
+            max_runup REAL,
+            max_drawdown REAL,
+            hit_take_profit INTEGER NOT NULL DEFAULT 0,
+            hit_invalidation INTEGER NOT NULL DEFAULT 0,
+            close_reason TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS agent_state (
             state_key TEXT PRIMARY KEY,
             state_value TEXT NOT NULL
@@ -257,8 +324,8 @@ class Store:
         self.connection.executemany(
             f"""
             INSERT OR REPLACE INTO {table}
-            (symbol, timestamp, open, high, low, close, volume)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            (symbol, timestamp, open, high, low, close, volume, adjusted)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -269,8 +336,35 @@ class Store:
                     bar.low,
                     bar.close,
                     bar.volume,
+                    1 if getattr(bar, "adjusted", False) else 0,
                 )
                 for bar in bars
+            ],
+        )
+        self.connection.commit()
+
+    def replace_price_bars(self, symbol: str, timeframe: str, bars: Iterable[Bar]) -> None:
+        table = self._bar_table(timeframe)
+        bar_rows = list(bars)
+        self.connection.execute(f"DELETE FROM {table} WHERE symbol = ?", (symbol,))
+        self.connection.executemany(
+            f"""
+            INSERT OR REPLACE INTO {table}
+            (symbol, timestamp, open, high, low, close, volume, adjusted)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    symbol,
+                    bar.timestamp.isoformat(),
+                    bar.open,
+                    bar.high,
+                    bar.low,
+                    bar.close,
+                    bar.volume,
+                    1 if getattr(bar, "adjusted", False) else 0,
+                )
+                for bar in bar_rows
             ],
         )
         self.connection.commit()
@@ -279,7 +373,7 @@ class Store:
         table = self._bar_table(timeframe)
         cursor = self.connection.execute(
             f"""
-            SELECT timestamp, open, high, low, close, volume
+            SELECT timestamp, open, high, low, close, volume, adjusted
             FROM {table}
             WHERE symbol = ?
             ORDER BY timestamp DESC
@@ -297,9 +391,32 @@ class Store:
                 low=row["low"],
                 close=row["close"],
                 volume=row["volume"],
+                adjusted=bool(row["adjusted"]) if "adjusted" in row.keys() else False,
             )
             for row in rows
         ]
+
+    def summarize_price_bar_adjustment(self, symbols: Iterable[str], timeframe: str) -> list[sqlite3.Row]:
+        normalized_symbols = [str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()]
+        if not normalized_symbols:
+            return []
+        table = self._bar_table(timeframe)
+        placeholders = ", ".join("?" for _ in normalized_symbols)
+        cursor = self.connection.execute(
+            f"""
+            SELECT
+                symbol,
+                COUNT(*) AS total_bars,
+                SUM(CASE WHEN adjusted = 1 THEN 1 ELSE 0 END) AS adjusted_bars,
+                SUM(CASE WHEN adjusted = 0 THEN 1 ELSE 0 END) AS unadjusted_bars
+            FROM {table}
+            WHERE symbol IN ({placeholders})
+            GROUP BY symbol
+            ORDER BY symbol ASC
+            """,
+            tuple(normalized_symbols),
+        )
+        return cursor.fetchall()
 
     def save_indicator_snapshot(self, snapshot: IndicatorSnapshot) -> None:
         self.connection.execute(
@@ -551,6 +668,244 @@ class Store:
         )
         return cursor.fetchall()
 
+    def load_decision_records(self, run_id: str) -> list[sqlite3.Row]:
+        cursor = self.connection.execute(
+            """
+            SELECT
+                dr.decision_id,
+                dr.run_id,
+                dr.event_id,
+                dr.symbol,
+                COALESCE(NULLIF(dr.event_type, ''), ei.event_type, '') AS event_type,
+                dr.pool,
+                dr.action,
+                dr.priority,
+                dr.confidence,
+                dr.event_score,
+                dr.market_score,
+                dr.theme_score,
+                dr.final_score,
+                dr.trigger_mode,
+                dr.llm_used,
+                dr.theme_ids_json,
+                dr.entry_plan_json,
+                dr.invalidation_json,
+                dr.ttl,
+                dr.packet_json,
+                dr.created_at,
+                do.t_plus_1_return,
+                do.t_plus_3_return,
+                do.t_plus_5_return,
+                do.t_plus_7_return,
+                do.t_plus_10_return,
+                do.t_plus_14_return,
+                do.t_plus_30_return,
+                do.max_runup,
+                do.max_drawdown,
+                do.entered,
+                do.entered_at,
+                do.entry_price,
+                do.exit_price,
+                do.realized_return,
+                do.holding_days,
+                do.gross_realized_return,
+                do.net_realized_return,
+                do.slippage_bps,
+                do.hit_take_profit,
+                do.hit_invalidation,
+                do.close_reason,
+                do.updated_at AS outcome_updated_at
+            FROM decision_records dr
+            LEFT JOIN event_insights ei ON dr.event_id = ei.event_id AND dr.run_id = ei.run_id
+            LEFT JOIN decision_outcomes do ON dr.decision_id = do.decision_id
+            WHERE dr.run_id = ?
+            ORDER BY dr.created_at ASC, dr.symbol ASC, dr.pool ASC
+            """,
+            (run_id,),
+        )
+        return cursor.fetchall()
+
+    def load_decision_records_without_outcomes(
+        self,
+        *,
+        run_id: str = "",
+        since: str = "",
+        limit: int = 0,
+        recompute_existing: bool = False,
+    ) -> list[sqlite3.Row]:
+        query = """
+            SELECT dr.*
+            FROM decision_records dr
+            LEFT JOIN decision_outcomes do ON dr.decision_id = do.decision_id
+            WHERE 1 = 1
+        """
+        params: list[Any] = []
+        if not recompute_existing:
+            query += """
+               AND (
+                    do.decision_id IS NULL
+                    OR do.close_reason = ''
+                    OR do.t_plus_1_return IS NULL
+                    OR do.t_plus_3_return IS NULL
+                    OR do.t_plus_5_return IS NULL
+                    OR do.t_plus_7_return IS NULL
+                    OR do.t_plus_10_return IS NULL
+                    OR do.t_plus_14_return IS NULL
+                    OR do.t_plus_30_return IS NULL
+                    OR do.max_runup IS NULL
+                    OR do.max_drawdown IS NULL
+                    OR do.entered IS NULL
+                    OR (do.entered = 1 AND do.entry_price IS NULL)
+                    OR (
+                        do.close_reason IN ('hit_take_profit', 'hit_invalidation', 'window_complete')
+                        AND (
+                            do.exit_price IS NULL
+                            OR do.realized_return IS NULL
+                            OR do.holding_days IS NULL
+                        )
+                    )
+               )
+            """
+        if since:
+            query += " AND dr.created_at >= ?"
+            params.append(since)
+        if run_id:
+            query += " AND dr.run_id = ?"
+            params.append(run_id)
+        query += " ORDER BY dr.created_at ASC"
+        if limit > 0:
+            query += " LIMIT ?"
+            params.append(limit)
+        cursor = self.connection.execute(query, tuple(params))
+        return cursor.fetchall()
+
+    def load_latest_decision_records(self, limit: int = 50) -> list[sqlite3.Row]:
+        cursor = self.connection.execute(
+            """
+            SELECT
+                dr.decision_id,
+                dr.run_id,
+                dr.event_id,
+                dr.symbol,
+                COALESCE(NULLIF(dr.event_type, ''), ei.event_type, '') AS event_type,
+                dr.pool,
+                dr.action,
+                dr.priority,
+                dr.confidence,
+                dr.event_score,
+                dr.market_score,
+                dr.theme_score,
+                dr.final_score,
+                dr.trigger_mode,
+                dr.llm_used,
+                dr.theme_ids_json,
+                dr.entry_plan_json,
+                dr.invalidation_json,
+                dr.ttl,
+                dr.packet_json,
+                dr.created_at,
+                do.t_plus_1_return,
+                do.t_plus_3_return,
+                do.t_plus_5_return,
+                do.t_plus_7_return,
+                do.t_plus_10_return,
+                do.t_plus_14_return,
+                do.t_plus_30_return,
+                do.max_runup,
+                do.max_drawdown,
+                do.entered,
+                do.entered_at,
+                do.entry_price,
+                do.exit_price,
+                do.realized_return,
+                do.holding_days,
+                do.gross_realized_return,
+                do.net_realized_return,
+                do.slippage_bps,
+                do.hit_take_profit,
+                do.hit_invalidation,
+                do.close_reason,
+                do.updated_at AS outcome_updated_at
+            FROM decision_records dr
+            LEFT JOIN event_insights ei ON dr.event_id = ei.event_id AND dr.run_id = ei.run_id
+            LEFT JOIN decision_outcomes do ON dr.decision_id = do.decision_id
+            ORDER BY dr.created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return cursor.fetchall()
+
+    def load_decision_records_for_window(
+        self,
+        *,
+        since: str,
+        until: str = "",
+        actions: Iterable[str] | None = None,
+    ) -> list[sqlite3.Row]:
+        query = """
+            SELECT
+                dr.decision_id,
+                dr.run_id,
+                dr.event_id,
+                dr.symbol,
+                COALESCE(NULLIF(dr.event_type, ''), ei.event_type, '') AS event_type,
+                dr.pool,
+                dr.action,
+                dr.priority,
+                dr.confidence,
+                dr.event_score,
+                dr.market_score,
+                dr.theme_score,
+                dr.final_score,
+                dr.trigger_mode,
+                dr.llm_used,
+                dr.theme_ids_json,
+                dr.entry_plan_json,
+                dr.invalidation_json,
+                dr.ttl,
+                dr.packet_json,
+                dr.created_at,
+                do.entered,
+                do.entered_at,
+                do.entry_price,
+                do.exit_price,
+                do.realized_return,
+                do.holding_days,
+                do.gross_realized_return,
+                do.net_realized_return,
+                do.slippage_bps,
+                do.t_plus_1_return,
+                do.t_plus_3_return,
+                do.t_plus_5_return,
+                do.t_plus_7_return,
+                do.t_plus_10_return,
+                do.t_plus_14_return,
+                do.t_plus_30_return,
+                do.max_runup,
+                do.max_drawdown,
+                do.hit_take_profit,
+                do.hit_invalidation,
+                do.close_reason,
+                do.updated_at AS outcome_updated_at
+            FROM decision_records dr
+            LEFT JOIN event_insights ei ON dr.event_id = ei.event_id AND dr.run_id = ei.run_id
+            LEFT JOIN decision_outcomes do ON dr.decision_id = do.decision_id
+            WHERE dr.created_at >= ?
+        """
+        params: list[Any] = [since]
+        if until:
+            query += " AND dr.created_at < ?"
+            params.append(until)
+        normalized_actions = [str(item).strip() for item in (actions or []) if str(item).strip()]
+        if normalized_actions:
+            placeholders = ", ".join("?" for _ in normalized_actions)
+            query += f" AND dr.action IN ({placeholders})"
+            params.extend(normalized_actions)
+        query += " ORDER BY dr.created_at ASC, dr.symbol ASC, dr.pool ASC"
+        cursor = self.connection.execute(query, tuple(params))
+        return cursor.fetchall()
+
     def load_latest_source_health(self) -> list[sqlite3.Row]:
         cursor = self.connection.execute(
             """
@@ -587,9 +942,8 @@ class Store:
         )
         return cursor.fetchall()
 
-    def aggregate_event_type_performance(self, since: str, limit: int = 10) -> list[sqlite3.Row]:
-        cursor = self.connection.execute(
-            """
+    def aggregate_event_type_performance(self, since: str, limit: int = 10, until: str = "") -> list[sqlite3.Row]:
+        query = """
             SELECT
                 ei.event_type AS event_type,
                 COUNT(*) AS card_count,
@@ -598,11 +952,20 @@ class Store:
             FROM opportunity_cards oc
             JOIN event_insights ei ON oc.event_id = ei.event_id
             WHERE oc.created_at >= ?
+        """
+        params: list[Any] = [since]
+        if until:
+            query += " AND oc.created_at < ?"
+            params.append(until)
+        query += """
             GROUP BY ei.event_type
             ORDER BY avg_final_score DESC, card_count DESC
             LIMIT ?
-            """,
-            (since, limit),
+        """
+        params.append(limit)
+        cursor = self.connection.execute(
+            query,
+            tuple(params),
         )
         return cursor.fetchall()
 
@@ -625,9 +988,8 @@ class Store:
         )
         return cursor.fetchall()
 
-    def aggregate_source_stability(self, since: str, limit: int = 10) -> list[sqlite3.Row]:
-        cursor = self.connection.execute(
-            """
+    def aggregate_source_stability(self, since: str, limit: int = 10, until: str = "") -> list[sqlite3.Row]:
+        query = """
             SELECT
                 source_name,
                 COUNT(*) AS check_count,
@@ -637,17 +999,22 @@ class Store:
                 MAX(checked_at) AS last_checked_at
             FROM source_health_checks
             WHERE checked_at >= ?
+        """
+        params: list[Any] = [since]
+        if until:
+            query += " AND checked_at < ?"
+            params.append(until)
+        query += """
             GROUP BY source_name
             ORDER BY healthy_count DESC, check_count DESC, source_name ASC
             LIMIT ?
-            """,
-            (since, limit),
-        )
+        """
+        params.append(limit)
+        cursor = self.connection.execute(query, tuple(params))
         return cursor.fetchall()
 
-    def aggregate_alert_volume(self, since: str, limit: int = 14) -> list[sqlite3.Row]:
-        cursor = self.connection.execute(
-            """
+    def aggregate_alert_volume(self, since: str, limit: int = 14, until: str = "") -> list[sqlite3.Row]:
+        query = """
             SELECT
                 substr(notified_at, 1, 10) AS bucket_date,
                 COUNT(*) AS total_alerts,
@@ -657,12 +1024,18 @@ class Store:
                 SUM(CASE WHEN priority = 'high' AND sent = 1 THEN 1 ELSE 0 END) AS sent_high_priority_alerts
             FROM alert_history
             WHERE notified_at >= ?
+        """
+        params: list[Any] = [since]
+        if until:
+            query += " AND notified_at < ?"
+            params.append(until)
+        query += """
             GROUP BY bucket_date
             ORDER BY bucket_date DESC
             LIMIT ?
-            """,
-            (since, limit),
-        )
+        """
+        params.append(limit)
+        cursor = self.connection.execute(query, tuple(params))
         return cursor.fetchall()
 
     def aggregate_alert_volume_for_run(self, run_id: str) -> list[sqlite3.Row]:
@@ -683,6 +1056,246 @@ class Store:
         )
         return cursor.fetchall()
 
+    def aggregate_decision_outcomes_by_event_type(self, since: str, limit: int = 10, until: str = "") -> list[sqlite3.Row]:
+        query = """
+            SELECT
+                COALESCE(NULLIF(dr.event_type, ''), 'uncategorized') AS event_type,
+                COUNT(dr.decision_id) AS decision_count,
+                SUM(CASE WHEN do.decision_id IS NOT NULL THEN 1 ELSE 0 END) AS outcome_count,
+                SUM(CASE WHEN do.close_reason = 'insufficient_lookahead' THEN 1 ELSE 0 END) AS pending_count,
+                SUM(CASE WHEN do.entered = 1 THEN 1 ELSE 0 END) AS entered_count,
+                SUM(CASE WHEN do.close_reason = 'not_entered' THEN 1 ELSE 0 END) AS not_entered_count,
+                SUM(CASE WHEN do.hit_take_profit = 1 THEN 1 ELSE 0 END) AS take_profit_hits,
+                SUM(CASE WHEN do.hit_invalidation = 1 THEN 1 ELSE 0 END) AS invalidation_hits,
+                SUM(CASE WHEN do.close_reason = 'window_complete' THEN 1 ELSE 0 END) AS window_complete_count,
+                SUM(CASE WHEN do.t_plus_3_return > 0 THEN 1 ELSE 0 END) AS positive_t3_count,
+                SUM(CASE WHEN do.t_plus_3_return IS NOT NULL THEN 1 ELSE 0 END) AS t_plus_3_sample_count,
+                SUM(CASE WHEN do.max_runup IS NOT NULL THEN 1 ELSE 0 END) AS max_runup_sample_count,
+                SUM(CASE WHEN do.max_drawdown IS NOT NULL THEN 1 ELSE 0 END) AS max_drawdown_sample_count,
+                ROUND(AVG(do.realized_return), 2) AS avg_realized_return,
+                ROUND(AVG(do.t_plus_3_return), 2) AS avg_t_plus_3_return,
+                ROUND(AVG(do.max_runup), 2) AS avg_max_runup,
+                ROUND(AVG(do.max_drawdown), 2) AS avg_max_drawdown
+            FROM decision_records dr
+            LEFT JOIN decision_outcomes do ON dr.decision_id = do.decision_id
+            WHERE dr.created_at >= ?
+        """
+        params: list[Any] = [since]
+        if until:
+            query += " AND dr.created_at < ?"
+            params.append(until)
+        query += """
+            GROUP BY COALESCE(NULLIF(dr.event_type, ''), 'uncategorized')
+            ORDER BY outcome_count DESC, avg_t_plus_3_return DESC, decision_count DESC
+            LIMIT ?
+        """
+        params.append(limit)
+        cursor = self.connection.execute(query, tuple(params))
+        return cursor.fetchall()
+
+    def aggregate_decision_outcomes_by_event_type_for_run(self, run_id: str, limit: int = 10) -> list[sqlite3.Row]:
+        cursor = self.connection.execute(
+            """
+            SELECT
+                COALESCE(NULLIF(dr.event_type, ''), 'uncategorized') AS event_type,
+                COUNT(dr.decision_id) AS decision_count,
+                SUM(CASE WHEN do.decision_id IS NOT NULL THEN 1 ELSE 0 END) AS outcome_count,
+                SUM(CASE WHEN do.close_reason = 'insufficient_lookahead' THEN 1 ELSE 0 END) AS pending_count,
+                SUM(CASE WHEN do.hit_take_profit = 1 THEN 1 ELSE 0 END) AS take_profit_hits,
+                SUM(CASE WHEN do.hit_invalidation = 1 THEN 1 ELSE 0 END) AS invalidation_hits,
+                SUM(CASE WHEN do.t_plus_3_return > 0 THEN 1 ELSE 0 END) AS positive_t3_count,
+                SUM(CASE WHEN do.t_plus_3_return IS NOT NULL THEN 1 ELSE 0 END) AS t_plus_3_sample_count,
+                SUM(CASE WHEN do.max_runup IS NOT NULL THEN 1 ELSE 0 END) AS max_runup_sample_count,
+                SUM(CASE WHEN do.max_drawdown IS NOT NULL THEN 1 ELSE 0 END) AS max_drawdown_sample_count,
+                ROUND(AVG(do.t_plus_3_return), 2) AS avg_t_plus_3_return,
+                ROUND(AVG(do.max_runup), 2) AS avg_max_runup,
+                ROUND(AVG(do.max_drawdown), 2) AS avg_max_drawdown
+            FROM decision_records dr
+            LEFT JOIN decision_outcomes do ON dr.decision_id = do.decision_id
+            WHERE dr.run_id = ?
+            GROUP BY COALESCE(NULLIF(dr.event_type, ''), 'uncategorized')
+            ORDER BY outcome_count DESC, avg_t_plus_3_return DESC, decision_count DESC
+            LIMIT ?
+            """,
+            (run_id, limit),
+        )
+        return cursor.fetchall()
+
+    def aggregate_decision_outcomes_by_pool(self, since: str, limit: int = 10, until: str = "") -> list[sqlite3.Row]:
+        query = """
+            SELECT
+                dr.pool AS pool,
+                COUNT(dr.decision_id) AS decision_count,
+                SUM(CASE WHEN do.decision_id IS NOT NULL THEN 1 ELSE 0 END) AS outcome_count,
+                SUM(CASE WHEN do.close_reason = 'insufficient_lookahead' THEN 1 ELSE 0 END) AS pending_count,
+                SUM(CASE WHEN do.entered = 1 THEN 1 ELSE 0 END) AS entered_count,
+                SUM(CASE WHEN do.close_reason = 'not_entered' THEN 1 ELSE 0 END) AS not_entered_count,
+                SUM(CASE WHEN do.hit_take_profit = 1 THEN 1 ELSE 0 END) AS take_profit_hits,
+                SUM(CASE WHEN do.hit_invalidation = 1 THEN 1 ELSE 0 END) AS invalidation_hits,
+                SUM(CASE WHEN do.close_reason = 'window_complete' THEN 1 ELSE 0 END) AS window_complete_count,
+                SUM(CASE WHEN do.t_plus_3_return > 0 THEN 1 ELSE 0 END) AS positive_t3_count,
+                SUM(CASE WHEN do.t_plus_3_return IS NOT NULL THEN 1 ELSE 0 END) AS t_plus_3_sample_count,
+                SUM(CASE WHEN do.max_runup IS NOT NULL THEN 1 ELSE 0 END) AS max_runup_sample_count,
+                SUM(CASE WHEN do.max_drawdown IS NOT NULL THEN 1 ELSE 0 END) AS max_drawdown_sample_count,
+                ROUND(AVG(do.realized_return), 2) AS avg_realized_return,
+                ROUND(AVG(do.t_plus_3_return), 2) AS avg_t_plus_3_return,
+                ROUND(AVG(do.max_runup), 2) AS avg_max_runup,
+                ROUND(AVG(do.max_drawdown), 2) AS avg_max_drawdown
+            FROM decision_records dr
+            LEFT JOIN decision_outcomes do ON dr.decision_id = do.decision_id
+            WHERE dr.created_at >= ?
+        """
+        params: list[Any] = [since]
+        if until:
+            query += " AND dr.created_at < ?"
+            params.append(until)
+        query += """
+            GROUP BY dr.pool
+            ORDER BY outcome_count DESC, avg_t_plus_3_return DESC, decision_count DESC
+            LIMIT ?
+        """
+        params.append(limit)
+        cursor = self.connection.execute(query, tuple(params))
+        return cursor.fetchall()
+
+    def aggregate_decision_outcomes_by_pool_for_run(self, run_id: str, limit: int = 10) -> list[sqlite3.Row]:
+        cursor = self.connection.execute(
+            """
+            SELECT
+                dr.pool AS pool,
+                COUNT(dr.decision_id) AS decision_count,
+                SUM(CASE WHEN do.decision_id IS NOT NULL THEN 1 ELSE 0 END) AS outcome_count,
+                SUM(CASE WHEN do.close_reason = 'insufficient_lookahead' THEN 1 ELSE 0 END) AS pending_count,
+                SUM(CASE WHEN do.hit_take_profit = 1 THEN 1 ELSE 0 END) AS take_profit_hits,
+                SUM(CASE WHEN do.hit_invalidation = 1 THEN 1 ELSE 0 END) AS invalidation_hits,
+                SUM(CASE WHEN do.t_plus_3_return > 0 THEN 1 ELSE 0 END) AS positive_t3_count,
+                SUM(CASE WHEN do.t_plus_3_return IS NOT NULL THEN 1 ELSE 0 END) AS t_plus_3_sample_count,
+                SUM(CASE WHEN do.max_runup IS NOT NULL THEN 1 ELSE 0 END) AS max_runup_sample_count,
+                SUM(CASE WHEN do.max_drawdown IS NOT NULL THEN 1 ELSE 0 END) AS max_drawdown_sample_count,
+                ROUND(AVG(do.t_plus_3_return), 2) AS avg_t_plus_3_return,
+                ROUND(AVG(do.max_runup), 2) AS avg_max_runup,
+                ROUND(AVG(do.max_drawdown), 2) AS avg_max_drawdown
+            FROM decision_records dr
+            LEFT JOIN decision_outcomes do ON dr.decision_id = do.decision_id
+            WHERE dr.run_id = ?
+            GROUP BY dr.pool
+            ORDER BY outcome_count DESC, avg_t_plus_3_return DESC, decision_count DESC
+            LIMIT ?
+            """,
+            (run_id, limit),
+        )
+        return cursor.fetchall()
+
+    def summarize_decision_outcomes(self, since: str, until: str = "") -> sqlite3.Row:
+        query = """
+            SELECT
+                COUNT(dr.decision_id) AS decision_count,
+                SUM(CASE WHEN do.decision_id IS NOT NULL THEN 1 ELSE 0 END) AS outcome_count,
+                SUM(CASE WHEN do.close_reason = 'insufficient_lookahead' THEN 1 ELSE 0 END) AS pending_count,
+                SUM(CASE WHEN do.entered = 1 THEN 1 ELSE 0 END) AS entered_count,
+                SUM(CASE WHEN do.close_reason = 'not_entered' THEN 1 ELSE 0 END) AS not_entered_count,
+                SUM(CASE WHEN do.close_reason = 'hit_take_profit' THEN 1 ELSE 0 END) AS take_profit_exit_count,
+                SUM(CASE WHEN do.close_reason = 'hit_invalidation' THEN 1 ELSE 0 END) AS invalidation_exit_count,
+                SUM(CASE WHEN do.close_reason = 'window_complete' THEN 1 ELSE 0 END) AS window_complete_count,
+                ROUND(AVG(do.realized_return), 2) AS avg_realized_return,
+                SUM(
+                    CASE
+                        WHEN do.decision_id IS NOT NULL
+                         AND do.close_reason != ''
+                         AND do.close_reason != 'insufficient_lookahead'
+                        THEN 1 ELSE 0
+                    END
+                ) AS completed_count
+            FROM decision_records dr
+            LEFT JOIN decision_outcomes do ON dr.decision_id = do.decision_id
+            WHERE dr.created_at >= ?
+        """
+        params: list[Any] = [since]
+        if until:
+            query += " AND dr.created_at < ?"
+            params.append(until)
+        cursor = self.connection.execute(query, tuple(params))
+        row = cursor.fetchone()
+        if row is None:
+            cursor = self.connection.execute(
+                """
+                SELECT
+                    0 AS decision_count,
+                    0 AS outcome_count,
+                    0 AS pending_count,
+                    0 AS entered_count,
+                    0 AS not_entered_count,
+                    0 AS take_profit_exit_count,
+                    0 AS invalidation_exit_count,
+                    0 AS window_complete_count,
+                    NULL AS avg_realized_return,
+                    0 AS completed_count
+                """
+            )
+            row = cursor.fetchone()
+        return row
+
+    def load_decision_history_for_archive(self, *, before: str, limit: int = 0) -> list[sqlite3.Row]:
+        query = """
+            SELECT
+                dr.*,
+                do.t_plus_1_return,
+                do.t_plus_3_return,
+                do.t_plus_5_return,
+                do.t_plus_7_return,
+                do.t_plus_10_return,
+                do.t_plus_14_return,
+                do.t_plus_30_return,
+                do.max_runup,
+                do.max_drawdown,
+                do.entered,
+                do.entered_at,
+                do.entry_price,
+                do.exit_price,
+                do.realized_return,
+                do.holding_days,
+                do.gross_realized_return,
+                do.net_realized_return,
+                do.slippage_bps,
+                do.hit_take_profit,
+                do.hit_invalidation,
+                do.close_reason,
+                do.updated_at AS outcome_updated_at
+            FROM decision_records dr
+            LEFT JOIN decision_outcomes do ON dr.decision_id = do.decision_id
+            WHERE dr.created_at < ?
+            ORDER BY dr.created_at ASC, dr.decision_id ASC
+        """
+        params: list[Any] = [before]
+        if limit > 0:
+            query += " LIMIT ?"
+            params.append(limit)
+        cursor = self.connection.execute(query, tuple(params))
+        return cursor.fetchall()
+
+    def delete_decision_history(self, decision_ids: list[str]) -> dict[str, int]:
+        if not decision_ids:
+            return {"deleted_records": 0, "deleted_outcomes": 0}
+
+        deleted_records = 0
+        deleted_outcomes = 0
+        chunk_size = 500
+        for start in range(0, len(decision_ids), chunk_size):
+            batch = decision_ids[start : start + chunk_size]
+            placeholders = ", ".join("?" for _ in batch)
+            outcome_cursor = self.connection.execute(
+                f"DELETE FROM decision_outcomes WHERE decision_id IN ({placeholders})",
+                tuple(batch),
+            )
+            record_cursor = self.connection.execute(
+                f"DELETE FROM decision_records WHERE decision_id IN ({placeholders})",
+                tuple(batch),
+            )
+            deleted_outcomes += max(int(outcome_cursor.rowcount), 0)
+            deleted_records += max(int(record_cursor.rowcount), 0)
+        self.connection.commit()
+        return {"deleted_records": deleted_records, "deleted_outcomes": deleted_outcomes}
+
     def get_state(self, key: str) -> Optional[str]:
         cursor = self.connection.execute(
             "SELECT state_value FROM agent_state WHERE state_key = ?",
@@ -695,6 +1308,176 @@ class Store:
         self.connection.execute(
             "INSERT OR REPLACE INTO agent_state (state_key, state_value) VALUES (?, ?)",
             (key, value),
+        )
+        self.connection.commit()
+
+    def record_llm_usage(
+        self,
+        *,
+        run_id: str,
+        event_id: str,
+        symbol: str,
+        model: str,
+        used_llm: bool,
+        success: bool,
+        prompt_tokens_estimate: int = 0,
+        completion_tokens_estimate: int = 0,
+        reason: str = "",
+        created_at: str,
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO llm_usage
+            (run_id, event_id, symbol, model, used_llm, success, prompt_tokens_estimate, completion_tokens_estimate, reason, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                event_id,
+                symbol,
+                model,
+                1 if used_llm else 0,
+                1 if success else 0,
+                int(prompt_tokens_estimate),
+                int(completion_tokens_estimate),
+                reason,
+                created_at,
+            ),
+        )
+        self.connection.commit()
+
+    def count_llm_usage_since(self, since: str) -> int:
+        cursor = self.connection.execute(
+            """
+            SELECT COUNT(*) AS usage_count
+            FROM llm_usage
+            WHERE used_llm = 1 AND created_at >= ?
+            """,
+            (since,),
+        )
+        row = cursor.fetchone()
+        return int(row["usage_count"]) if row else 0
+
+    def save_decision_record(
+        self,
+        *,
+        decision_id: str,
+        run_id: str,
+        event_id: str,
+        symbol: str,
+        event_type: str,
+        pool: str,
+        action: str,
+        priority: str,
+        confidence: str,
+        event_score: float,
+        market_score: float,
+        theme_score: float,
+        final_score: float,
+        trigger_mode: str,
+        llm_used: bool,
+        theme_ids: list[str],
+        entry_plan: dict[str, Any],
+        invalidation: dict[str, Any],
+        ttl: str,
+        packet: dict[str, Any],
+        created_at: str,
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT OR REPLACE INTO decision_records
+            (decision_id, run_id, event_id, symbol, event_type, pool, action, priority, confidence,
+             event_score, market_score, theme_score, final_score, trigger_mode, llm_used,
+             theme_ids_json, entry_plan_json, invalidation_json, ttl, packet_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                decision_id,
+                run_id,
+                event_id,
+                symbol,
+                event_type,
+                pool,
+                action,
+                priority,
+                confidence,
+                event_score,
+                market_score,
+                theme_score,
+                final_score,
+                trigger_mode,
+                1 if llm_used else 0,
+                json.dumps(theme_ids, sort_keys=True),
+                json.dumps(entry_plan, sort_keys=True),
+                json.dumps(invalidation, sort_keys=True),
+                ttl,
+                json.dumps(packet, sort_keys=True),
+                created_at,
+            ),
+        )
+        self.connection.commit()
+
+    def save_decision_outcome(
+        self,
+        *,
+        decision_id: str,
+        entered: bool = False,
+        entered_at: str = "",
+        entry_price: float | None = None,
+        exit_price: float | None = None,
+        realized_return: float | None = None,
+        holding_days: int | None = None,
+        gross_realized_return: float | None = None,
+        net_realized_return: float | None = None,
+        slippage_bps: float = 0.0,
+        t_plus_1_return: float | None = None,
+        t_plus_3_return: float | None = None,
+        t_plus_5_return: float | None = None,
+        t_plus_7_return: float | None = None,
+        t_plus_10_return: float | None = None,
+        t_plus_14_return: float | None = None,
+        t_plus_30_return: float | None = None,
+        max_runup: float | None = None,
+        max_drawdown: float | None = None,
+        hit_take_profit: bool = False,
+        hit_invalidation: bool = False,
+        close_reason: str = "",
+        updated_at: str,
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT OR REPLACE INTO decision_outcomes
+            (decision_id, entered, entered_at, entry_price, exit_price, realized_return, holding_days,
+             gross_realized_return, net_realized_return, slippage_bps,
+             t_plus_1_return, t_plus_3_return, t_plus_5_return, t_plus_7_return, t_plus_10_return, t_plus_14_return, t_plus_30_return,
+             max_runup, max_drawdown, hit_take_profit, hit_invalidation, close_reason, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                decision_id,
+                1 if entered else 0,
+                entered_at,
+                entry_price,
+                exit_price,
+                realized_return,
+                holding_days,
+                gross_realized_return,
+                net_realized_return,
+                slippage_bps,
+                t_plus_1_return,
+                t_plus_3_return,
+                t_plus_5_return,
+                t_plus_7_return,
+                t_plus_10_return,
+                t_plus_14_return,
+                t_plus_30_return,
+                max_runup,
+                max_drawdown,
+                1 if hit_take_profit else 0,
+                1 if hit_invalidation else 0,
+                close_reason,
+                updated_at,
+            ),
         )
         self.connection.commit()
 
@@ -714,6 +1497,22 @@ class Store:
         self._ensure_table_column("agent_runs", "run_name", "TEXT NOT NULL DEFAULT ''")
         self._ensure_table_column("agent_runs", "note", "TEXT NOT NULL DEFAULT ''")
         self._ensure_table_column("agent_runs", "config_snapshot_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_table_column("decision_records", "event_type", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_table_column("decision_outcomes", "entered", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_table_column("decision_outcomes", "entered_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_table_column("decision_outcomes", "entry_price", "REAL")
+        self._ensure_table_column("decision_outcomes", "exit_price", "REAL")
+        self._ensure_table_column("decision_outcomes", "realized_return", "REAL")
+        self._ensure_table_column("decision_outcomes", "holding_days", "INTEGER")
+        self._ensure_table_column("decision_outcomes", "gross_realized_return", "REAL")
+        self._ensure_table_column("decision_outcomes", "net_realized_return", "REAL")
+        self._ensure_table_column("decision_outcomes", "slippage_bps", "REAL NOT NULL DEFAULT 0")
+        self._ensure_table_column("decision_outcomes", "t_plus_7_return", "REAL")
+        self._ensure_table_column("decision_outcomes", "t_plus_14_return", "REAL")
+        self._ensure_table_column("decision_outcomes", "t_plus_30_return", "REAL")
+        self._ensure_table_column("price_bars_5m", "adjusted", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_table_column("price_bars_1d", "adjusted", "INTEGER NOT NULL DEFAULT 0")
+        self._backfill_decision_record_event_types()
 
     def _ensure_indexes(self) -> None:
         self.connection.execute(
@@ -728,3 +1527,57 @@ class Store:
         columns = {row["name"] for row in cursor.fetchall()}
         if column not in columns:
             self.connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+
+    def _backfill_decision_record_event_types(self) -> None:
+        self.connection.execute(
+            """
+            UPDATE decision_records
+            SET event_type = (
+                SELECT ei.event_type
+                FROM event_insights ei
+                WHERE ei.event_id = decision_records.event_id
+                  AND ei.run_id = decision_records.run_id
+                LIMIT 1
+            )
+            WHERE (event_type = '' OR event_type IS NULL)
+              AND EXISTS (
+                SELECT 1
+                FROM event_insights ei
+                WHERE ei.event_id = decision_records.event_id
+                  AND ei.run_id = decision_records.run_id
+            )
+            """
+        )
+        cursor = self.connection.execute(
+            """
+            SELECT decision_id, packet_json
+            FROM decision_records
+            WHERE event_type = '' OR event_type IS NULL
+            """
+        )
+        for row in cursor.fetchall():
+            event_type = self._extract_event_type_from_packet_json(row["packet_json"])
+            if event_type:
+                self.connection.execute(
+                    "UPDATE decision_records SET event_type = ? WHERE decision_id = ?",
+                    (event_type, row["decision_id"]),
+                )
+
+    def _extract_event_type_from_packet_json(self, packet_json: str | None) -> str:
+        if not packet_json:
+            return ""
+        try:
+            payload = json.loads(packet_json)
+        except json.JSONDecodeError:
+            return ""
+        if not isinstance(payload, dict):
+            return ""
+        event_type = payload.get("event_type")
+        if isinstance(event_type, str) and event_type:
+            return event_type
+        event_assessment = payload.get("event_assessment")
+        if isinstance(event_assessment, dict):
+            nested_event_type = event_assessment.get("event_type")
+            if isinstance(nested_event_type, str):
+                return nested_event_type
+        return ""

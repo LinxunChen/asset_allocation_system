@@ -1,20 +1,108 @@
 from __future__ import annotations
 
 import json
-from datetime import timedelta
+from datetime import timedelta, timezone
 from typing import Optional, Protocol
 from urllib import request
+from urllib.parse import urlparse
 
+from .decision_engines.mappers import build_delivery_view_from_card
 from .models import AlertDecision, OpportunityCard, utcnow
 from .store import Store
+
+CN_TZ = timezone(timedelta(hours=8))
 
 
 def _display_horizon(horizon: str) -> str:
     return {"swing": "短线", "position": "波段"}.get(horizon, horizon)
 
 
+def _display_trade_cycle(horizon: str) -> str:
+    return f"交易周期：{_display_horizon(horizon)}"
+
+
 def _display_priority(priority: str) -> str:
     return {"high": "高优先级", "normal": "普通", "suppressed": "压制"}.get(priority, priority)
+
+
+def _display_event_type(event_type: str) -> str:
+    return {
+        "earnings": "财报事件",
+        "guidance": "指引事件",
+        "sec": "公告事件",
+        "research": "研报事件",
+        "m&a": "并购事件",
+        "strategic": "战略合作",
+        "product": "产品催化",
+        "news": "新闻事件",
+    }.get(event_type, event_type)
+
+
+def _display_trend_state(value: str) -> str:
+    return {
+        "bullish": "多头",
+        "bearish": "空头",
+        "neutral": "震荡",
+        "uptrend": "多头",
+        "downtrend": "空头",
+    }.get(value, value or "未识别")
+
+
+def _display_valid_until(card: OpportunityCard) -> str:
+    valid_until = card.ttl.astimezone(CN_TZ)
+    return valid_until.strftime("%m-%d %H:%M")
+
+
+def _risk_reward_ratio(card: OpportunityCard) -> float | None:
+    if not card.market_data_complete:
+        return None
+    if card.bias == "short":
+        expected_reward = float(card.entry_range.low) - float(card.take_profit_range.high)
+        expected_risk = float(card.invalidation_level) - float(card.entry_range.low)
+    else:
+        expected_reward = float(card.take_profit_range.low) - float(card.entry_range.high)
+        expected_risk = float(card.entry_range.high) - float(card.invalidation_level)
+    if expected_reward <= 0 or expected_risk <= 0:
+        return None
+    return round(expected_reward / expected_risk, 2)
+
+
+def _display_risk_reward(card: OpportunityCard) -> str:
+    ratio = _risk_reward_ratio(card)
+    if ratio is None:
+        return "待行情确认后再计算"
+    if ratio >= 2.0:
+        label = "较优"
+    elif ratio >= 1.5:
+        label = "可接受"
+    else:
+        label = "偏弱"
+    return f"{label}（{ratio:.2f}）"
+
+
+def _source_label(source_ref: str) -> str:
+    if not source_ref:
+        return "未知来源"
+    if not source_ref.startswith(("http://", "https://")):
+        return source_ref
+    host = urlparse(source_ref).netloc.lower()
+    if not host:
+        return source_ref
+    mapping = {
+        "www.sec.gov": "SEC Edgar",
+        "sec.gov": "SEC Edgar",
+        "news.google.com": "Google News",
+        "www.gurufocus.com": "GuruFocus",
+        "gurufocus.com": "GuruFocus",
+        "www.reuters.com": "Reuters",
+        "reuters.com": "Reuters",
+        "www.benzinga.com": "Benzinga",
+        "benzinga.com": "Benzinga",
+        "www.fool.com": "Motley Fool",
+        "www.zacks.com": "Zacks",
+        "finance.yahoo.com": "Yahoo Finance",
+    }
+    return mapping.get(host, host.replace("www.", ""))
 
 
 class NotificationTransport(Protocol):
@@ -60,20 +148,91 @@ class FeishuTransport:
             return
 
     def _build_interactive_payload(self, card: OpportunityCard) -> dict:
+        delivery = build_delivery_view_from_card(card)
         header_template = {
             "high": "red",
             "normal": "orange",
             "suppressed": "grey",
         }.get(card.priority, "blue")
-        ttl_days = max(card.ttl_delta().days, 0)
         risk_text = "；".join(card.risk_notes[:3]) if card.risk_notes else "无"
-        reason_text = card.reason_to_watch or card.headline_summary
+        identity = delivery["identity"]
+        action_label = delivery["action_label_effective"]
+        confidence_text = delivery["confidence_label_effective"]
+        priority_text = _display_priority(card.priority)
+        theme_text = delivery["theme_text"]
+        peer_text = "、".join(delivery["confirmed_peers"][:3]) if delivery["confirmed_peers"] else "暂无"
+        event_line = delivery["event_reason_line"]
+        market_line = delivery["market_reason_line"]
+        theme_line = delivery["theme_reason_line"]
+        valid_until_text = delivery["valid_until_text"] or _display_valid_until(card)
+        risk_reward_text = _display_risk_reward(card)
+        source_text = delivery["source_summary"]
+        signal_metric_lines = [
+            {
+                "is_short": True,
+                "text": {
+                    "tag": "lark_md",
+                    "content": f"**交易周期**\n{_display_horizon(card.horizon)}",
+                },
+            },
+            {
+                "is_short": True,
+                "text": {
+                    "tag": "lark_md",
+                    "content": f"**操作建议**\n{action_label}",
+                },
+            },
+            {
+                "is_short": True,
+                "text": {
+                    "tag": "lark_md",
+                    "content": f"**强度 / 置信度**\n{priority_text} / {confidence_text}",
+                },
+            },
+            {
+                "is_short": True,
+                "text": {
+                    "tag": "lark_md",
+                    "content": f"**题材**\n{theme_text}",
+                },
+            },
+        ]
+        if card.rsi_14 is not None:
+            signal_metric_lines.append(
+                {
+                    "is_short": True,
+                    "text": {
+                        "tag": "lark_md",
+                        "content": f"**RSI**\n{card.rsi_14:.1f}",
+                    },
+                }
+            )
+        if card.relative_volume is not None:
+            signal_metric_lines.append(
+                {
+                    "is_short": True,
+                    "text": {
+                        "tag": "lark_md",
+                        "content": f"**相对量能**\n{card.relative_volume:.2f} 倍",
+                    },
+                }
+            )
+        if card.trend_state:
+            signal_metric_lines.append(
+                {
+                    "is_short": True,
+                    "text": {
+                        "tag": "lark_md",
+                        "content": f"**趋势状态**\n{delivery['trend_state_display']}",
+                    },
+                }
+            )
         actions = []
-        for index, source in enumerate(card.source_refs[:3], start=1):
+        for source in card.source_refs[:3]:
             actions.append(
                 {
                     "tag": "button",
-                    "text": {"tag": "plain_text", "content": f"查看来源{index}"},
+                    "text": {"tag": "plain_text", "content": _source_label(source)},
                     "type": "default",
                     "url": source,
                 }
@@ -104,54 +263,24 @@ class FeishuTransport:
                         "text": {
                             "tag": "lark_md",
                             "content": (
+                                f"**标的**：{identity}\n"
+                                f"**事件类型**：{delivery['event_type_display']}\n"
                                 f"**摘要**：{card.headline_summary}\n"
-                                f"**关注理由**：{reason_text}\n"
-                                f"**方向**：{'做多' if card.bias == 'long' else '做空'}"
+                                f"**操作建议**：{action_label}（{priority_text} / 置信度 {confidence_text}）\n"
+                                f"**交易周期**：{delivery['horizon_display']}\n"
+                                f"**信息来源**：{source_text}"
+                                + (
+                                    f"\n**行情状态**：{card.market_data_note or '行情确认暂缺'}"
+                                    if not card.market_data_complete
+                                    else ""
+                                )
                             ),
                         },
                     },
                     {
                         "tag": "div",
-                        "fields": [
-                            {
-                                "is_short": True,
-                                "text": {
-                                    "tag": "lark_md",
-                                    "content": (
-                                        f"**事件分**\n{card.event_score:.2f}"
-                                    ),
-                                },
-                            },
-                            {
-                                "is_short": True,
-                                "text": {
-                                    "tag": "lark_md",
-                                    "content": (
-                                        f"**市场分**\n{card.market_score:.2f}"
-                                    ),
-                                },
-                            },
-                            {
-                                "is_short": True,
-                                "text": {
-                                    "tag": "lark_md",
-                                    "content": (
-                                        f"**综合分**\n{card.final_score:.2f}"
-                                    ),
-                                },
-                            },
-                            {
-                                "is_short": True,
-                                "text": {
-                                    "tag": "lark_md",
-                                    "content": (
-                                        f"**周期 / 优先级**\n{_display_horizon(card.horizon)} / {_display_priority(card.priority)}"
-                                    ),
-                                },
-                            },
-                        ],
+                        "fields": signal_metric_lines,
                     },
-                    {"tag": "hr"},
                     {
                         "tag": "div",
                         "fields": [
@@ -159,46 +288,126 @@ class FeishuTransport:
                                 "is_short": True,
                                 "text": {
                                     "tag": "lark_md",
-                                    "content": (
-                                        f"**入场区间**\n{card.entry_range.low:.2f} - {card.entry_range.high:.2f}"
-                                    ),
+                                    "content": f"**事件分**\n{card.event_score:.2f}",
                                 },
                             },
                             {
                                 "is_short": True,
                                 "text": {
                                     "tag": "lark_md",
-                                    "content": (
-                                        f"**止盈区间**\n{card.take_profit_range.low:.2f} - {card.take_profit_range.high:.2f}"
-                                    ),
+                                    "content": f"**市场分**\n{card.market_score:.2f}",
                                 },
                             },
                             {
                                 "is_short": True,
                                 "text": {
                                     "tag": "lark_md",
-                                    "content": (
-                                        f"**失效价**\n{card.invalidation_level:.2f}"
-                                    ),
+                                    "content": f"**综合分**\n{card.final_score:.2f}",
                                 },
                             },
                             {
                                 "is_short": True,
                                 "text": {
                                     "tag": "lark_md",
-                                    "content": (
-                                        f"**有效期**\n{ttl_days} 天"
-                                    ),
+                                    "content": f"**同题材确认**\n{peer_text}",
                                 },
                             },
                         ],
+                    },
+                    {"tag": "hr"},
+                    *(
+                        [
+                            {
+                                "tag": "div",
+                                "fields": [
+                                    {
+                                        "is_short": True,
+                                        "text": {
+                                            "tag": "lark_md",
+                                            "content": (
+                                                f"**入场区间**\n{card.entry_range.low:.2f} - {card.entry_range.high:.2f}"
+                                            ),
+                                        },
+                                    },
+                                    {
+                                        "is_short": True,
+                                        "text": {
+                                            "tag": "lark_md",
+                                            "content": (
+                                                f"**止盈区间**\n{card.take_profit_range.low:.2f} - {card.take_profit_range.high:.2f}"
+                                            ),
+                                        },
+                                    },
+                                    {
+                                        "is_short": True,
+                                        "text": {
+                                            "tag": "lark_md",
+                                            "content": (
+                                                f"**失效价**\n{card.invalidation_level:.2f}"
+                                            ),
+                                        },
+                                    },
+                                    {
+                                        "is_short": True,
+                                        "text": {
+                                            "tag": "lark_md",
+                                            "content": (
+                                                f"**预期盈亏比**\n{risk_reward_text}"
+                                            ),
+                                        },
+                                    },
+                                ],
+                            }
+                        ]
+                        if card.market_data_complete
+                        else [
+                            {
+                                "tag": "div",
+                                "fields": [
+                                    {
+                                        "is_short": False,
+                                        "text": {
+                                            "tag": "lark_md",
+                                            "content": "**价格计划**\n行情快照暂不可用，未自动生成入场/止盈/失效价。",
+                                        },
+                                    },
+                                    {
+                                        "is_short": True,
+                                        "text": {
+                                            "tag": "lark_md",
+                                            "content": f"**有效至**\n{valid_until_text}",
+                                        },
+                                    },
+                                ],
+                            }
+                        ]
+                    ),
+                    {
+                        "tag": "div",
+                        "text": {
+                            "tag": "lark_md",
+                            "content": (
+                                "**决策理由**\n"
+                                f"- 事件判断：{event_line}\n"
+                                f"- 市场状态：{market_line}\n"
+                                f"- 题材联动：{theme_line}\n"
+                                f"- 仓位提示：{card.positioning_hint or card.reason_to_watch or card.headline_summary}"
+                            ),
+                        },
                     },
                     {
                         "tag": "note",
                         "elements": [
                             {
                                 "tag": "plain_text",
-                                "content": f"失效条件：{card.invalidation_reason} | 风险提示：{risk_text}",
+                                "content": (
+                                    f"{_display_trade_cycle(card.horizon)} | 失效条件：{card.invalidation_reason} | 风险提示：{risk_text}"
+                                    + (
+                                        f" | 行情说明：{card.market_data_note}"
+                                        if card.market_data_note
+                                        else ""
+                                    )
+                                ),
                             }
                         ],
                     },
@@ -208,7 +417,16 @@ class FeishuTransport:
         }
 
     def _title(self, card: OpportunityCard) -> str:
-        return f"[{_display_priority(card.priority)}] {card.symbol} {_display_horizon(card.horizon)}机会"
+        delivery = build_delivery_view_from_card(card)
+        if not card.market_data_complete:
+            return (
+                f"{delivery['identity']} | {delivery['action_label_effective']} | "
+                f"{delivery['event_type_display']} | 事件强提醒"
+            )
+        return (
+            f"{delivery['identity']} | {delivery['action_label_effective']} | "
+            f"{delivery['event_type_display']} | {_display_priority(card.priority)}"
+        )
 
 
 class Notifier:
@@ -275,16 +493,35 @@ class Notifier:
         return False
 
     def _title(self, card: OpportunityCard) -> str:
-        return f"[{_display_priority(card.priority)}] {card.symbol} {_display_horizon(card.horizon)}机会"
+        delivery = build_delivery_view_from_card(card)
+        return (
+            f"{delivery['identity']} | {delivery['action_label_effective']} | "
+            f"{delivery['event_type_display']} | {_display_priority(card.priority)}"
+        )
 
     def _body(self, card: OpportunityCard) -> str:
+        delivery = build_delivery_view_from_card(card)
+        event_line = delivery["event_reason_line"]
+        market_line = delivery["market_reason_line"]
+        theme_line = delivery["theme_reason_line"]
+        confidence_text = delivery["confidence_label_effective"]
+        risk_reward_text = _display_risk_reward(card)
         return (
-            f"{card.headline_summary}\n"
-            f"方向：{'做多' if card.bias == 'long' else '做空'}\n"
-            f"关注理由：{card.reason_to_watch}\n"
+            f"标的：{delivery['identity']}\n"
+            f"{_display_trade_cycle(card.horizon)}\n"
+            f"操作建议：{delivery['action_label_effective']}（{_display_priority(card.priority)} / 置信度 {confidence_text}）\n"
+            f"事件类型：{delivery['event_type_display']}\n"
+            f"摘要：{card.headline_summary}\n"
+            f"决策理由：\n"
+            f"- 事件判断：{event_line}\n"
+            f"- 市场状态：{market_line}\n"
+            f"- 题材联动：{theme_line}\n"
+            f"- 仓位提示：{card.positioning_hint or card.reason_to_watch}\n"
             f"入场区间：{card.entry_range.low:.2f}-{card.entry_range.high:.2f}\n"
             f"止盈区间：{card.take_profit_range.low:.2f}-{card.take_profit_range.high:.2f}\n"
             f"失效价：{card.invalidation_level:.2f}（{card.invalidation_reason}）\n"
+            f"预期盈亏比：{risk_reward_text}\n"
             f"风险提示：{' | '.join(card.risk_notes)}\n"
+            f"信息来源：{delivery['source_summary']}\n"
             f"原文链接：{' | '.join(card.source_refs)}"
         )

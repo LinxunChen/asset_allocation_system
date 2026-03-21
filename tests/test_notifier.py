@@ -72,8 +72,36 @@ class NotifierTests(unittest.TestCase):
         self.assertEqual(payload["msg_type"], "interactive")
         self.assertEqual(payload["card"]["header"]["template"], "red")
         self.assertIn("NVDA", payload["card"]["header"]["title"]["content"])
+        self.assertIn("确认做多", payload["card"]["header"]["title"]["content"])
+        ratio_field = next(
+            field["text"]["content"]
+            for element in payload["card"]["elements"]
+            if element.get("tag") == "div"
+            for field in element.get("fields", [])
+            if "预期盈亏比" in field["text"]["content"]
+        )
+        self.assertIn("偏弱", ratio_field)
+        self.assertIn("1.00", ratio_field)
         self.assertEqual(payload["card"]["elements"][-1]["tag"], "action")
         self.assertEqual(payload["card"]["elements"][-1]["actions"][0]["url"], "https://example.com")
+
+    def test_feishu_transport_builds_event_only_payload_without_price_plan(self) -> None:
+        transport = FeishuTransport("https://example.com/webhook")
+        card = make_card(84.0)
+        card.market_data_complete = False
+        card.market_data_note = "行情快照暂不可用，仅基于事件强度提醒。"
+        payload = transport._build_interactive_payload(card)
+        self.assertIn("事件强提醒", payload["card"]["header"]["title"]["content"])
+        content_text = payload["card"]["elements"][0]["text"]["content"]
+        self.assertIn("行情状态", content_text)
+        price_section = next(
+            field["text"]["content"]
+            for element in payload["card"]["elements"]
+            if element.get("tag") == "div"
+            for field in element.get("fields", [])
+            if "价格计划" in field["text"]["content"]
+        )
+        self.assertIn("未自动生成入场/止盈/失效价", price_section)
 
     def test_no_transport_uses_explicit_reason(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -83,6 +111,14 @@ class NotifierTests(unittest.TestCase):
             decision = notifier.send(make_card(76.0))
             self.assertTrue(decision.sent)
             self.assertEqual(decision.reason, "no_transport_configured")
+
+    def test_plain_text_body_includes_risk_reward_ratio(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = Store(Path(temp_dir) / "test.db")
+            store.initialize()
+            notifier = Notifier(store=store, transport=None, dry_run=True)
+            body = notifier._body(make_card(76.0))
+            self.assertIn("预期盈亏比：偏弱（1.00）", body)
 
     def test_skip_records_explicit_reason(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

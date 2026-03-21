@@ -40,28 +40,29 @@ satellite-agent replay-evaluate --replay-path tests/fixtures/events.jsonl --json
 satellite-agent annotate-run --run-id run_a --name tuned_thresholds --note "raised market confirmation floor"
 satellite-agent compare-runs --run-id run_a --run-id run_b
 satellite-agent compare-runs --run-id run_a --run-id run_b --json
-satellite-agent batch-replay --spec-path config/batch_replay.template.json --output-dir ./data/batch_runs
-satellite-agent batch-replay --spec-path config/batch_replay.template.json --output-dir ./data/batch_runs --json
-satellite-agent report-batch --manifest-path ./data/batch_runs/<batch_id>_manifest.json
-satellite-agent report-batch --manifest-path ./data/batch_runs/<batch_id>_manifest.json --markdown-path ./data/reports/latest_batch.md
-satellite-agent compare-batches --left-manifest-path ./data/batch_runs/<batch_a>_manifest.json --right-manifest-path ./data/batch_runs/<batch_b>_manifest.json
-satellite-agent compare-batches --left-manifest-path ./data/batch_runs/<batch_a>_manifest.json --right-manifest-path ./data/batch_runs/<batch_b>_manifest.json --markdown-path ./data/reports/batch_diff.md
-satellite-agent list-batches --dir ./data/batch_runs --limit 10
-satellite-agent promote-batch --manifest-path ./data/batch_runs/<batch_id>_manifest.json --output-config-path ./config/agent.recommended.json
-satellite-agent promote-batch --manifest-path ./data/batch_runs/<batch_id>_manifest.json --output-config-path ./config/agent.recommended.json --force
+satellite-agent batch-replay --spec-path config/satellite_agent/batch_replay.template.json --output-dir ./data/satellite_agent/experiments/batch_runs
+satellite-agent batch-replay --spec-path config/satellite_agent/batch_replay.template.json --output-dir ./data/satellite_agent/experiments/batch_runs --json
+satellite-agent report-batch --manifest-path ./data/satellite_agent/experiments/batch_runs/<batch_id>_manifest.json
+satellite-agent report-batch --manifest-path ./data/satellite_agent/experiments/batch_runs/<batch_id>_manifest.json --markdown-path ./data/reports/latest_batch.md
+satellite-agent compare-batches --left-manifest-path ./data/satellite_agent/experiments/batch_runs/<batch_a>_manifest.json --right-manifest-path ./data/satellite_agent/experiments/batch_runs/<batch_b>_manifest.json
+satellite-agent compare-batches --left-manifest-path ./data/satellite_agent/experiments/batch_runs/<batch_a>_manifest.json --right-manifest-path ./data/satellite_agent/experiments/batch_runs/<batch_b>_manifest.json --markdown-path ./data/reports/batch_diff.md
+satellite-agent list-batches --dir ./data/satellite_agent/experiments/batch_runs --limit 10
+satellite-agent promote-batch --manifest-path ./data/satellite_agent/experiments/batch_runs/<batch_id>_manifest.json --output-config-path ./config/satellite_agent/agent.recommended.json
+satellite-agent promote-batch --manifest-path ./data/satellite_agent/experiments/batch_runs/<batch_id>_manifest.json --output-config-path ./config/satellite_agent/agent.recommended.json --force
 SATELLITE_FEISHU_WEBHOOK=https://example.feishu.cn/webhook satellite-agent send-test-notification --symbol NVDA
-satellite-agent demo-flow --workspace-dir ./data/demo_flow
-satellite-agent daily-run --workspace-dir ./data/daily_run --config-path ./config/agent.recommended.json --replay-path tests/fixtures/events.jsonl
-satellite-agent run-once --replay-path tests/fixtures/events.jsonl
+satellite-agent demo-flow --workspace-dir ./data/satellite_agent/experiments/demo_flow
+satellite-agent daily-run --workspace-dir ./data/satellite_agent/daily_run --config-path ./config/satellite_agent/agent.recommended.json --replay-path tests/fixtures/events.jsonl
+satellite-agent run-once --workspace-dir ./data/satellite_agent/run_once --replay-path tests/fixtures/events.jsonl
+satellite-agent serve --workspace-dir ./data/satellite_agent/serve
 python3 -m unittest discover -s tests -v
 ```
 
-`<batch_id>`, `<batch_a>`, and `<batch_b>` are placeholders. Run `satellite-agent list-batches --dir ./data/batch_runs --limit 10` first, then copy a real manifest path from the output.
+`<batch_id>`, `<batch_a>`, and `<batch_b>` are placeholders. Run `satellite-agent list-batches --dir ./data/satellite_agent/experiments/batch_runs --limit 10` first, then copy a real manifest path from the output.
 
 ## Environment variables
 
-- `SATELLITE_DB_PATH`: SQLite path, default `./data/satellite_agent.db`
-- `SATELLITE_CONFIG_PATH`: runtime config path, default `./config/agent.json`
+- `SATELLITE_DB_PATH`: SQLite path, default `./data/satellite_agent/agent.db`
+- `SATELLITE_CONFIG_PATH`: runtime config path, default `./config/satellite_agent/agent.json`
 - `SATELLITE_FEISHU_WEBHOOK`: Feishu webhook URL
 - `SATELLITE_OPENAI_API_KEY`: OpenAI API key
 - `SATELLITE_OPENAI_MODEL`: OpenAI model, default `gpt-4o-mini`
@@ -77,24 +78,25 @@ python3 -m unittest discover -s tests -v
 ## 中文说明
 
 - 中文版评分体系说明见 [scoring_guide.zh-CN.md](/Users/linxun/CodeSpace/asset_allocation_system/docs/scoring_guide.zh-CN.md)
+- 完整决策链路说明见 [decision_logic.zh-CN.md](/Users/linxun/CodeSpace/asset_allocation_system/docs/decision_logic.zh-CN.md)
 - 后续如果评分权重、阈值或优先级逻辑发生变化，这份中文文档会同步维护
 
 ## Watchlist 维护
 
-- 观察池现在只推荐维护一份模板：[agent.template.json](/Users/linxun/CodeSpace/asset_allocation_system/config/agent.template.json)。
-- `satellite-agent write-default-config` 会把这份模板写成你的 `config/agent.json`；`seed-watchlist` 和 `sync-watchlist --use-defaults` 也都会读取同一份模板。
+- 观察池现在只推荐维护一份模板：[agent.template.json](/Users/linxun/CodeSpace/asset_allocation_system/config/satellite_agent/agent.template.json)。
+- `satellite-agent write-default-config` 会把这份模板写成你的 `config/satellite_agent/agent.json`；`seed-watchlist` 和 `sync-watchlist --use-defaults` 也都会读取同一份模板。
 - 也就是说，代码里不再单独维护另一套默认 watchlist 常量，避免“改了模板但程序默认值还是旧的”。
 - `watchlist` 现在支持两种写法：
   - 平铺：`stocks` / `etfs`
   - 分组：`stock_groups` / `etf_groups`
 - 推荐使用分组写法，后续维护更清楚；程序会自动把各组拍平成实际生效的 watchlist。
 - `SEC` 只读取股票池，`Google News` 会读取整个 watchlist（股票 + ETF）。
-- 修改 `config/agent.json` 后，需要执行一次 `satellite-agent sync-watchlist`，数据库中的实际观察池才会更新。
-- 如果数据库里已经有 watchlist，程序启动时不会自动用配置覆盖它；这就是为什么“改了配置但运行结果没变”通常需要再做一次同步。
+- 修改 `config/satellite_agent/agent.json` 后，运行阶段会自动检测并同步 watchlist；也可以手动执行 `satellite-agent sync-watchlist` 立即刷新数据库。
+- 运行命令会比较当前配置和数据库里的 watchlist，不一致时会自动同步；手动执行 `sync-watchlist` 主要用于想立即刷新或单独验证配置的时候。
 
 ## 飞书通知配置
 
-- 现在可以直接在 [agent.json](/Users/linxun/CodeSpace/asset_allocation_system/config/agent.json) 中维护通知配置：
+- 现在可以直接在 [agent.json](/Users/linxun/CodeSpace/asset_allocation_system/config/satellite_agent/agent.json) 中维护通知配置：
 
 ```json
 {
@@ -108,11 +110,11 @@ python3 -m unittest discover -s tests -v
 - `feishu_webhook` 为空时，不会真实外发，只会在运行记录里标记 `no_transport_configured`。
 - `dry_run: true` 时，会保留提醒判定与落盘，但跳过真正的 webhook 调用。
 - `send-test-notification`、`run-once`、`serve` 会统一读取这份通知配置。
-- 也仍然支持使用环境变量 `SATELLITE_FEISHU_WEBHOOK`；如果两边都配置，当前以 `config/agent.json` 为准。
+- 也仍然支持使用环境变量 `SATELLITE_FEISHU_WEBHOOK`；如果两边都配置，当前以 `config/satellite_agent/agent.json` 为准。
 
 ## Strategy Tuning
 
-- `config/agent.json` can now carry a `strategy` block with global and per-horizon threshold overrides.
+- `config/satellite_agent/agent.json` can now carry a `strategy` block with global and per-horizon threshold overrides.
 - `run-once`, `serve`, and `replay-evaluate` support temporary experiment flags:
   - `--event-score-threshold`
   - `--swing-market-score-threshold`
@@ -143,7 +145,7 @@ python3 -m unittest discover -s tests -v
 
 ### Batch Replay Spec
 
-- Use [batch_replay.template.json](/Users/linxun/CodeSpace/asset_allocation_system/config/batch_replay.template.json) as the starting point.
+- Use [batch_replay.template.json](/Users/linxun/CodeSpace/asset_allocation_system/config/satellite_agent/batch_replay.template.json) as the starting point.
 - Each experiment accepts `name`, `note`, and an `overrides` object.
 - Supported override keys:
   - `event_score_threshold`
@@ -186,7 +188,7 @@ python3 -m unittest discover -s tests -v
 - When `promote-batch` overwrites an existing config, it writes a timestamped `.bak.json` file next to the target so you can roll back quickly.
 - `promote-batch` now includes a Chinese per-field strategy diff, such as threshold and RSI changes, before you adopt a new recommendation.
 - Feishu notifications now use interactive cards with clearer score, entry, stop, and source-link sections, making them much easier to consume on mobile.
-- `daily-run` prefers `config/agent.recommended.json` when present, making it easy to move from replay recommendation into a repeatable operational run.
+- `daily-run` prefers `config/satellite_agent/agent.recommended.json` when present, making it easy to move from replay recommendation into a repeatable operational run.
 - Batch comparisons are name-based, so keep experiment names stable across specs if you want clean before/after diffs.
 - The batch recommendation is heuristic, not a portfolio decision engine; it is meant to narrow down which parameter set deserves the next round of testing.
 - If you want the recommender to prefer fewer but stricter signals, increase `strictness`; if you want it to prefer busier signal output, increase `alerts_sent` and `cards_generated`.

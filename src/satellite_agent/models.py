@@ -72,6 +72,7 @@ class Bar:
     low: float
     close: float
     volume: float
+    adjusted: bool = False
 
 
 @dataclass
@@ -135,7 +136,22 @@ class OpportunityCard:
     priority: str
     dedup_key: str
     bias: str = "long"
+    display_name: str = ""
+    action_label: str = ""
+    confidence_label: str = ""
+    confidence_score: float = 0.0
     reason_to_watch: str = ""
+    trend_state: str = ""
+    rsi_14: Optional[float] = None
+    relative_volume: Optional[float] = None
+    theme_tags: List[str] = field(default_factory=list)
+    confirmed_peer_symbols: List[str] = field(default_factory=list)
+    market_data_complete: bool = True
+    market_data_note: str = ""
+    promoted_from_prewatch: bool = False
+    prewatch_score: float = 0.0
+    prewatch_setup_type: str = ""
+    positioning_hint: str = ""
 
     def ttl_delta(self) -> timedelta:
         return self.ttl - self.created_at
@@ -174,4 +190,31 @@ class SourceHealthCheck:
     def to_record(self) -> Dict[str, Any]:
         payload = asdict(self)
         payload["checked_at"] = ensure_utc(self.checked_at).isoformat()
+        return payload
+
+
+@dataclass
+class PrewatchCandidate:
+    symbol: str
+    horizon: str
+    setup_type: str
+    score: float
+    headline_summary: str
+    action_hint: str
+    reason_to_watch: str
+    last_price: float
+    rsi_14: float
+    relative_volume: float
+    trend_state: str
+    support_20: float
+    resistance_20: float
+    trigger_mode: str = "structure"
+    trigger_event_type: str = ""
+    trigger_theme: str = ""
+    trigger_symbols: List[str] = field(default_factory=list)
+    as_of: datetime = field(default_factory=utcnow)
+
+    def to_record(self) -> Dict[str, Any]:
+        payload = asdict(self)
+        payload["as_of"] = ensure_utc(self.as_of).isoformat()
         return payload
