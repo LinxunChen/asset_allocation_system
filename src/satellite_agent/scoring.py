@@ -31,6 +31,11 @@ class SignalScorer:
         priority = "suppressed"
         if event_score >= self.settings.event_score_threshold and market_score >= horizon_settings.market_score_threshold:
             priority = "high" if final_score >= horizon_settings.priority_threshold else "normal" if final_score >= 60 else "suppressed"
+        if bias == "long" and snapshot.trend_state == "bearish":
+            if priority == "high":
+                priority = "normal"
+            elif priority == "normal" and final_score < (horizon_settings.priority_threshold - 5.0):
+                priority = "suppressed"
         action_label, confidence_label, confidence_score = self._action_and_confidence(
             priority=priority,
             final_score=final_score,
@@ -181,12 +186,13 @@ class SignalScorer:
 
     def _event_score(self, insight: EventInsight) -> float:
         sentiment_strength = abs(insight.sentiment) * 100.0
+        weights = self.settings.event_score_weights
         return clamp(
-            (0.30 * insight.importance)
-            + (0.25 * insight.source_credibility)
-            + (0.20 * insight.novelty)
-            + (0.15 * insight.theme_relevance)
-            + (0.10 * sentiment_strength),
+            (weights.importance * insight.importance)
+            + (weights.source_credibility * insight.source_credibility)
+            + (weights.novelty * insight.novelty)
+            + (weights.theme_relevance * insight.theme_relevance)
+            + (weights.sentiment * sentiment_strength),
             0.0,
             100.0,
         )

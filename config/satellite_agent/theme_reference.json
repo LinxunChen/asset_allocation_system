@@ -1,0 +1,260 @@
+{
+  "_meta": {
+    "config_path": "config/satellite_agent/agent.json",
+    "editable": false,
+    "managed_by": "satellite_agent",
+    "note": "这是系统托管的题材闭集与当前标的映射，仅供参考，不建议手工修改。"
+  },
+  "symbol_theme_map": [
+    {
+      "asset_type": "股票",
+      "display_name": "Apple",
+      "symbol": "AAPL",
+      "theme_id": "consumer_and_devices",
+      "theme_name": "消费电子与硬件终端"
+    },
+    {
+      "asset_type": "股票",
+      "display_name": "AMD",
+      "symbol": "AMD",
+      "theme_id": "semiconductors_and_ai",
+      "theme_name": "AI芯片与半导体设备"
+    },
+    {
+      "asset_type": "股票",
+      "display_name": "Broadcom",
+      "symbol": "AVGO",
+      "theme_id": "semiconductors_and_ai",
+      "theme_name": "AI芯片与半导体设备"
+    },
+    {
+      "asset_type": "股票",
+      "display_name": "Alphabet",
+      "symbol": "GOOG",
+      "theme_id": "software_and_cloud",
+      "theme_name": "AI软件与大模型应用"
+    },
+    {
+      "asset_type": "股票",
+      "display_name": "Hims & Hers",
+      "symbol": "HIMS",
+      "theme_id": "digital_health",
+      "theme_name": "数字医疗与健康消费"
+    },
+    {
+      "asset_type": "股票",
+      "display_name": "Robinhood",
+      "symbol": "HOOD",
+      "theme_id": "financials_and_fintech",
+      "theme_name": "金融科技与数字支付"
+    },
+    {
+      "asset_type": "股票",
+      "display_name": "LVMH",
+      "symbol": "LVMHF",
+      "theme_id": "premium_consumer",
+      "theme_name": "高端消费与奢侈品"
+    },
+    {
+      "asset_type": "股票",
+      "display_name": "Meta Platforms",
+      "symbol": "META",
+      "theme_id": "software_and_cloud",
+      "theme_name": "AI软件与大模型应用"
+    },
+    {
+      "asset_type": "股票",
+      "display_name": "Marvell Technology",
+      "symbol": "MRVL",
+      "theme_id": "semiconductors_and_ai",
+      "theme_name": "AI芯片与半导体设备"
+    },
+    {
+      "asset_type": "股票",
+      "display_name": "Microsoft",
+      "symbol": "MSFT",
+      "theme_id": "software_and_cloud",
+      "theme_name": "AI软件与大模型应用"
+    },
+    {
+      "asset_type": "股票",
+      "display_name": "Micron",
+      "symbol": "MU",
+      "theme_id": "semiconductors_and_ai",
+      "theme_name": "AI芯片与半导体设备"
+    },
+    {
+      "asset_type": "股票",
+      "display_name": "Nebius Group",
+      "symbol": "NBIS",
+      "theme_id": "data_center",
+      "theme_name": "数据中心基建与算力网络"
+    },
+    {
+      "asset_type": "股票",
+      "display_name": "NVIDIA",
+      "symbol": "NVDA",
+      "theme_id": "semiconductors_and_ai",
+      "theme_name": "AI芯片与半导体设备"
+    },
+    {
+      "asset_type": "股票",
+      "display_name": "Palantir",
+      "symbol": "PLTR",
+      "theme_id": "software_and_cloud",
+      "theme_name": "AI软件与大模型应用"
+    },
+    {
+      "asset_type": "股票",
+      "display_name": "Sea Limited",
+      "symbol": "SE",
+      "theme_id": "em_internet",
+      "theme_name": "新兴市场互联网与电商"
+    },
+    {
+      "asset_type": "股票",
+      "display_name": "Tencent",
+      "symbol": "TCEHY",
+      "theme_id": "em_internet",
+      "theme_name": "新兴市场互联网与电商"
+    },
+    {
+      "asset_type": "股票",
+      "display_name": "Tesla",
+      "symbol": "TSLA",
+      "theme_id": "automotive_and_mobility",
+      "theme_name": "电动车与智能出行"
+    },
+    {
+      "asset_type": "股票",
+      "display_name": "Taiwan Semiconductor",
+      "symbol": "TSM",
+      "theme_id": "semiconductors_and_ai",
+      "theme_name": "AI芯片与半导体设备"
+    },
+    {
+      "asset_type": "股票",
+      "display_name": "Vertex Pharmaceuticals",
+      "symbol": "VRTX",
+      "theme_id": "biotech_and_pharma",
+      "theme_name": "生物技术与创新药"
+    },
+    {
+      "asset_type": "股票",
+      "display_name": "Rocket Lab",
+      "symbol": "RKLB",
+      "theme_id": "space_and_defense",
+      "theme_name": "国防军工与航空航天"
+    },
+    {
+      "asset_type": "ETF",
+      "display_name": "JPMorgan BetaBuilders Japan ETF",
+      "symbol": "BBJP",
+      "theme_id": "non_us_markets",
+      "theme_name": "非美市场"
+    },
+    {
+      "asset_type": "ETF",
+      "display_name": "iShares Emerging Markets ex China ETF",
+      "symbol": "EMXC",
+      "theme_id": "non_us_markets",
+      "theme_name": "非美市场"
+    },
+    {
+      "asset_type": "ETF",
+      "display_name": "iShares Ethereum Trust ETF",
+      "symbol": "ETHA",
+      "theme_id": "digital_assets",
+      "theme_name": "数字资产"
+    },
+    {
+      "asset_type": "ETF",
+      "display_name": "iShares MSCI South Korea ETF",
+      "symbol": "EWY",
+      "theme_id": "non_us_markets",
+      "theme_name": "非美市场"
+    },
+    {
+      "asset_type": "ETF",
+      "display_name": "Freedom 100 Emerging Markets ETF",
+      "symbol": "FRDM",
+      "theme_id": "non_us_markets",
+      "theme_name": "非美市场"
+    },
+    {
+      "asset_type": "ETF",
+      "display_name": "iShares Bitcoin Trust ETF",
+      "symbol": "IBIT",
+      "theme_id": "digital_assets",
+      "theme_name": "数字资产"
+    },
+    {
+      "asset_type": "ETF",
+      "display_name": "VanEck Semiconductor ETF",
+      "symbol": "SMH",
+      "theme_id": "semiconductors_and_ai",
+      "theme_name": "AI芯片与半导体设备"
+    },
+    {
+      "asset_type": "ETF",
+      "display_name": "VanEck Vietnam ETF",
+      "symbol": "VNM",
+      "theme_id": "non_us_markets",
+      "theme_name": "非美市场"
+    }
+  ],
+  "theme_catalog": [
+    {
+      "display_name": "电动车与智能出行",
+      "theme_id": "automotive_and_mobility"
+    },
+    {
+      "display_name": "生物技术与创新药",
+      "theme_id": "biotech_and_pharma"
+    },
+    {
+      "display_name": "消费电子与硬件终端",
+      "theme_id": "consumer_and_devices"
+    },
+    {
+      "display_name": "数据中心基建与算力网络",
+      "theme_id": "data_center"
+    },
+    {
+      "display_name": "数字资产",
+      "theme_id": "digital_assets"
+    },
+    {
+      "display_name": "数字医疗与健康消费",
+      "theme_id": "digital_health"
+    },
+    {
+      "display_name": "新兴市场互联网与电商",
+      "theme_id": "em_internet"
+    },
+    {
+      "display_name": "金融科技与数字支付",
+      "theme_id": "financials_and_fintech"
+    },
+    {
+      "display_name": "非美市场",
+      "theme_id": "non_us_markets"
+    },
+    {
+      "display_name": "高端消费与奢侈品",
+      "theme_id": "premium_consumer"
+    },
+    {
+      "display_name": "AI芯片与半导体设备",
+      "theme_id": "semiconductors_and_ai"
+    },
+    {
+      "display_name": "AI软件与大模型应用",
+      "theme_id": "software_and_cloud"
+    },
+    {
+      "display_name": "国防军工与航空航天",
+      "theme_id": "space_and_defense"
+    }
+  ]
+}

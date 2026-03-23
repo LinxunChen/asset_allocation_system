@@ -6,6 +6,7 @@ from typing import Any, Iterable
 
 from .decision_engines.mappers import build_delivery_view_from_record
 from .theme_linkage import (
+    build_theme_display_name_map_from_watchlist_payload,
     build_prewatch_peer_map,
     build_symbol_theme_map_from_watchlist_payload,
     build_theme_snapshot_rows,
@@ -100,21 +101,67 @@ def _display_strategy_tilt_title(title: str) -> str:
     }.get(title, title)
 
 
+def _display_llm_component(component: str) -> str:
+    return {
+        "event_extraction": "事件抽取",
+        "narration": "卡片叙事",
+        "ranking_assist": "排序辅助",
+    }.get(component, component or "未标注")
+
+
 def _config_summary(config_snapshot: dict[str, Any]) -> str:
     settings = config_snapshot.get("settings", {})
     horizons = settings.get("horizons", {})
     swing = horizons.get("swing", {})
     position = horizons.get("position", {})
     event_floor = settings.get("event_score_threshold")
+    llm_event_extraction = settings.get("use_llm_event_extraction")
     dedup_hours = settings.get("cross_source_dedup_hours")
-    if event_floor is None and dedup_hours is None and not horizons:
+    llm_narration = settings.get("use_llm_narration")
+    llm_ranking = settings.get("use_llm_ranking_assist")
+    macro_overlay = settings.get("use_macro_risk_overlay")
+    event_score_weights = settings.get("event_score_weights") or {}
+    if (
+        event_floor is None
+        and llm_event_extraction is None
+        and dedup_hours is None
+        and llm_narration is None
+        and llm_ranking is None
+        and macro_overlay is None
+        and not event_score_weights
+        and not horizons
+    ):
         return "-"
-    return (
-        f"E{event_floor}/"
-        f"S{swing.get('market_score_threshold', '-')}-{swing.get('priority_threshold', '-')}/"
-        f"P{position.get('market_score_threshold', '-')}-{position.get('priority_threshold', '-')}/"
-        f"D{dedup_hours}"
-    )
+    toggle_parts = []
+    if llm_event_extraction is not None:
+        toggle_parts.append(f"X{1 if llm_event_extraction else 0}")
+    if llm_narration is not None:
+        toggle_parts.append(f"N{1 if llm_narration else 0}")
+    if llm_ranking is not None:
+        toggle_parts.append(f"R{1 if llm_ranking else 0}")
+    if macro_overlay is not None:
+        toggle_parts.append(f"M{1 if macro_overlay else 0}")
+    parts = [
+        f"E{event_floor}",
+        f"S{swing.get('market_score_threshold', '-')}-{swing.get('priority_threshold', '-')}",
+        f"P{position.get('market_score_threshold', '-')}-{position.get('priority_threshold', '-')}",
+        f"D{dedup_hours}",
+    ]
+    if toggle_parts:
+        parts.append("/".join(toggle_parts))
+    if event_score_weights:
+        parts.append(
+            ",".join(
+                [
+                    f"I{event_score_weights.get('importance', '-')}",
+                    f"C{event_score_weights.get('source_credibility', '-')}",
+                    f"Nv{event_score_weights.get('novelty', '-')}",
+                    f"T{event_score_weights.get('theme_relevance', '-')}",
+                    f"S{event_score_weights.get('sentiment', '-')}",
+                ]
+            )
+        )
+    return "/".join(parts)
 
 
 def _format_summary_value(key: str, value: Any) -> Any:
@@ -1363,6 +1410,162 @@ def serialize_replay_evaluation(
     }
 
 
+def serialize_llm_usage_report_payload(
+    *,
+    start_at: str,
+    end_at: str,
+    rows: dict[str, list[object]],
+) -> dict[str, Any]:
+    def _normalize_row(row: object) -> dict[str, Any]:
+        return normalize_timestamp_fields(dict(row)) if row is not None else {}
+
+    summary_rows = [_normalize_row(row) for row in rows.get("summary", [])]
+    by_day_rows = [_normalize_row(row) for row in rows.get("by_day", [])]
+    by_component_rows = [_normalize_row(row) for row in rows.get("by_component", [])]
+    by_model_rows = [_normalize_row(row) for row in rows.get("by_model", [])]
+    top_reason_rows = [_normalize_row(row) for row in rows.get("top_reasons", [])]
+    recent_call_rows = [_normalize_row(row) for row in rows.get("recent_calls", [])]
+    summary = summary_rows[0] if summary_rows else {}
+    total_tokens = int(summary.get("prompt_tokens", 0) or 0) + int(summary.get("completion_tokens", 0) or 0)
+    summary["total_tokens"] = total_tokens
+    for row in by_day_rows:
+        row["total_tokens"] = int(row.get("prompt_tokens", 0) or 0) + int(row.get("completion_tokens", 0) or 0)
+    for row in by_component_rows:
+        row["component_display"] = _display_llm_component(str(row.get("component", "")))
+        row["total_tokens"] = int(row.get("prompt_tokens", 0) or 0) + int(row.get("completion_tokens", 0) or 0)
+    for row in by_model_rows:
+        row["total_tokens"] = int(row.get("prompt_tokens", 0) or 0) + int(row.get("completion_tokens", 0) or 0)
+    for row in top_reason_rows:
+        row["component_display"] = _display_llm_component(str(row.get("component", "")))
+    for row in recent_call_rows:
+        row["component_display"] = _display_llm_component(str(row.get("component", "")))
+        row["total_tokens"] = int(row.get("prompt_tokens_estimate", 0) or 0) + int(
+            row.get("completion_tokens_estimate", 0) or 0
+        )
+    return {
+        "start_at": start_at,
+        "end_at": end_at,
+        "summary": summary,
+        "by_day": by_day_rows,
+        "by_component": by_component_rows,
+        "by_model": by_model_rows,
+        "top_reasons": top_reason_rows,
+        "recent_calls": recent_call_rows,
+    }
+
+
+def format_llm_usage_report_payload(payload: dict[str, Any]) -> str:
+    summary = payload.get("summary") or {}
+    by_day = payload.get("by_day") or []
+    by_component = payload.get("by_component") or []
+    by_model = payload.get("by_model") or []
+    top_reasons = payload.get("top_reasons") or []
+    recent_calls = payload.get("recent_calls") or []
+    lines = [
+        "LLM 用量报告",
+        f"统计区间：{payload.get('start_at', '-')} ~ {payload.get('end_at', '-')}",
+        "",
+        "总览：",
+        f"- 总记录数：{int(summary.get('total_records', 0) or 0)}",
+        f"- 真实调用数：{int(summary.get('llm_calls', 0) or 0)}",
+        f"- 成功调用数：{int(summary.get('success_calls', 0) or 0)}",
+        f"- 失败回退数：{int(summary.get('failed_calls', 0) or 0)}",
+        f"- 跳过调用数：{int(summary.get('skipped_calls', 0) or 0)}",
+        f"- Prompt token：{int(summary.get('prompt_tokens', 0) or 0)}",
+        f"- Completion token：{int(summary.get('completion_tokens', 0) or 0)}",
+        f"- 总 token：{int(summary.get('total_tokens', 0) or 0)}",
+        f"- 平均延迟：{round(float(summary.get('avg_latency_ms') or 0.0), 1)} ms",
+        f"- 最大延迟：{int(summary.get('max_latency_ms', 0) or 0)} ms",
+    ]
+    lines.extend(["", "按天："])
+    if by_day:
+        for row in by_day:
+            lines.append(
+                f"- {row.get('usage_date', '-')}"
+                f"：调用 {int(row.get('llm_calls', 0) or 0)}，成功 {int(row.get('success_calls', 0) or 0)}，"
+                f"失败 {int(row.get('failed_calls', 0) or 0)}，跳过 {int(row.get('skipped_calls', 0) or 0)}，"
+                f"总 token {int(row.get('total_tokens', 0) or 0)}，平均延迟 {round(float(row.get('avg_latency_ms') or 0.0), 1)} ms"
+            )
+    else:
+        lines.append("- 暂无数据")
+    lines.extend(["", "按环节："])
+    if by_component:
+        for row in by_component:
+            lines.append(
+                f"- {row.get('component_display', row.get('component', '-'))}"
+                f"：调用 {int(row.get('llm_calls', 0) or 0)}，成功 {int(row.get('success_calls', 0) or 0)}，"
+                f"失败 {int(row.get('failed_calls', 0) or 0)}，跳过 {int(row.get('skipped_calls', 0) or 0)}，"
+                f"总 token {int(row.get('total_tokens', 0) or 0)}，平均延迟 {round(float(row.get('avg_latency_ms') or 0.0), 1)} ms"
+            )
+    else:
+        lines.append("- 暂无数据")
+    lines.extend(["", "按模型："])
+    if by_model:
+        for row in by_model:
+            lines.append(
+                f"- {row.get('model', '-')}"
+                f"：调用 {int(row.get('llm_calls', 0) or 0)}，成功 {int(row.get('success_calls', 0) or 0)}，"
+                f"失败 {int(row.get('failed_calls', 0) or 0)}，总 token {int(row.get('total_tokens', 0) or 0)}，"
+                f"平均延迟 {round(float(row.get('avg_latency_ms') or 0.0), 1)} ms"
+            )
+    else:
+        lines.append("- 暂无数据")
+    lines.extend(["", "高频原因："])
+    if top_reasons:
+        for row in top_reasons:
+            lines.append(
+                f"- {row.get('component_display', row.get('component', '-'))}"
+                f" / {row.get('reason', '-')}"
+                f"：{int(row.get('occurrence_count', 0) or 0)} 次"
+            )
+    else:
+        lines.append("- 暂无数据")
+    lines.extend(["", "最近调用："])
+    if recent_calls:
+        for row in recent_calls[:10]:
+            lines.append(
+                f"- {format_beijing_minute(parse_datetime(str(row.get('created_at')))) if row.get('created_at') else '-'}"
+                f" | {row.get('component_display', row.get('component', '-'))}"
+                f" | {row.get('symbol', '-')}"
+                f" | {'成功' if row.get('success') else '失败/跳过'}"
+                f" | token {int(row.get('total_tokens', 0) or 0)}"
+                f" | {row.get('reason', '-')}"
+            )
+    else:
+        lines.append("- 暂无数据")
+    return "\n".join(lines)
+
+
+def _format_llm_usage_snapshot_lines(payload: dict[str, Any] | None) -> list[str]:
+    if not payload:
+        return ["  最近窗口内没有 LLM 用量数据。"]
+    summary = payload.get("summary") or {}
+    if not summary:
+        return ["  最近窗口内没有 LLM 用量数据。"]
+    by_component = payload.get("by_component") or []
+    lines = [
+        "  "
+        f"最近窗口：{payload.get('start_at', '-')} ~ {payload.get('end_at', '-')}",
+        "  "
+        f"真实调用 {summary.get('actual_calls', 0)} 次 / 失败回退 {summary.get('fallback_calls', 0)} 次 / "
+        f"跳过 {summary.get('skipped_calls', 0)} 次 / 总 token {summary.get('total_tokens', 0)}",
+    ]
+    if by_component:
+        parts = []
+        for row in by_component[:3]:
+            parts.append(
+                f"{_display_llm_component(str(row.get('component') or ''))} "
+                f"{row.get('actual_calls', 0)} 次"
+            )
+        lines.append(f"  主要环节：{'；'.join(parts)}")
+    top_reasons = payload.get("top_reasons") or []
+    if top_reasons:
+        reason = str(top_reasons[0].get("reason") or "").strip() or "未标注"
+        count = int(top_reasons[0].get("count", 0) or 0)
+        lines.append(f"  高频原因：{reason}（{count} 次）")
+    return lines
+
+
 def serialize_run_comparison(items: list[dict[str, Any]]) -> dict[str, Any]:
     return {"runs": items}
 
@@ -1373,28 +1576,37 @@ def serialize_batch_replay(
 ) -> dict[str, Any]:
     ranking = []
     for item in items:
-        summary = item.get("summary", {})
+        metrics = item.get("metrics", {})
         ranking.append(
             {
                 "name": item["name"],
                 "run_id": item.get("run_id", ""),
                 "status": item["status"],
-                "alerts_sent": summary.get("alerts_sent", 0),
-                "cards_generated": summary.get("cards_generated", 0),
-                "events_processed": summary.get("events_processed", 0),
+                "decision_count": metrics.get("decision_count", 0),
+                "entered_count": metrics.get("entered_count", 0),
+                "take_profit_exit_count": metrics.get("take_profit_exit_count", 0),
+                "invalidation_exit_count": metrics.get("invalidation_exit_count", 0),
+                "avg_realized_return": metrics.get("avg_realized_return"),
+                "win_rate": metrics.get("win_rate"),
+                "profit_loss_ratio": metrics.get("profit_loss_ratio"),
+                "avg_t_plus_7_return": metrics.get("avg_t_plus_7_return"),
+                "avg_t_plus_14_return": metrics.get("avg_t_plus_14_return"),
+                "avg_t_plus_30_return": metrics.get("avg_t_plus_30_return"),
+                "avg_max_drawdown": metrics.get("avg_max_drawdown"),
+                "completed_outcome_count": metrics.get("completed_outcome_count", 0),
                 "failures": item.get("failures", 0),
                 "config_summary": item.get("config_summary", "-"),
                 "db_path": item.get("db_path", ""),
-                "closest_market_margin": item.get("closest_market_margin"),
-                "closest_priority_margin": item.get("closest_priority_margin"),
             }
         )
     ranking.sort(
         key=lambda row: (
             0 if row["status"] == "success" else 1,
-            -row["alerts_sent"],
-            -row["cards_generated"],
-            -row["events_processed"],
+            -(float(row["avg_realized_return"]) if row["avg_realized_return"] is not None else float("-inf")),
+            -(float(row["win_rate"]) if row["win_rate"] is not None else float("-inf")),
+            float(row["avg_max_drawdown"]) if row["avg_max_drawdown"] is not None else float("inf"),
+            -(float(row["profit_loss_ratio"]) if row["profit_loss_ratio"] is not None else float("-inf")),
+            -(float(row["avg_t_plus_7_return"]) if row["avg_t_plus_7_return"] is not None else float("-inf")),
             row["failures"],
             row["name"],
         )
@@ -1500,35 +1712,114 @@ def _recommend_batch(
     weights = _recommendation_weights(preferences)
     candidates = []
     for item in items:
-        summary = item.get("summary", {})
+        metrics = item.get("metrics", {})
         if item.get("status") != "success":
             continue
-        if summary.get("events_processed", 0) <= 0:
+        if int(metrics.get("completed_outcome_count", 0) or 0) <= 0:
             continue
-        market_margin = item.get("closest_market_margin")
-        priority_margin = item.get("closest_priority_margin")
-        non_negative_market = market_margin is not None and market_margin >= 0
+        avg_return = metrics.get("avg_realized_return")
+        win_rate = metrics.get("win_rate")
+        avg_drawdown = metrics.get("avg_max_drawdown")
+        profit_loss_ratio = metrics.get("profit_loss_ratio")
+        avg_t7 = metrics.get("avg_t_plus_7_return")
         score = (
-            (summary.get("alerts_sent", 0) * weights["alerts_sent"])
-            + (summary.get("cards_generated", 0) * weights["cards_generated"])
-            + (summary.get("events_processed", 0) * weights["events_processed"])
+            ((float(avg_return) if avg_return is not None else -999.0) * weights["avg_realized_return"])
+            + ((float(win_rate) if win_rate is not None else 0.0) * weights["win_rate"])
+            + ((float(profit_loss_ratio) if profit_loss_ratio is not None else 0.0) * weights["profit_loss_ratio"])
+            + ((float(avg_t7) if avg_t7 is not None else 0.0) * weights["avg_t_plus_7_return"])
             - (item.get("failures", 0) * weights["failures"])
         )
-        if market_margin is not None:
-            score += (
-                (1.0 / (1.0 + max(market_margin, 0.0))) * weights["strictness"]
-                if market_margin >= 0
-                else market_margin * weights["strictness"]
-            )
-        if priority_margin is not None:
-            score += (1.0 / (1.0 + abs(priority_margin))) * weights["priority_proximity"]
+        if avg_drawdown is not None:
+            score -= abs(float(avg_drawdown)) * weights["max_drawdown"]
         candidates.append(
             (
                 (
                     -round(score, 8),
-                    0 if non_negative_market else 1,
-                    market_margin if non_negative_market else float("inf"),
-                    abs(priority_margin) if priority_margin is not None else float("inf"),
+                    -(float(avg_return) if avg_return is not None else float("-inf")),
+                    -(float(win_rate) if win_rate is not None else float("-inf")),
+                    abs(float(avg_drawdown)) if avg_drawdown is not None else float("inf"),
+                    -(float(profit_loss_ratio) if profit_loss_ratio is not None else float("-inf")),
+                    -(float(avg_t7) if avg_t7 is not None else float("-inf")),
+                    item["name"],
+                ),
+                item,
+                round(score, 4),
+            )
+        )
+    if not candidates:
+        return _recommend_batch_legacy(items, weights)
+    candidates.sort(key=lambda pair: pair[0])
+    chosen = candidates[0][1]
+    chosen_score = candidates[0][2]
+    metrics = chosen.get("metrics", {})
+    reason = "在真实收益、胜率与风险控制的综合比较中表现最好。"
+    return {
+        "name": chosen["name"],
+        "run_id": chosen.get("run_id", ""),
+        "config_summary": chosen.get("config_summary", "-"),
+        "reason": reason,
+        "score": chosen_score,
+        "weights": weights,
+        "decision_count": metrics.get("decision_count", 0),
+        "entered_count": metrics.get("entered_count", 0),
+        "take_profit_exit_count": metrics.get("take_profit_exit_count", 0),
+        "invalidation_exit_count": metrics.get("invalidation_exit_count", 0),
+        "avg_realized_return": metrics.get("avg_realized_return"),
+        "win_rate": metrics.get("win_rate"),
+        "profit_loss_ratio": metrics.get("profit_loss_ratio"),
+        "avg_t_plus_7_return": metrics.get("avg_t_plus_7_return"),
+        "avg_max_drawdown": metrics.get("avg_max_drawdown"),
+    }
+
+
+def _recommendation_weights(preferences: dict[str, Any] | None) -> dict[str, float]:
+    prefs = preferences or {}
+    return {
+        "avg_realized_return": float(prefs.get("avg_realized_return", 5.0)),
+        "win_rate": float(prefs.get("win_rate", 2.5)),
+        "max_drawdown": float(prefs.get("max_drawdown", 1.5)),
+        "profit_loss_ratio": float(prefs.get("profit_loss_ratio", 1.5)),
+        "avg_t_plus_7_return": float(prefs.get("avg_t_plus_7_return", 1.0)),
+        "alerts_sent": float(prefs.get("alerts_sent", 3.0)),
+        "cards_generated": float(prefs.get("cards_generated", 1.5)),
+        "events_processed": float(prefs.get("events_processed", 1.0)),
+        "strictness": float(prefs.get("strictness", 0.75)),
+        "priority_proximity": float(prefs.get("priority_proximity", 0.25)),
+        "failures": float(prefs.get("failures", 3.0)),
+    }
+
+
+def _recommend_batch_legacy(items: list[dict[str, Any]], weights: dict[str, float]) -> dict[str, Any] | None:
+    candidates = []
+    for item in items:
+        if item.get("status") != "success":
+            continue
+        summary = item.get("summary", {})
+        alerts_sent = int(summary.get("alerts_sent", 0) or 0)
+        cards_generated = int(summary.get("cards_generated", 0) or 0)
+        events_processed = int(summary.get("events_processed", 0) or 0)
+        closest_market_margin = item.get("closest_market_margin")
+        closest_priority_margin = item.get("closest_priority_margin")
+        score = (
+            alerts_sent * weights["alerts_sent"]
+            + cards_generated * weights["cards_generated"]
+            + events_processed * weights["events_processed"]
+            - abs(float(closest_market_margin)) * weights["strictness"]
+            if closest_market_margin is not None
+            else -999.0
+        )
+        if closest_priority_margin is not None:
+            score -= abs(float(closest_priority_margin)) * weights["priority_proximity"]
+        score -= item.get("failures", 0) * weights["failures"]
+        candidates.append(
+            (
+                (
+                    -round(score, 8),
+                    -alerts_sent,
+                    -cards_generated,
+                    -events_processed,
+                    abs(float(closest_market_margin)) if closest_market_margin is not None else float("inf"),
+                    abs(float(closest_priority_margin)) if closest_priority_margin is not None else float("inf"),
                     item["name"],
                 ),
                 item,
@@ -1539,47 +1830,19 @@ def _recommend_batch(
         return None
     candidates.sort(key=lambda pair: pair[0])
     chosen = candidates[0][1]
-    chosen_score = candidates[0][2]
     summary = chosen.get("summary", {})
-    same_output = [
-        item
-        for _, item, _ in candidates
-        if item.get("summary", {}).get("alerts_sent", 0) == summary.get("alerts_sent", 0)
-        and item.get("summary", {}).get("cards_generated", 0) == summary.get("cards_generated", 0)
-        and item.get("summary", {}).get("events_processed", 0) == summary.get("events_processed", 0)
-        and item.get("failures", 0) == chosen.get("failures", 0)
-    ]
-    reason = "Produced the strongest batch output."
-    if len(same_output) > 1 and chosen.get("closest_market_margin") is not None:
-        reason = (
-            "Matched the top output and ranked best under the configured strictness preference."
-        )
-    elif chosen.get("closest_priority_margin") is not None and chosen["closest_priority_margin"] > -5:
-        reason = "Produced the strongest batch output and stayed relatively close to high-priority cutoff."
     return {
         "name": chosen["name"],
         "run_id": chosen.get("run_id", ""),
         "config_summary": chosen.get("config_summary", "-"),
-        "reason": reason,
-        "score": chosen_score,
+        "reason": "在当前样本下产出更稳定，同时更接近严格阈值控制。",
+        "score": candidates[0][2],
         "weights": weights,
-        "alerts_sent": summary.get("alerts_sent", 0),
-        "cards_generated": summary.get("cards_generated", 0),
-        "events_processed": summary.get("events_processed", 0),
+        "alerts_sent": int(summary.get("alerts_sent", 0) or 0),
+        "cards_generated": int(summary.get("cards_generated", 0) or 0),
+        "events_processed": int(summary.get("events_processed", 0) or 0),
         "closest_market_margin": chosen.get("closest_market_margin"),
         "closest_priority_margin": chosen.get("closest_priority_margin"),
-    }
-
-
-def _recommendation_weights(preferences: dict[str, Any] | None) -> dict[str, float]:
-    prefs = preferences or {}
-    return {
-        "alerts_sent": float(prefs.get("alerts_sent", 4.0)),
-        "cards_generated": float(prefs.get("cards_generated", 2.0)),
-        "events_processed": float(prefs.get("events_processed", 1.0)),
-        "strictness": float(prefs.get("strictness", 0.75)),
-        "priority_proximity": float(prefs.get("priority_proximity", 0.25)),
-        "failures": float(prefs.get("failures", 3.0)),
     }
 
 
@@ -1594,39 +1857,55 @@ def _summarize_batch(
             "line_items": ["No successful experiments in this batch."],
             "has_meaningful_difference": False,
         }
-    alerts = {item["name"]: item.get("summary", {}).get("alerts_sent", 0) for item in successful}
-    cards = {item["name"]: item.get("summary", {}).get("cards_generated", 0) for item in successful}
-    margins = {
-        item["name"]: item.get("closest_market_margin")
-        for item in successful
-        if item.get("closest_market_margin") is not None
-    }
+    avg_returns = {item["name"]: item.get("metrics", {}).get("avg_realized_return") for item in successful}
+    win_rates = {item["name"]: item.get("metrics", {}).get("win_rate") for item in successful}
+    drawdowns = {item["name"]: item.get("metrics", {}).get("avg_max_drawdown") for item in successful}
+    valid_returns = {name: value for name, value in avg_returns.items() if value is not None}
     recommendation = _recommend_batch(items, preferences)
     line_items = []
     top_ranked = ranking[0] if ranking else None
+    if not valid_returns:
+        if top_ranked:
+            line_items.append(
+                f"Top output: {top_ranked['name']}，已进场 {top_ranked['entered_count']}，当前还没有足够成熟样本做真实收益比较。"
+            )
+        output_counts = {
+            item["name"]: (
+                int(item.get("summary", {}).get("alerts_sent", 0) or 0),
+                int(item.get("summary", {}).get("cards_generated", 0) or 0),
+                int(item.get("summary", {}).get("events_processed", 0) or 0),
+            )
+            for item in successful
+        }
+        if len(set(output_counts.values())) == 1 and output_counts:
+            line_items.append("各实验当前产出接近，建议扩大回放样本再比较。")
+            return {"line_items": line_items, "has_meaningful_difference": False}
+        if recommendation:
+            line_items.append(
+                f"当前更推荐：{recommendation['name']}，因为它在产出与阈值严格度之间更平衡。"
+            )
+        return {"line_items": line_items, "has_meaningful_difference": True}
     if top_ranked:
         line_items.append(
-            f"Top output: {top_ranked['name']} with {top_ranked['alerts_sent']} alerts and {top_ranked['cards_generated']} cards."
+            f"当前领先：{top_ranked['name']}，平均真实收益 {top_ranked['avg_realized_return']}%，胜率 {top_ranked['win_rate']}%。"
         )
-    if len(set(alerts.values())) == 1 and len(set(cards.values())) == 1:
-        line_items.append("Output is tied across experiments on alerts and cards.")
+    if len(set(valid_returns.values())) == 1 and valid_returns:
+        line_items.append("各实验的平均真实收益目前接近，建议扩大回放样本区间。")
     else:
-        best_alerts = max(alerts.values())
-        leaders = sorted(name for name, value in alerts.items() if value == best_alerts)
-        line_items.append(f"Alert leader: {', '.join(leaders)} at {best_alerts} alerts.")
-    if margins:
-        strict_name, strict_margin = min(margins.items(), key=lambda pair: pair[1])
-        loose_name, loose_margin = max(margins.items(), key=lambda pair: pair[1])
-        line_items.append(
-            f"Closest passing setup: {strict_name} with market margin {strict_margin:+.2f}; loosest is {loose_name} at {loose_margin:+.2f}."
-        )
+        best_return_name, best_return = max(valid_returns.items(), key=lambda pair: pair[1]) if valid_returns else ("-", None)
+        if best_return is not None:
+            line_items.append(f"真实收益领先：{best_return_name}，平均真实收益 {best_return}%。")
+    valid_drawdowns = {name: value for name, value in drawdowns.items() if value is not None}
+    if valid_drawdowns:
+        best_dd_name, best_dd = min(valid_drawdowns.items(), key=lambda pair: abs(pair[1]))
+        line_items.append(f"风险控制最好：{best_dd_name}，平均最大回撤 {best_dd}%。")
     if recommendation:
         line_items.append(
-            f"Recommended setup: {recommendation['name']} because {recommendation['reason'].rstrip('.').lower()}."
+            f"推荐策略：{recommendation['name']}，因为它在收益、胜率和回撤的综合平衡上最好。"
         )
     return {
         "line_items": line_items,
-        "has_meaningful_difference": not (len(set(alerts.values())) == 1 and len(set(cards.values())) == 1),
+        "has_meaningful_difference": len(set(value for value in valid_returns.values())) > 1 if valid_returns else False,
     }
 
 
@@ -1644,34 +1923,30 @@ def _next_step_batch(
     recommendation = _recommend_batch(items, preferences)
     summary = _summarize_batch(items, ranking, preferences)
     failure_count = sum(item.get("failures", 0) for item in items)
-    margins = [
-        item.get("closest_market_margin")
-        for item in successful
-        if item.get("closest_market_margin") is not None
-    ]
-    narrow_margin = min(margins) if margins else None
     lines = []
     title = "Advance Recommended Setup"
     if failure_count > 0:
         title = "Stabilize Data Path"
         lines.append("Reduce data or notification failures before trusting the batch recommendation.")
+    elif recommendation and recommendation.get("alerts_sent") is not None and recommendation.get("avg_realized_return") is None:
+        if not summary.get("has_meaningful_difference"):
+            title = "Expand Replay Coverage"
+            lines.append("当前实验只有产出差异，尚未形成足够成熟的后验样本，建议扩大回放覆盖。")
+        else:
+            title = "Advance Recommended Setup"
+            lines.append(f"先把 {recommendation['name']} 作为下一轮赛马的临时基线。")
+            lines.append("下一轮优先补充更多已成熟样本，再比较真实收益和回撤。")
+        return {"title": title, "line_items": lines}
     if not summary.get("has_meaningful_difference"):
         title = "Expand Replay Coverage"
-        lines.append("Current experiments are tied on alerts and cards; use a larger replay sample to surface real differences.")
-        if narrow_margin is not None and narrow_margin > 2.0:
-            lines.append("Parameter gaps are still too mild for this sample; try stricter thresholds or wider step sizes.")
-        elif narrow_margin is not None:
-            lines.append("The batch is already close to a threshold boundary, so a larger replay window is more useful than tighter tuning.")
+        lines.append("当前实验在收益层面的差异还不够大，建议扩大回放时间窗或加入震荡/下跌样本。")
     elif recommendation:
         lines.append(
-            f"Carry {recommendation['name']} forward as the provisional baseline for the next batch."
+            f"先把 {recommendation['name']} 作为下一轮赛马的临时基线。"
         )
-        if narrow_margin is not None and narrow_margin < 1.0:
-            lines.append("Keep the next change small because the current winner is already close to the market threshold.")
-        else:
-            lines.append("Test one tighter and one looser variant around the current recommendation to map the local sensitivity.")
+        lines.append("下一轮建议至少加入一段风险偏好下降或震荡样本，检验策略是否只是吃到了市场 Beta。")
     if not lines and recommendation:
-        lines.append(f"Use {recommendation['name']} as the next baseline and retest on a broader replay sample.")
+        lines.append(f"继续以 {recommendation['name']} 为基线，并在更长窗口上复测。")
     return {"title": title, "line_items": lines}
 
 
@@ -2109,11 +2384,11 @@ def format_recent_performance_review(review: dict[str, Any]) -> str:
         lines.append(f"程序抽检：{sample_audit.get('status', '-')}")
         if sample_audit.get("summary_line"):
             lines.append(f"程序抽检说明：{sample_audit.get('summary_line')}")
-    manual_audit = review.get("manual_audit") or {}
-    if manual_audit:
-        lines.append(f"AI复核：{manual_audit.get('status', '-')}")
-        if manual_audit.get("summary_line"):
-            lines.append(f"AI复核说明：{manual_audit.get('summary_line')}")
+    ai_review = review.get("ai_review") or review.get("manual_audit") or {}
+    if ai_review:
+        lines.append(f"AI复核：{ai_review.get('status', '-')}")
+        if ai_review.get("summary_line"):
+            lines.append(f"AI复核说明：{ai_review.get('summary_line')}")
     for blocker in formal_readiness.get("blockers", []):
         lines.append(f"阻塞项：{blocker}")
     for reason in review.get("draft_reasons", []):
@@ -2698,6 +2973,7 @@ def format_run_review(
     source_health: list[dict[str, Any]],
     card_diagnostics: list[dict[str, Any]] | None = None,
     decision_diagnostics: list[dict[str, Any]] | None = None,
+    llm_usage_report: dict[str, Any] | None = None,
 ) -> str:
     health = summarize_run_health(run_detail, strategy_report, source_health, card_diagnostics, decision_diagnostics)
     lines = ["运行复盘："]
@@ -2708,6 +2984,7 @@ def format_run_review(
         else {}
     )
     symbol_theme_map = build_symbol_theme_map_from_watchlist_payload(runtime_watchlist)
+    theme_display_name_map = build_theme_display_name_map_from_watchlist_payload(runtime_watchlist)
     if run_detail is None:
         lines.append("运行：缺失")
     else:
@@ -2750,6 +3027,8 @@ def format_run_review(
     lines.append("运行健康：")
     for line in health["line_items"]:
         lines.append(f"  {line}")
+    lines.append("LLM 用量摘要：")
+    lines.extend(_format_llm_usage_snapshot_lines(llm_usage_report))
     lines.append("机会概览：")
     event_types = strategy_report.get("event_type_performance", [])
     if not event_types:
@@ -2777,6 +3056,7 @@ def format_run_review(
         _format_theme_linkage_lines(
             build_theme_snapshot_rows(
                 symbol_theme_map=symbol_theme_map,
+                theme_display_name_map=theme_display_name_map,
                 card_diagnostics=diagnostics,
                 prewatch_candidates=prewatch_candidates,
             )
@@ -2860,64 +3140,76 @@ def format_run_comparison(items: list[dict[str, Any]]) -> str:
 def format_batch_replay(payload: dict[str, Any]) -> str:
     items = payload.get("experiments", [])
     if not items:
-        return "Batch Replay: no experiments."
-    lines = ["Batch Replay:"]
+        return "策略赛马结果：当前没有可比较实验。"
+    lines = ["策略赛马结果："]
     if payload.get("batch_id"):
-        lines.append(f"Batch ID: {payload['batch_id']}")
+        lines.append(f"批次ID：{payload['batch_id']}")
     if payload.get("generated_at"):
-        lines.append(f"Generated At: {payload['generated_at']}")
+        lines.append(f"生成时间：{payload['generated_at']}")
     if payload.get("manifest_path"):
-        lines.append(f"Manifest: {payload['manifest_path']}")
+        lines.append(f"清单文件：{payload['manifest_path']}")
     if payload.get("report_path"):
-        lines.append(f"Report: {payload['report_path']}")
+        lines.append(f"报告文件：{payload['report_path']}")
+    lines.append("实验结果：")
     for index, item in enumerate(items, start=1):
         if item["status"] != "success":
             lines.append(
-                f"  {index}. {item['name']}: status={item['status']} error={item.get('error', '-')}"
+                f"  {index}. {item['name']}：状态={item['status']}，错误={item.get('error', '-')}"
             )
             continue
-        summary = item.get("summary", {})
+        metrics = item.get("metrics", {})
         lines.append(
-            f"  {index}. {item['name']}: status={item['status']} run_id={item.get('run_id', '-')} "
-            f"events={summary.get('events_processed', 0)} cards={summary.get('cards_generated', 0)} "
-            f"alerts={summary.get('alerts_sent', 0)} top_event={item.get('top_event', '-')} "
-            f"cfg={item.get('config_summary', '-')} db={item.get('db_path', '-')}"
+            f"  {index}. {item['name']}：状态={item['status']}，run_id={item.get('run_id', '-')}，"
+            f"决策 {metrics.get('decision_count', 0)}，已进场 {metrics.get('entered_count', 0)}，"
+            f"平均真实收益 {metrics.get('avg_realized_return')}%，胜率 {metrics.get('win_rate')}%，"
+            f"平均最大回撤 {metrics.get('avg_max_drawdown')}%，主导事件 {item.get('top_event', '-')}，"
+            f"配置 {item.get('config_summary', '-')}，数据库 {item.get('db_path', '-')}"
         )
         for card in item.get("card_diagnostics", []):
             lines.append(
                 "     "
                 f"{card['symbol']} {card['horizon']} "
-                f"event_margin={card['event_margin']:+.2f} "
-                f"market_margin={card['market_margin']:+.2f} "
-                f"priority_margin={card['priority_margin']:+.2f} "
-                f"priority={card['priority']}"
+                f"事件阈值差={card['event_margin']:+.2f} "
+                f"市场阈值差={card['market_margin']:+.2f} "
+                f"优先级阈值差={card['priority_margin']:+.2f} "
+                f"优先级={card['priority']}"
             )
-    lines.append("Ranking:")
+    lines.append("排序：")
     for index, row in enumerate(payload.get("ranking", []), start=1):
         lines.append(
-            f"  {index}. {row['name']}: status={row['status']} alerts={row['alerts_sent']} "
-            f"cards={row['cards_generated']} events={row['events_processed']} cfg={row['config_summary']} "
-            f"closest_market_margin={row['closest_market_margin']} closest_priority_margin={row['closest_priority_margin']}"
+            f"  {index}. {row['name']}：状态={row['status']}，平均真实收益={row['avg_realized_return']}%，"
+            f" 胜率={row['win_rate']}%，平均最大回撤={row['avg_max_drawdown']}%，"
+            f" 盈亏比={row['profit_loss_ratio']}，T+7={row['avg_t_plus_7_return']}%，配置={row['config_summary']}"
         )
     recommendation = payload.get("recommendation")
     if recommendation:
-        lines.append("Recommendation:")
-        lines.append(
-            f"  {recommendation['name']}: alerts={recommendation['alerts_sent']} "
-            f"cards={recommendation['cards_generated']} events={recommendation['events_processed']} "
-            f"cfg={recommendation['config_summary']} "
-            f"closest_market_margin={recommendation['closest_market_margin']} "
-            f"closest_priority_margin={recommendation['closest_priority_margin']}"
-        )
-        lines.append(f"  Reason: {recommendation['reason']}")
+        lines.append("推荐策略：")
+        if "decision_count" in recommendation:
+            lines.append(
+                f"  {recommendation['name']}：决策={recommendation['decision_count']}，"
+                f"已进场={recommendation['entered_count']}，止盈退出={recommendation['take_profit_exit_count']}，"
+                f"失效退出={recommendation['invalidation_exit_count']}，平均真实收益={recommendation['avg_realized_return']}%，"
+                f"胜率={recommendation['win_rate']}%，平均最大回撤={recommendation['avg_max_drawdown']}%，"
+                f"盈亏比={recommendation['profit_loss_ratio']}，T+7={recommendation['avg_t_plus_7_return']}%，"
+                f"配置={recommendation['config_summary']}"
+            )
+        else:
+            lines.append(
+                f"  {recommendation['name']}：提醒={recommendation.get('alerts_sent')}，"
+                f"卡片={recommendation.get('cards_generated')}，事件={recommendation.get('events_processed')}，"
+                f"最近市场阈值差={recommendation.get('closest_market_margin')}，"
+                f"最近优先级阈值差={recommendation.get('closest_priority_margin')}，"
+                f"配置={recommendation['config_summary']}"
+            )
+        lines.append(f"  推荐原因：{recommendation['reason']}")
     summary = payload.get("summary")
     if summary and summary.get("line_items"):
-        lines.append("Summary:")
+        lines.append("摘要：")
         for line in summary["line_items"]:
             lines.append(f"  {line}")
     recommendation = payload.get("recommendation")
     if recommendation:
-        lines.append("Winner Snapshot:")
+        lines.append("胜者快照：")
         top_event = next(
             (
                 item.get("top_event", "-")
@@ -2927,17 +3219,13 @@ def format_batch_replay(payload: dict[str, Any]) -> str:
             "-",
         )
         lines.append(
-            f"  {recommendation['name']}: cfg={recommendation['config_summary']} "
-            f"alerts={recommendation['alerts_sent']} cards={recommendation['cards_generated']} "
-            f"events={recommendation['events_processed']} top_event={top_event}"
-        )
-        lines.append(
-            f"  margins: market={recommendation['closest_market_margin']} "
-            f"priority={recommendation['closest_priority_margin']}"
+            f"  {recommendation['name']}：配置={recommendation['config_summary']}，"
+            f"平均真实收益={recommendation.get('avg_realized_return')}%，胜率={recommendation.get('win_rate')}%，"
+            f"平均最大回撤={recommendation.get('avg_max_drawdown')}%，主导事件={top_event}"
         )
     next_step = payload.get("next_step")
     if next_step and next_step.get("line_items"):
-        lines.append(f"Next Step: {next_step['title']}")
+        lines.append(f"下一步：{next_step['title']}")
         for line in next_step["line_items"]:
             lines.append(f"  {line}")
     return "\n".join(lines)

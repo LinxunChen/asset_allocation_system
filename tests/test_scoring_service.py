@@ -15,11 +15,12 @@ if str(SRC) not in sys.path:
 from satellite_agent.config import Settings
 from satellite_agent.entry_exit import EntryExitEngine
 from satellite_agent.event_normalizer import EventNormalizer
-from satellite_agent.llm import OpenAIExtractor, RuleBasedExtractor
+from satellite_agent.llm import NarrativeOutput, OpenAIExtractor, RuleBasedExtractor
 from satellite_agent.market_data import InMemoryMarketDataProvider, MarketDataEngine
 from satellite_agent.models import Bar, SourceEvent
 from satellite_agent.models import EventInsight, IndicatorSnapshot, OpportunityCard, PrewatchCandidate, PriceRange, utcnow
 from satellite_agent.notifier import Notifier
+from satellite_agent.observability import RunContext, StructuredLogger
 from satellite_agent.scoring import SignalScorer
 from satellite_agent.service import (
     SatelliteAgentService,
@@ -78,6 +79,93 @@ def build_intraday_bars() -> list[Bar]:
 
 
 class ScoringServiceTests(unittest.TestCase):
+    def test_event_score_weights_can_be_overridden(self) -> None:
+        settings = Settings().with_strategy_overrides(
+            event_score_weights={
+                "importance": 0.5,
+                "source_credibility": 0.1,
+                "novelty": 0.1,
+                "theme_relevance": 0.1,
+                "sentiment": 0.2,
+            }
+        )
+        scorer = SignalScorer(settings)
+        insight = EventInsight(
+            event_id="evt-weights",
+            symbol="NVDA",
+            event_type="earnings",
+            headline_summary="Positive earnings catalyst",
+            bull_case="",
+            bear_case="",
+            importance=80.0,
+            source_credibility=70.0,
+            novelty=60.0,
+            sentiment=0.5,
+            theme_relevance=90.0,
+            llm_confidence=80.0,
+            risk_notes=[],
+            source_refs=[],
+            raw_payload={},
+            created_at=utcnow(),
+        )
+
+        self.assertEqual(round(scorer._event_score(insight), 2), 72.0)
+
+    def test_bearish_trend_does_not_directly_confirm_long(self) -> None:
+        settings = Settings().with_strategy_overrides(
+            event_score_threshold=50.0,
+            horizons={
+                "swing": {
+                    "market_score_threshold": 20.0,
+                    "priority_threshold": 60.0,
+                }
+            },
+        )
+        scorer = SignalScorer(settings)
+        insight = EventInsight(
+            event_id="evt-bearish",
+            symbol="NVDA",
+            event_type="earnings",
+            headline_summary="Positive earnings catalyst",
+            bull_case="",
+            bear_case="",
+            importance=90.0,
+            source_credibility=90.0,
+            novelty=80.0,
+            sentiment=0.8,
+            theme_relevance=85.0,
+            llm_confidence=80.0,
+            risk_notes=[],
+            source_refs=[],
+            raw_payload={},
+            created_at=utcnow(),
+        )
+        snapshot = IndicatorSnapshot(
+            symbol="NVDA",
+            horizon="swing",
+            as_of=utcnow(),
+            last_price=100.0,
+            rsi_14=58.0,
+            atr_14=3.0,
+            sma_20=101.0,
+            sma_60=102.0,
+            relative_volume=1.8,
+            support_20=98.0,
+            resistance_20=105.0,
+            support_60=95.0,
+            resistance_60=108.0,
+            gap_percent=0.0,
+            intraday_breakout=True,
+            is_pullback=False,
+            trend_state="bearish",
+            atr_percent=3.0,
+        )
+
+        card = scorer.score(insight, snapshot)
+
+        self.assertNotEqual(card.action_label, "确认做多")
+        self.assertIn(card.action_label, {"试探建仓", "加入观察"})
+
     def test_entry_exit_invalidation_uses_normalized_long_entry_range(self) -> None:
         snapshot = IndicatorSnapshot(
             symbol="AAPL",
@@ -649,7 +737,7 @@ class ScoringServiceTests(unittest.TestCase):
 
             self.assertEqual(len(candidates), 1)
             self.assertEqual(candidates[0]["symbol"], "MU")
-            self.assertIn("题材近期持续活跃：半导体与AI", candidates[0]["reason_to_watch"])
+            self.assertIn("题材近期持续活跃：AI芯片与半导体设备", candidates[0]["reason_to_watch"])
 
     def test_event_driven_theme_prewatch_can_pull_related_symbol_into_watchlist(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -714,9 +802,9 @@ class ScoringServiceTests(unittest.TestCase):
             self.assertEqual(len(candidates), 1)
             self.assertEqual(candidates[0]["symbol"], "MU")
             self.assertEqual(candidates[0]["trigger_mode"], "event")
-            self.assertEqual(candidates[0]["trigger_theme"], "半导体与AI")
+            self.assertEqual(candidates[0]["trigger_theme"], "AI芯片与半导体设备")
             self.assertEqual(candidates[0]["trigger_symbols"], ["NVDA"])
-            self.assertIn("事件预热：半导体与AI", candidates[0]["reason_to_watch"])
+            self.assertIn("事件预热：AI芯片与半导体设备", candidates[0]["reason_to_watch"])
             self.assertIn("战略合作催化", candidates[0]["reason_to_watch"])
             self.assertIn("触发标的 NVDA", candidates[0]["reason_to_watch"])
 
@@ -1137,6 +1225,7 @@ class ScoringServiceTests(unittest.TestCase):
                     database_path=Path(temp_dir) / "agent.db",
                     openai_api_key="test-key",
                     openai_model="test-model",
+                    use_llm_event_extraction=True,
                     llm_max_requests_per_run=1,
                     llm_max_requests_per_day=10,
                     normal_alert_min_final_score=100.0,
@@ -1154,7 +1243,12 @@ class ScoringServiceTests(unittest.TestCase):
             service.run_once()
 
             rows = store.connection.execute(
-                "SELECT event_id, used_llm, success, reason FROM llm_usage ORDER BY usage_id ASC"
+                """
+                SELECT event_id, used_llm, success, reason
+                FROM llm_usage
+                WHERE component = 'event_extraction'
+                ORDER BY usage_id ASC
+                """
             ).fetchall()
             self.assertEqual(len(rows), 2)
             self.assertEqual(rows[0]["event_id"], "evt-llm-1")
@@ -1255,6 +1349,166 @@ class ScoringServiceTests(unittest.TestCase):
             self.assertTrue(transport.messages[0][0].startswith("[预备池]"))
             self.assertEqual(second["prewatch_alerts_sent"], 0)
             self.assertEqual(latest_summary["prewatch_alert_symbols"], [])
+
+    def test_prewatch_alert_skips_repeat_when_content_unchanged_within_repeat_window(self) -> None:
+        class DummyTransport:
+            def __init__(self) -> None:
+                self.messages: list[tuple[str, str]] = []
+
+            def send(self, title: str, body: str) -> None:
+                self.messages.append((title, body))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+            settings = Settings(
+                dry_run=False,
+                database_path=db_path,
+                prewatch_alert_min_score=75.0,
+                max_prewatch_alerts_per_run=2,
+                prewatch_alert_cooldown_minutes=240,
+                prewatch_alert_repeat_window_minutes=720,
+                prewatch_alert_repeat_min_score_delta=4.0,
+            )
+            transport = DummyTransport()
+            service = SatelliteAgentService(
+                settings=settings,
+                store=store,
+                source_adapter=StaticSourceAdapter([]),
+                normalizer=EventNormalizer(),
+                extractor=RuleBasedExtractor(),
+                market_data=MarketDataEngine(InMemoryMarketDataProvider(data={})),
+                scorer=SignalScorer(settings),
+                entry_exit=EntryExitEngine(),
+                notifier=Notifier(store=store, transport=transport, dry_run=False),
+                prewatch_symbols=["NBIS"],
+            )
+            candidate = PrewatchCandidate(
+                symbol="NBIS",
+                horizon="position",
+                setup_type="breakout_watch",
+                score=82.0,
+                headline_summary="NBIS 进入预备池",
+                action_hint="轻仓观察",
+                reason_to_watch="量价结构改善",
+                last_price=100.0,
+                rsi_14=58.0,
+                relative_volume=1.8,
+                trend_state="bullish",
+                support_20=97.0,
+                resistance_20=103.0,
+                as_of=utcnow(),
+            )
+            logger = StructuredLogger(store, "run-prewatch-repeat")
+            first_context = RunContext(run_id="run-prewatch-repeat")
+            first_sent = service._dispatch_prewatch_notifications(
+                [candidate],
+                macro_context={"market_regime": "neutral", "rate_risk": "low", "geopolitical_risk": "low", "macro_risk_score": 35.0},
+                run_context=first_context,
+                logger=logger,
+            )
+            self.assertEqual(first_sent, ["NBIS"])
+            self.assertEqual(len(transport.messages), 1)
+
+            previous_state = json.loads(store.get_state("prewatch_alert:NBIS"))
+            previous_state["sent_at"] = (utcnow() - timedelta(hours=5)).isoformat()
+            store.set_state("prewatch_alert:NBIS", json.dumps(previous_state, sort_keys=True))
+
+            second_context = RunContext(run_id="run-prewatch-repeat-2")
+            second_sent = service._dispatch_prewatch_notifications(
+                [candidate],
+                macro_context={"market_regime": "neutral", "rate_risk": "low", "geopolitical_risk": "low", "macro_risk_score": 35.0},
+                run_context=second_context,
+                logger=logger,
+            )
+            self.assertEqual(second_sent, [])
+            self.assertEqual(len(transport.messages), 1)
+
+    def test_prewatch_alert_uses_llm_narration_in_rendered_body(self) -> None:
+        class DummyTransport:
+            def __init__(self) -> None:
+                self.messages: list[tuple[str, str]] = []
+
+            def send(self, title: str, body: str) -> None:
+                self.messages.append((title, body))
+
+        class FakeNarrator:
+            def narrate_with_metadata(self, **kwargs):
+                return (
+                    NarrativeOutput(
+                        summary="公司披露的新合作仍处在预热阶段，更多细节还没落地。",
+                        impact_inference="短线先看合作细节和量能能否继续跟上，确认后才更容易升级。",
+                        reasoning="消息先把这只票重新拉回视野，但现在更适合先观察，不适合直接追。",
+                        uncertainty="如果后续没有新增细节，关注度可能很快降温。",
+                        priority_adjustment=0.0,
+                    ),
+                    {
+                        "used_llm": True,
+                        "success": True,
+                        "reason": "ok",
+                        "model": "fake-narrator",
+                        "prompt_tokens_estimate": 10,
+                        "completion_tokens_estimate": 10,
+                        "latency_ms": 1,
+                    },
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+            settings = Settings(
+                dry_run=False,
+                database_path=db_path,
+                prewatch_alert_min_score=75.0,
+                max_prewatch_alerts_per_run=1,
+            )
+            transport = DummyTransport()
+            service = SatelliteAgentService(
+                settings=settings,
+                store=store,
+                source_adapter=StaticSourceAdapter([]),
+                normalizer=EventNormalizer(),
+                extractor=RuleBasedExtractor(),
+                market_data=MarketDataEngine(InMemoryMarketDataProvider(data={})),
+                scorer=SignalScorer(settings),
+                entry_exit=EntryExitEngine(),
+                notifier=Notifier(store=store, transport=transport, dry_run=False),
+                prewatch_symbols=["NBIS"],
+            )
+            service.narrator = FakeNarrator()  # type: ignore[assignment]
+            candidate = PrewatchCandidate(
+                symbol="NBIS",
+                horizon="position",
+                setup_type="breakout_watch",
+                score=82.0,
+                headline_summary="NBIS 进入预备池",
+                action_hint="轻仓观察",
+                reason_to_watch="量价结构改善",
+                last_price=100.0,
+                rsi_14=58.0,
+                relative_volume=1.8,
+                trend_state="bullish",
+                support_20=97.0,
+                resistance_20=103.0,
+                as_of=utcnow(),
+            )
+            logger = StructuredLogger(store, "run-prewatch-llm")
+            sent = service._dispatch_prewatch_notifications(
+                [candidate],
+                macro_context={"market_regime": "neutral", "rate_risk": "low", "geopolitical_risk": "low", "macro_risk_score": 35.0},
+                run_context=RunContext(run_id="run-prewatch-llm"),
+                logger=logger,
+            )
+
+            self.assertEqual(sent, ["NBIS"])
+            self.assertEqual(len(transport.messages), 1)
+            title, body = transport.messages[0]
+            self.assertTrue(title.startswith("[预备池]"))
+            self.assertIn("事实摘要：公司披露的新合作仍处在预热阶段", body)
+            self.assertIn("为什么现在先观察：消息先把这只票重新拉回视野", body)
+            self.assertIn("升级触发：短线先看合作细节和量能能否继续跟上", body)
 
     def test_prewatch_scan_skips_ineligible_and_recent_failure_symbols(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

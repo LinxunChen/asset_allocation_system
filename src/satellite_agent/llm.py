@@ -3,13 +3,15 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any, Dict
 from urllib import request
 
-from .models import EventInsight, SourceEvent, utcnow
+from .models import EventInsight, OpportunityCard, SourceEvent, utcnow
 
 
 JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
+OPENAI_API_TIMEOUT_SECONDS = 90
 SEC_FILING_PATTERNS = (
     re.compile(r"\b8-k\b"),
     re.compile(r"\b10-q\b"),
@@ -20,6 +22,36 @@ SEC_FILING_PATTERNS = (
     re.compile(r"\bfiled an? (8-k|10-q|10-k)\b"),
     re.compile(r"\bfiling(s)?\b"),
 )
+
+
+def _normalize_narrative_text(text: str, *, max_chars: int) -> str:
+    cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+    cleaned = cleaned.replace("：", "：").replace("，", "，")
+    if len(cleaned) <= max_chars:
+        return cleaned
+    truncated = cleaned[: max_chars - 1].rstrip("，。；：、,. ")
+    return f"{truncated}…"
+
+
+def _soften_trader_jargon(text: str) -> str:
+    softened = str(text or "")
+    replacements = (
+        ("风险偏好环境提供安全边际", "当前市场环境不拖后腿"),
+        ("风险偏好提供安全边际", "当前市场环境不拖后腿"),
+        ("提供安全边际", "不至于太吃亏"),
+        ("放量确认多头动能", "成交量放大，说明有资金在跟"),
+        ("量价配合共振", "价格走强、量能也有跟上"),
+        ("量价确认", "价格和成交量都在配合"),
+        ("顺趋势的二次确认", "顺着当前强势方向跟随"),
+        ("动能确认", "资金还在跟"),
+        ("多头动能", "做多资金在跟"),
+        ("结构向上", "价格结构偏强"),
+        ("结构走弱", "价格结构偏弱"),
+    )
+    for source, target in replacements:
+        softened = softened.replace(source, target)
+    softened = re.sub(r"安全边际", "缓冲", softened)
+    return softened
 
 
 def _keyword_score(text: str, positive: tuple[str, ...], negative: tuple[str, ...]) -> float:
@@ -36,6 +68,58 @@ def _estimate_tokens(text: str) -> int:
     if not text:
         return 0
     return max(1, (len(text) + 3) // 4)
+
+
+def _build_openai_chat_body(
+    *,
+    model: str,
+    prompt: str,
+    temperature: float,
+    max_tokens: int,
+) -> bytes:
+    return json.dumps(
+        {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": "Return strict JSON. No markdown."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "response_format": {"type": "json_object"},
+            "enable_thinking": False,
+        }
+    ).encode("utf-8")
+
+
+def _extract_message_content(raw: Dict[str, Any]) -> str:
+    message = raw["choices"][0]["message"]
+    content = message.get("content")
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                text_parts.append(str(part.get("text", "")))
+        content = "".join(text_parts)
+    if not content:
+        content = message.get("reasoning_content", "")
+    return str(content or "")
+
+
+def _extract_usage_metadata(raw: Dict[str, Any]) -> dict[str, int]:
+    usage = raw.get("usage") or {}
+    try:
+        prompt_tokens = int(usage.get("prompt_tokens") or 0)
+    except (TypeError, ValueError):
+        prompt_tokens = 0
+    try:
+        completion_tokens = int(usage.get("completion_tokens") or 0)
+    except (TypeError, ValueError):
+        completion_tokens = 0
+    return {
+        "prompt_tokens": max(0, prompt_tokens),
+        "completion_tokens": max(0, completion_tokens),
+    }
 
 
 @dataclass
@@ -188,16 +272,19 @@ class OpenAIExtractor(RuleBasedExtractor):
         prompt = self._build_prompt(event)
         prompt_tokens = _estimate_tokens(prompt)
         try:
-            payload = self._call_api(prompt)
+            payload, call_metadata = self._call_api_with_metadata(prompt)
             insight = self._payload_to_insight(event, payload)
-            completion_tokens = _estimate_tokens(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            completion_tokens = int(call_metadata.get("completion_tokens") or 0)
+            if completion_tokens <= 0:
+                completion_tokens = _estimate_tokens(json.dumps(payload, ensure_ascii=False, sort_keys=True))
             return insight, {
                 "used_llm": True,
                 "success": True,
                 "reason": "ok",
                 "model": self.model,
-                "prompt_tokens_estimate": prompt_tokens,
+                "prompt_tokens_estimate": int(call_metadata.get("prompt_tokens") or prompt_tokens),
                 "completion_tokens_estimate": completion_tokens,
+                "latency_ms": int(call_metadata.get("latency_ms") or 0),
             }
         except Exception as exc:
             return super().extract(event), {
@@ -207,6 +294,7 @@ class OpenAIExtractor(RuleBasedExtractor):
                 "model": self.model,
                 "prompt_tokens_estimate": prompt_tokens,
                 "completion_tokens_estimate": 0,
+                "latency_ms": 0,
             }
 
     def _build_prompt(self, event: SourceEvent) -> str:
@@ -222,16 +310,16 @@ class OpenAIExtractor(RuleBasedExtractor):
         )
 
     def _call_api(self, prompt: str) -> Dict[str, Any]:
-        body = json.dumps(
-            {
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": "Return strict JSON. No markdown."},
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": 0.1,
-            }
-        ).encode("utf-8")
+        payload, _ = self._call_api_with_metadata(prompt)
+        return payload
+
+    def _call_api_with_metadata(self, prompt: str) -> tuple[Dict[str, Any], Dict[str, int]]:
+        body = _build_openai_chat_body(
+            model=self.model,
+            prompt=prompt,
+            temperature=0.1,
+            max_tokens=400,
+        )
         req = request.Request(
             self.base_url,
             data=body,
@@ -241,13 +329,18 @@ class OpenAIExtractor(RuleBasedExtractor):
             },
             method="POST",
         )
-        with request.urlopen(req, timeout=20) as response:
+        started = perf_counter()
+        with request.urlopen(req, timeout=OPENAI_API_TIMEOUT_SECONDS) as response:
             raw = json.loads(response.read().decode("utf-8"))
-        content = raw["choices"][0]["message"]["content"]
+        latency_ms = int((perf_counter() - started) * 1000)
+        content = _extract_message_content(raw)
         match = JSON_BLOCK_RE.search(content)
         if not match:
             raise ValueError("LLM response did not contain JSON")
-        return json.loads(match.group(0))
+        return json.loads(match.group(0)), {
+            **_extract_usage_metadata(raw),
+            "latency_ms": latency_ms,
+        }
 
     def _payload_to_insight(self, event: SourceEvent, payload: Dict[str, Any]) -> EventInsight:
         fallback = super().extract(event)
@@ -282,3 +375,205 @@ class OpenAIExtractor(RuleBasedExtractor):
             raw_payload=payload,
             created_at=utcnow(),
         )
+
+
+@dataclass
+class NarrativeOutput:
+    summary: str = ""
+    impact_inference: str = ""
+    reasoning: str = ""
+    uncertainty: str = ""
+    priority_adjustment: float = 0.0
+
+
+class OpenAINarrator:
+    def __init__(self, api_key: str, model: str, base_url: str) -> None:
+        self.api_key = api_key
+        self.model = model
+        self.base_url = base_url
+
+    def narrate(
+        self,
+        *,
+        insight: EventInsight,
+        card: OpportunityCard,
+        market_regime: str,
+        rate_risk: str,
+        geopolitical_risk: str,
+        theme_text: str,
+        chain_summary: str,
+    ) -> NarrativeOutput:
+        output, _ = self.narrate_with_metadata(
+            insight=insight,
+            card=card,
+            market_regime=market_regime,
+            rate_risk=rate_risk,
+            geopolitical_risk=geopolitical_risk,
+            theme_text=theme_text,
+            chain_summary=chain_summary,
+        )
+        return output
+
+    def narrate_with_metadata(
+        self,
+        *,
+        insight: EventInsight,
+        card: OpportunityCard,
+        market_regime: str,
+        rate_risk: str,
+        geopolitical_risk: str,
+        theme_text: str,
+        chain_summary: str,
+        lite: bool = False,
+    ) -> tuple[NarrativeOutput, Dict[str, Any]]:
+        if not self.api_key:
+            return NarrativeOutput(), {
+                "used_llm": False,
+                "success": False,
+                "reason": "missing_api_key",
+                "model": self.model,
+                "prompt_tokens_estimate": 0,
+                "completion_tokens_estimate": 0,
+                "latency_ms": 0,
+            }
+        if lite:
+            prompt = (
+                "Rewrite this prewatch stock alert for a Chinese-speaking trader. "
+                "Return JSON only with keys: summary, impact_inference, reasoning, uncertainty, priority_adjustment. "
+                "Use concise Simplified Chinese. No hype, no markdown, no extra keys. "
+                "summary: facts only, 1 short sentence. "
+                "impact_inference: 1 short sentence explaining what still needs confirmation before upgrading. "
+                "reasoning: 1 short sentence explaining why it stays on watch instead of direct execution. "
+                "uncertainty: 1 short sentence naming the main failure mode. "
+                "priority_adjustment: always return 0.\n"
+                f"Symbol: {card.symbol}\n"
+                f"Event type: {insight.event_type}\n"
+                f"Headline: {insight.headline_summary}\n"
+                f"Action: {card.action_label}\n"
+                f"Trend state: {card.trend_state}\n"
+                f"Theme: {theme_text}\n"
+                f"Chain summary: {chain_summary}\n"
+                f"RSI: {card.rsi_14}\n"
+                f"Relative volume: {card.relative_volume}\n"
+            )
+        else:
+            prompt = (
+                "Rewrite this stock alert card for a Chinese-speaking trader. "
+                "Return JSON only with keys: summary, impact_inference, reasoning, uncertainty, priority_adjustment. "
+                "Use concise Simplified Chinese. No hype, no markdown, no extra keys. "
+                "summary: facts only, at most 2 short sentences, no market judgment words. "
+                "impact_inference: what the market may trade over the next 1-7 trading days and what confirmation is still missing. "
+                "reasoning: explain in plain trader language using three concrete layers when relevant: message, price structure, and funds/volume. "
+                "Avoid abstract terms like 风险偏好, 安全边际, 动能确认, 共振 unless you immediately explain them in plain words. "
+                "uncertainty: one short sentence naming the main failure mode. "
+                "priority_adjustment: number between -8 and 8.\n"
+                f"Symbol: {card.symbol}\n"
+                f"Event type: {insight.event_type}\n"
+                f"Headline: {insight.headline_summary}\n"
+                f"Bull case: {insight.bull_case[:160]}\n"
+                f"Bear case: {insight.bear_case[:160]}\n"
+                f"Action: {card.action_label}\n"
+                f"Trend state: {card.trend_state}\n"
+                f"Theme: {theme_text}\n"
+                f"Chain summary: {chain_summary}\n"
+                f"Market regime: {market_regime}\n"
+                f"Rate risk: {rate_risk}\n"
+                f"Geopolitical risk: {geopolitical_risk}\n"
+                f"Event score: {card.event_score:.2f}\n"
+                f"Market score: {card.market_score:.2f}\n"
+                f"Final score: {card.final_score:.2f}\n"
+                f"RSI: {card.rsi_14}\n"
+                f"Relative volume: {card.relative_volume}\n"
+            )
+        prompt_tokens = _estimate_tokens(prompt)
+        try:
+            payload, call_metadata = self._call_api_with_metadata(
+                prompt,
+                max_tokens=180 if lite else 300,
+            )
+        except Exception as exc:
+            return NarrativeOutput(), {
+                "used_llm": True,
+                "success": False,
+                "reason": f"api_error:{exc.__class__.__name__}",
+                "model": self.model,
+                "prompt_tokens_estimate": prompt_tokens,
+                "completion_tokens_estimate": 0,
+                "latency_ms": 0,
+            }
+        output = NarrativeOutput(
+            summary=_normalize_narrative_text(str(payload.get("summary", "")), max_chars=80),
+            impact_inference=_normalize_narrative_text(
+                _soften_trader_jargon(str(payload.get("impact_inference", ""))),
+                max_chars=80,
+            ),
+            reasoning=_normalize_narrative_text(
+                _soften_trader_jargon(str(payload.get("reasoning", ""))),
+                max_chars=96,
+            ),
+            uncertainty=_normalize_narrative_text(
+                _soften_trader_jargon(str(payload.get("uncertainty", ""))),
+                max_chars=48,
+            ),
+            priority_adjustment=_bounded_float(payload.get("priority_adjustment"), -8.0, 8.0),
+        )
+        completion_tokens = int(call_metadata.get("completion_tokens") or 0)
+        if completion_tokens <= 0:
+            completion_tokens = _estimate_tokens(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return output, {
+            "used_llm": True,
+            "success": any(
+                [
+                    output.summary,
+                    output.impact_inference,
+                    output.reasoning,
+                    output.uncertainty,
+                ]
+            ),
+            "reason": "ok",
+            "model": self.model,
+            "prompt_tokens_estimate": int(call_metadata.get("prompt_tokens") or prompt_tokens),
+            "completion_tokens_estimate": completion_tokens,
+            "latency_ms": int(call_metadata.get("latency_ms") or 0),
+        }
+
+    def _call_api(self, prompt: str) -> Dict[str, Any]:
+        payload, _ = self._call_api_with_metadata(prompt)
+        return payload
+
+    def _call_api_with_metadata(self, prompt: str, *, max_tokens: int = 300) -> tuple[Dict[str, Any], Dict[str, int]]:
+        body = _build_openai_chat_body(
+            model=self.model,
+            prompt=prompt,
+            temperature=0.2,
+            max_tokens=max_tokens,
+        )
+        req = request.Request(
+            self.base_url,
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+            method="POST",
+        )
+        started = perf_counter()
+        with request.urlopen(req, timeout=OPENAI_API_TIMEOUT_SECONDS) as response:
+            raw = json.loads(response.read().decode("utf-8"))
+        latency_ms = int((perf_counter() - started) * 1000)
+        content = _extract_message_content(raw)
+        match = JSON_BLOCK_RE.search(content)
+        if not match:
+            raise ValueError("LLM response did not contain JSON")
+        return json.loads(match.group(0)), {
+            **_extract_usage_metadata(raw),
+            "latency_ms": latency_ms,
+        }
+
+
+def _bounded_float(value: Any, minimum: float, maximum: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(minimum, min(maximum, parsed))

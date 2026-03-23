@@ -6,7 +6,7 @@ import hashlib
 import json
 import time
 from datetime import datetime, timedelta
-from typing import Dict
+from typing import Any, Dict
 
 from .config import Settings
 from .decision_engines import (
@@ -20,14 +20,14 @@ from .decision_engines.types import PricePlan, ReasonSections, SourceBundle
 from .entry_exit import EntryExitEngine
 from .event_normalizer import EventNormalizer
 from .llm import OpenAIExtractor, RuleBasedExtractor
+from .llm import OpenAINarrator
 from .market_data import (
     MarketDataEngine,
     MultiSourceMarketDataProvider,
     StooqDailyMarketDataProvider,
     YahooFinanceMarketDataProvider,
 )
-from .models import utcnow
-from .models import SourceHealthCheck
+from .models import EventInsight, OpportunityCard, PriceRange, SourceHealthCheck, utcnow
 from .notifier import Notifier
 from .observability import RunContext, StructuredLogger
 from .prewatch import build_prewatch_candidate, sort_prewatch_candidates
@@ -35,6 +35,7 @@ from .scoring import SignalScorer
 from .sources import SourceAdapter
 from .store import Store
 from .theme_linkage import (
+    build_theme_display_name_map_from_watchlist_payload,
     build_symbol_theme_map_from_watchlist_payload,
     build_theme_memberships,
     display_theme_name,
@@ -107,6 +108,7 @@ THEME_PREWATCH_CONFIRMED_BONUS = 4.0
 THEME_CONFIRMATION_CHAIN_BONUS = 1.5
 THEME_MEMORY_STATE_KEY = "theme_heat_memory"
 EVENT_PREWATCH_BASE_BONUS = 4.0
+MACRO_PROXY_SYMBOLS = ("SPY", "QQQ", "SMH", "TLT")
 
 EVENT_TYPE_DISPLAY_NAMES: dict[str, str] = {
     "earnings": "财报",
@@ -132,6 +134,55 @@ def _display_trend_state(value: str) -> str:
         "uptrend": "多头",
         "downtrend": "空头",
     }.get(value, value)
+
+
+def _relative_volume_label(value: float | None) -> str:
+    if value is None:
+        return "未识别"
+    if value >= 2.2:
+        return "异常放量"
+    if value >= 1.5:
+        return "明显放量"
+    if value >= 1.15:
+        return "温和放量"
+    return "未放量"
+
+
+def _score_label(score: float | None, *, bands: tuple[float, float, float], labels: tuple[str, str, str, str]) -> str:
+    if score is None:
+        return "未识别"
+    high, medium, low = bands
+    if score >= high:
+        return labels[0]
+    if score >= medium:
+        return labels[1]
+    if score >= low:
+        return labels[2]
+    return labels[3]
+
+
+def _market_regime_display(value: str) -> str:
+    return {"risk_on": "风险偏好回升", "neutral": "中性", "risk_off": "风险偏好下降"}.get(value, value or "中性")
+
+
+def _risk_level_display(value: str) -> str:
+    return {"low": "低", "medium": "中", "high": "高"}.get(value, value or "中")
+
+
+def _load_symbol_display_names(watchlist_payload: dict) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for bucket_key in ("stock_items", "etf_items"):
+        bucket = watchlist_payload.get(bucket_key, {})
+        if not isinstance(bucket, dict):
+            continue
+        for symbol, item in bucket.items():
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            normalized = str(symbol).strip().upper()
+            if normalized and name:
+                mapping[normalized] = name
+    return mapping
 
 
 class SatelliteAgentService:
@@ -165,8 +216,10 @@ class SatelliteAgentService:
         self.note = note
         self.prewatch_symbols = [symbol.upper() for symbol in (prewatch_symbols or [])]
         runtime_watchlist = self.runtime_snapshot.get("runtime_config", {}).get("watchlist", {})
+        self.symbol_display_names = _load_symbol_display_names(runtime_watchlist)
         self.symbol_theme_map = build_symbol_theme_map_from_watchlist_payload(runtime_watchlist)
         self.theme_memberships = build_theme_memberships(self.symbol_theme_map)
+        self.theme_display_name_map = build_theme_display_name_map_from_watchlist_payload(runtime_watchlist)
         self.event_engine = HybridEventUnderstandingEngine(
             rule_extractor=RuleBasedExtractor(),
             llm_extractor=extractor if isinstance(extractor, OpenAIExtractor) else None,
@@ -175,8 +228,18 @@ class SatelliteAgentService:
         self.theme_engine = HybridThemeUnderstandingEngine(
             symbol_theme_map=self.symbol_theme_map,
             theme_memberships=self.theme_memberships,
+            theme_display_name_map=self.theme_display_name_map,
             store=self.store,
             settings=self.settings,
+        )
+        self.narrator = (
+            OpenAINarrator(
+                api_key=self.settings.openai_api_key,
+                model=self.settings.openai_model,
+                base_url=self.settings.openai_base_url,
+            )
+            if self.settings.openai_api_key and self.settings.use_llm_narration
+            else None
         )
         self.prewatch_market_data = MarketDataEngine(
             MultiSourceMarketDataProvider(
@@ -187,11 +250,249 @@ class SatelliteAgentService:
             )
         )
 
+    def _display_name_for(self, symbol: str) -> str:
+        normalized = str(symbol).strip().upper()
+        return self.symbol_display_names.get(normalized, normalized)
+
+    def _build_macro_context(self) -> dict[str, object]:
+        if not self.settings.use_macro_risk_overlay:
+            return {
+                "market_regime": "neutral",
+                "rate_risk": "low",
+                "geopolitical_risk": "low",
+                "macro_risk_score": 0.0,
+            }
+        snapshots: dict[str, object] = {}
+        scores: list[int] = []
+        for symbol in MACRO_PROXY_SYMBOLS:
+            try:
+                snapshot = self.prewatch_market_data.snapshot(symbol, "position", include_intraday=False)
+            except Exception:
+                continue
+            snapshots[symbol] = snapshot
+        for symbol in ("SPY", "QQQ", "SMH"):
+            snapshot = snapshots.get(symbol)
+            if snapshot is None:
+                continue
+            trend_state = getattr(snapshot, "trend_state", "neutral")
+            if trend_state == "bullish":
+                scores.append(1)
+            elif trend_state == "bearish":
+                scores.append(-1)
+            else:
+                scores.append(0)
+        avg_score = sum(scores) / len(scores) if scores else 0.0
+        if avg_score <= -0.6:
+            regime = "risk_off"
+        elif avg_score >= 0.6:
+            regime = "risk_on"
+        else:
+            regime = "neutral"
+        tlt_snapshot = snapshots.get("TLT")
+        tlt_trend = getattr(tlt_snapshot, "trend_state", "neutral") if tlt_snapshot is not None else "neutral"
+        if tlt_trend == "bearish":
+            rate_risk = "high"
+        elif tlt_trend == "neutral":
+            rate_risk = "medium"
+        else:
+            rate_risk = "low"
+        semis_trend = getattr(snapshots.get("SMH"), "trend_state", "neutral")
+        geopolitical_risk = "high" if regime == "risk_off" and semis_trend == "bearish" and tlt_trend == "bullish" else "low"
+        macro_risk_score = 0.0
+        macro_risk_score += {"risk_on": 10.0, "neutral": 35.0, "risk_off": 70.0}[regime]
+        macro_risk_score += {"low": 0.0, "medium": 10.0, "high": 20.0}[rate_risk]
+        macro_risk_score += {"low": 0.0, "high": 10.0}.get(geopolitical_risk, 5.0)
+        return {
+            "market_regime": regime,
+            "rate_risk": rate_risk,
+            "geopolitical_risk": geopolitical_risk,
+            "macro_risk_score": round(min(macro_risk_score, 100.0), 2),
+        }
+
+    def _macro_penalty(self, action_label: str, macro_risk_score: float) -> float:
+        if macro_risk_score >= 70.0:
+            return {"确认做多": 12.0, "试探建仓": 6.0, "加入观察": 2.0}.get(action_label, 0.0)
+        if macro_risk_score >= 50.0:
+            return {"确认做多": 6.0, "试探建仓": 3.0, "加入观察": 1.0}.get(action_label, 0.0)
+        return 0.0
+
+    def _parse_alert_action_label(self, row: Any) -> str:
+        card_json_raw = row["card_json"] if "card_json" in row.keys() else ""
+        if not card_json_raw:
+            return ""
+        try:
+            card_payload = json.loads(str(card_json_raw))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return ""
+        action_label = str(card_payload.get("action_label") or "").strip()
+        if action_label:
+            return action_label
+        priority = str(card_payload.get("priority") or row["priority"] or "").strip()
+        market_data_complete = bool(card_payload.get("market_data_complete", True))
+        if not market_data_complete:
+            return "加入观察"
+        return {"high": "确认做多", "normal": "试探建仓", "suppressed": "加入观察"}.get(priority, "")
+
+    def _chain_summary_for_symbol(self, symbol: str, *, current_action: str) -> str:
+        since = (utcnow() - timedelta(days=7)).isoformat()
+        symbol_upper = symbol.upper()
+        rows = [
+            row
+            for row in self.store.load_decision_records_for_window(since=since)
+            if str(row["symbol"]).upper() == symbol_upper
+        ]
+        if not rows:
+            return "首次出现"
+        terminal_reasons = {"hit_take_profit", "hit_invalidation", "window_complete"}
+        active_cycle: list[dict | object] = []
+        for row in rows:
+            if str(row["close_reason"] or "") in terminal_reasons:
+                active_cycle = []
+                continue
+            active_cycle.append(row)
+        if not active_cycle:
+            return "首次出现"
+        cycle_start_at = datetime.fromisoformat(str(active_cycle[0]["created_at"]))
+        alert_rows = [
+            row
+            for row in self.store.load_alert_history_for_window(since=since, symbol=symbol_upper)
+            if int(row["sent"] or 0) == 1 and datetime.fromisoformat(str(row["notified_at"])) >= cycle_start_at
+        ]
+        action_nodes: list[str] = []
+        now = utcnow()
+        alert_action_nodes: list[str] = []
+        for row in alert_rows[-3:]:
+            action = self._parse_alert_action_label(row)
+            if not action:
+                continue
+            notified_at = datetime.fromisoformat(str(row["notified_at"]))
+            delta_days = max(0, int((now - notified_at).total_seconds() // 86400))
+            prefix = "今日" if delta_days == 0 else "昨晚" if delta_days == 1 else f"{delta_days}天前"
+            node = f"{prefix}{action}"
+            if not alert_action_nodes or alert_action_nodes[-1] != node:
+                alert_action_nodes.append(node)
+        if alert_action_nodes:
+            action_nodes = alert_action_nodes
+        else:
+            for row in active_cycle[-3:]:
+                action = str(row["action"] or "").strip()
+                if not action:
+                    continue
+                created_at = datetime.fromisoformat(str(row["created_at"]))
+                delta_days = max(0, int((now - created_at).total_seconds() // 86400))
+                prefix = "今日" if delta_days == 0 else "昨晚" if delta_days == 1 else f"{delta_days}天前"
+                node = f"{prefix}{action}"
+                if not action_nodes or action_nodes[-1] != node:
+                    action_nodes.append(node)
+        if not action_nodes:
+            return "首次出现"
+        if not action_nodes[-1].endswith(current_action):
+            action_nodes.append(f"今日{current_action}")
+        return " -> ".join(action_nodes)
+
+    def _decorate_card_with_runtime_context(
+        self,
+        card: OpportunityCard,
+        *,
+        insight: EventInsight,
+        macro_context: dict[str, object],
+        run_id: str = "",
+        lite_narration: bool = False,
+    ) -> OpportunityCard:
+        display_name = self._display_name_for(card.symbol)
+        macro_risk_score = float(macro_context.get("macro_risk_score", 0.0))
+        action_label = card.action_label
+        original_action_label = card.action_label
+        penalty = (
+            self._macro_penalty(action_label, macro_risk_score)
+            if card.bias == "long" and self.settings.use_macro_risk_overlay
+            else 0.0
+        )
+        final_score = round(max(0.0, card.final_score - penalty), 2)
+        priority = card.priority
+        if card.bias == "long" and macro_risk_score >= 70.0:
+            if action_label == "确认做多":
+                action_label = "试探建仓"
+                priority = "normal"
+            elif action_label == "试探建仓" and card.final_score < 80.0:
+                action_label = "加入观察"
+                priority = "suppressed" if priority == "normal" else priority
+        chain_summary = self._chain_summary_for_symbol(card.symbol, current_action=action_label)
+        theme_text = " / ".join(card.theme_tags) if card.theme_tags else "未标注"
+        narrative = None
+        narrative_metadata: dict[str, object] = {}
+        if self.narrator is not None:
+            narrative, narrative_metadata = self.narrator.narrate_with_metadata(
+                insight=insight,
+                card=card,
+                market_regime=str(macro_context.get("market_regime", "")),
+                rate_risk=str(macro_context.get("rate_risk", "")),
+                geopolitical_risk=str(macro_context.get("geopolitical_risk", "")),
+                theme_text=theme_text,
+                chain_summary=chain_summary,
+                lite=lite_narration,
+            )
+            self.store.record_llm_usage(
+                run_id=run_id,
+                event_id=insight.event_id,
+                symbol=card.symbol,
+                component="narration",
+                model=str(narrative_metadata.get("model") or self.settings.openai_model),
+                used_llm=bool(narrative_metadata.get("used_llm")),
+                success=bool(narrative_metadata.get("success")),
+                prompt_tokens_estimate=int(narrative_metadata.get("prompt_tokens_estimate") or 0),
+                completion_tokens_estimate=int(narrative_metadata.get("completion_tokens_estimate") or 0),
+                latency_ms=int(narrative_metadata.get("latency_ms") or 0),
+                reason=str(narrative_metadata.get("reason") or ""),
+                created_at=utcnow().isoformat(),
+            )
+        risk_notes = list(card.risk_notes)
+        macro_note = (
+            f"当前环境：{_market_regime_display(str(macro_context.get('market_regime', '')))}，"
+            f"利率压力{_risk_level_display(str(macro_context.get('rate_risk', '')))}。"
+        )
+        if penalty > 0 and card.bias == "long":
+            macro_note += f" 做多优先级已下调（-{penalty:.1f}分）。"
+        overlay_note = ""
+        if penalty > 0 and card.bias == "long":
+            overlay_note = f"宏观风险覆盖已生效：综合分下调 {penalty:.1f} 分"
+        if action_label != original_action_label:
+            action_note = f"动作由「{original_action_label}」降为「{action_label}」"
+            overlay_note = f"{overlay_note}，{action_note}" if overlay_note else f"宏观风险覆盖已生效：{action_note}"
+        if macro_note not in risk_notes:
+            risk_notes.append(macro_note)
+        return replace(
+            card,
+            display_name=display_name,
+            action_label=action_label,
+            priority=priority,
+            final_score=final_score,
+            chain_summary=chain_summary,
+            llm_summary=(narrative.summary if narrative and narrative.summary else card.headline_summary),
+            llm_impact_inference=narrative.impact_inference if narrative else "",
+            llm_reasoning=narrative.reasoning if narrative else "",
+            llm_uncertainty=narrative.uncertainty if narrative else "",
+            market_regime=str(macro_context.get("market_regime", "")),
+            rate_risk=str(macro_context.get("rate_risk", "")),
+            geopolitical_risk=str(macro_context.get("geopolitical_risk", "")),
+            macro_risk_score=macro_risk_score,
+            macro_penalty_applied=penalty,
+            macro_action_before_overlay=original_action_label,
+            macro_overlay_note=overlay_note,
+            narrative_priority_adjustment=(
+                narrative.priority_adjustment
+                if narrative and self.settings.use_llm_ranking_assist
+                else 0.0
+            ),
+            risk_notes=risk_notes,
+        )
+
     def run_once(self) -> Dict[str, int]:
         run_context = self._create_run_context()
         logger = StructuredLogger(self.store, run_context.run_id)
         logger.info("run_started", "Satellite agent run started.", stage="run")
         watchlist = self.store.load_watchlist()
+        macro_context = self._build_macro_context()
         now = utcnow()
         last_poll = self.store.get_state("last_event_poll_at")
         since = datetime.fromisoformat(last_poll) if last_poll else now - timedelta(days=1)
@@ -352,6 +653,7 @@ class SatelliteAgentService:
                             card_contexts[degraded_card.card_id] = {
                                 "event_assessment": event_assessment,
                                 "market_assessment": degraded_market_assessment,
+                                "insight": insight,
                             }
                             if degraded_card.promoted_from_prewatch:
                                 logger.info(
@@ -393,6 +695,7 @@ class SatelliteAgentService:
                         card_contexts[card.card_id] = {
                             "event_assessment": event_assessment,
                             "market_assessment": market_assessment,
+                            "insight": insight,
                         }
                         if card.promoted_from_prewatch:
                             logger.info(
@@ -431,6 +734,24 @@ class SatelliteAgentService:
                 notification_candidates,
                 confirmation_packets,
             )
+            notification_candidates = [
+                self._decorate_card_with_runtime_context(
+                    card,
+                    insight=card_contexts.get(card.card_id, {}).get("insight"),
+                    macro_context=macro_context,
+                    run_id=run_context.run_id,
+                )
+                if card_contexts.get(card.card_id, {}).get("insight") is not None
+                else replace(
+                    card,
+                    display_name=self._display_name_for(card.symbol),
+                    market_regime=str(macro_context.get("market_regime", "")),
+                    rate_risk=str(macro_context.get("rate_risk", "")),
+                    geopolitical_risk=str(macro_context.get("geopolitical_risk", "")),
+                    macro_risk_score=float(macro_context.get("macro_risk_score", 0.0)),
+                )
+                for card in notification_candidates
+            ]
             for card in notification_candidates:
                 self.store.save_opportunity_card(card, run_id=run_context.run_id)
             self._record_decision_packets(confirmation_packets, run_id=run_context.run_id)
@@ -450,6 +771,7 @@ class SatelliteAgentService:
             self._record_decision_packets(prewatch_packets, run_id=run_context.run_id)
             prewatch_alert_symbols = self._dispatch_prewatch_notifications(
                 prewatch_candidates,
+                macro_context=macro_context,
                 run_context=run_context,
                 logger=logger,
             )
@@ -506,7 +828,11 @@ class SatelliteAgentService:
         llm_requests_used: int,
         llm_daily_requests_used: int,
     ) -> tuple[object, object, int, int]:
-        allow_llm = isinstance(self.extractor, OpenAIExtractor) and bool(self.settings.openai_api_key)
+        allow_llm = (
+            isinstance(self.extractor, OpenAIExtractor)
+            and bool(self.settings.openai_api_key)
+            and self.settings.use_llm_event_extraction
+        )
 
         budget_reason = self._llm_budget_reason(
             llm_requests_used=llm_requests_used,
@@ -519,6 +845,7 @@ class SatelliteAgentService:
                 run_id=run_context.run_id,
                 event_id=event.event_id,
                 symbol=event.symbol,
+                component="event_extraction",
                 model=self.settings.openai_model,
                 used_llm=False,
                 success=False,
@@ -559,11 +886,13 @@ class SatelliteAgentService:
             run_id=run_context.run_id,
             event_id=event.event_id,
             symbol=event.symbol,
+            component="event_extraction",
             model=self.settings.openai_model,
             used_llm=used_llm,
             success=success,
             prompt_tokens_estimate=prompt_tokens,
             completion_tokens_estimate=completion_tokens,
+            latency_ms=int(metadata.get("latency_ms", 0) or 0),
             reason=reason,
             created_at=utcnow().isoformat(),
         )
@@ -909,7 +1238,7 @@ class SatelliteAgentService:
                 priority_rank.get(card.priority, 3),
                 0 if getattr(card, "promoted_from_prewatch", False) else 1,
                 -theme_heat.get(card.symbol.upper(), 0.0),
-                -card.final_score,
+                -(card.final_score + max(min(getattr(card, "narrative_priority_adjustment", 0.0), 3.0), -3.0)),
                 -card.event_score,
                 card.symbol,
                 card.horizon,
@@ -1146,6 +1475,7 @@ class SatelliteAgentService:
         self,
         candidates,
         *,
+        macro_context: dict[str, object],
         run_context: RunContext,
         logger: StructuredLogger,
     ) -> list[str]:
@@ -1160,25 +1490,23 @@ class SatelliteAgentService:
                 and len(sent_symbols) >= self.settings.max_prewatch_alerts_per_run
             ):
                 break
-            if self._is_prewatch_alert_cooled_down(candidate.symbol):
+            should_skip, skip_reason = self._should_skip_prewatch_alert(candidate)
+            if should_skip:
                 logger.info(
                     "prewatch_alert_skipped",
-                    "Prewatch light alert skipped due to cooldown.",
+                    "Prewatch light alert skipped.",
                     stage="prewatch_notify",
                     symbol=candidate.symbol,
-                    context={"reason": "cooldown_active"},
+                    context={"reason": skip_reason},
                 )
                 continue
-            title = f"[预备池] {candidate.symbol} {_display_horizon(candidate.horizon)}观察"
-            body = "\n".join(
-                [
-                    f"分数：{candidate.score:.2f}",
-                    f"摘要：{candidate.headline_summary}",
-                    f"建议：{candidate.action_hint}",
-                    f"关注理由：{candidate.reason_to_watch}",
-                    f"状态：现价 {candidate.last_price:.2f} / RSI {candidate.rsi_14:.1f} / 相对量能 {candidate.relative_volume:.2f} 倍",
-                ]
+            notification_card = self._build_prewatch_notification_card(
+                candidate,
+                macro_context=macro_context,
+                run_id=run_context.run_id,
             )
+            title = f"[预备池] {self.notifier._title(notification_card)}"
+            body = self.notifier._body(notification_card)
             try:
                 self.notifier.transport.send(title, body)
             except Exception as exc:
@@ -1191,7 +1519,7 @@ class SatelliteAgentService:
                     context={"error": exc.__class__.__name__},
                 )
                 continue
-            self.store.set_state(self._prewatch_alert_state_key(candidate.symbol), utcnow().isoformat())
+            self._record_prewatch_alert_sent(candidate)
             run_context.metrics.prewatch_alerts_sent += 1
             sent_symbols.append(candidate.symbol)
             logger.info(
@@ -1202,6 +1530,89 @@ class SatelliteAgentService:
                 context={"score": candidate.score, "horizon": candidate.horizon},
             )
         return sent_symbols
+
+    def _build_prewatch_notification_card(
+        self,
+        candidate,
+        *,
+        macro_context: dict[str, object],
+        run_id: str = "",
+    ) -> OpportunityCard:
+        now = utcnow()
+        symbol = candidate.symbol.upper()
+        theme_tags = theme_tags_for_symbol(
+            symbol,
+            self.symbol_theme_map,
+            self.theme_display_name_map,
+        )
+        event_type = candidate.trigger_event_type or "news"
+        confidence_label = "中" if candidate.score >= self.settings.prewatch_alert_min_score else "低"
+        base_card = OpportunityCard(
+            card_id=f"prewatch-notify:{symbol}:{int(now.timestamp())}",
+            event_id=f"prewatch-notify:{symbol}:{candidate.as_of.isoformat()}",
+            symbol=symbol,
+            horizon=candidate.horizon,
+            event_type=event_type,
+            headline_summary=candidate.headline_summary,
+            bull_case="若后续催化继续兑现、价格结构转强，这条预备池机会有望升级。",
+            bear_case="若量能衰减或价格结构转弱，这条预备池机会可能快速失去跟踪价值。",
+            event_score=round(candidate.score if candidate.trigger_mode == "event" else 0.0, 2),
+            market_score=round(candidate.score if candidate.trigger_mode != "event" else candidate.score * 0.6, 2),
+            final_score=round(candidate.score, 2),
+            entry_range=PriceRange(candidate.last_price, candidate.last_price),
+            take_profit_range=PriceRange(candidate.last_price, candidate.last_price),
+            invalidation_level=round(candidate.support_20, 2),
+            invalidation_reason="预备池轻推送，仅供观察，不作为正式交易依据。",
+            risk_notes=["预备池轻推送", "正式执行前需结合真实行情与事件确认"],
+            source_refs=[],
+            created_at=now,
+            ttl=now + timedelta(days=10 if candidate.horizon == "position" else 5),
+            priority="suppressed",
+            dedup_key=f"prewatch-notify:{symbol}:{candidate.horizon}",
+            bias="long",
+            display_name=self._display_name_for(symbol),
+            action_label="加入观察",
+            confidence_label=confidence_label,
+            confidence_score=round(candidate.score, 2),
+            reason_to_watch=candidate.reason_to_watch,
+            trend_state=candidate.trend_state,
+            rsi_14=round(candidate.rsi_14, 1),
+            relative_volume=round(candidate.relative_volume, 2),
+            theme_tags=theme_tags,
+            market_data_complete=True,
+            promoted_from_prewatch=True,
+            prewatch_score=round(candidate.score, 2),
+            prewatch_setup_type=candidate.setup_type,
+            positioning_hint="当前先放入观察名单，不追价，等结构和催化进一步确认后再升级。",
+        )
+        return self._decorate_card_with_runtime_context(
+            base_card,
+            insight=self._synthetic_prewatch_insight(candidate, theme_tags=theme_tags),
+            macro_context=macro_context,
+            run_id=run_id,
+            lite_narration=True,
+        )
+
+    def _synthetic_prewatch_insight(self, candidate, *, theme_tags: list[str]) -> EventInsight:
+        event_type = candidate.trigger_event_type or "news"
+        return EventInsight(
+            event_id=f"prewatch-insight:{candidate.symbol.upper()}:{candidate.as_of.isoformat()}",
+            symbol=candidate.symbol.upper(),
+            event_type=event_type,
+            headline_summary=candidate.headline_summary,
+            bull_case="若后续催化继续兑现且价格结构转强，市场更容易把它从观察升级为可执行机会。",
+            bear_case="若后续缺少新增催化、量能衰减或结构转弱，观察价值会快速下降。",
+            importance=round(candidate.score if candidate.trigger_mode == "event" else 58.0, 2),
+            source_credibility=72.0,
+            novelty=70.0 if candidate.trigger_mode == "event" else 56.0,
+            sentiment=0.45,
+            theme_relevance=82.0 if theme_tags else 60.0,
+            llm_confidence=0.0,
+            risk_notes=["预备池阶段更重视后续确认，不宜把观察信号直接等同于正式执行信号。"],
+            source_refs=[],
+            raw_payload={"mode": "synthetic_prewatch"},
+            created_at=utcnow(),
+        )
 
     def _build_theme_supported_prewatch_candidates(
         self,
@@ -1324,7 +1735,7 @@ class SatelliteAgentService:
                 if boosted_score < self.settings.prewatch_event_min_score:
                     continue
                 trigger_symbols = list(seed["trigger_symbols"])[:3]
-                theme_name = display_theme_name(theme_key)
+                theme_name = display_theme_name(theme_key, self.theme_display_name_map)
                 event_type_label = EVENT_TYPE_DISPLAY_NAMES.get(seed["event_type"], "事件")
                 headline_summary = (
                     f"{normalized} 受到{theme_name}题材事件催化带动，适合先加入观察名单，"
@@ -1408,17 +1819,89 @@ class SatelliteAgentService:
         return ranked
 
     def _is_prewatch_alert_cooled_down(self, symbol: str) -> bool:
-        raw = self.store.get_state(self._prewatch_alert_state_key(symbol))
-        if not raw:
-            return False
-        try:
-            previous = datetime.fromisoformat(raw)
-        except ValueError:
+        previous = self._load_prewatch_alert_state(symbol).get("sent_at")
+        if previous is None:
             return False
         return (utcnow() - previous).total_seconds() < self.settings.prewatch_alert_cooldown_minutes * 60
 
+    def _should_skip_prewatch_alert(self, candidate) -> tuple[bool, str]:
+        if self._is_prewatch_alert_cooled_down(candidate.symbol):
+            return True, "cooldown_active"
+        state = self._load_prewatch_alert_state(candidate.symbol)
+        previous = state.get("sent_at")
+        if previous is None:
+            return False, ""
+        repeat_window_seconds = max(self.settings.prewatch_alert_repeat_window_minutes, 0) * 60
+        if repeat_window_seconds <= 0:
+            return False, ""
+        if (utcnow() - previous).total_seconds() >= repeat_window_seconds:
+            return False, ""
+        previous_signature = str(state.get("signature") or "").strip()
+        if not previous_signature:
+            return False, ""
+        current_signature = self._prewatch_alert_signature(candidate)
+        score_delta = abs(float(candidate.score) - float(state.get("score") or 0.0))
+        if (
+            current_signature == previous_signature
+            and score_delta < max(self.settings.prewatch_alert_repeat_min_score_delta, 0.0)
+        ):
+            return True, "content_unchanged_within_repeat_window"
+        return False, ""
+
     def _prewatch_alert_state_key(self, symbol: str) -> str:
         return f"prewatch_alert:{symbol.upper()}"
+
+    def _load_prewatch_alert_state(self, symbol: str) -> dict[str, Any]:
+        raw = self.store.get_state(self._prewatch_alert_state_key(symbol))
+        if not raw:
+            return {}
+        raw = raw.strip()
+        if not raw:
+            return {}
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            try:
+                sent_at = datetime.fromisoformat(raw)
+            except ValueError:
+                return {}
+            return {"sent_at": sent_at}
+        sent_at_raw = payload.get("sent_at")
+        try:
+            sent_at = datetime.fromisoformat(str(sent_at_raw))
+        except (TypeError, ValueError):
+            return {}
+        return {
+            "sent_at": sent_at,
+            "score": float(payload.get("score") or 0.0),
+            "signature": str(payload.get("signature") or ""),
+        }
+
+    def _prewatch_alert_signature(self, candidate) -> str:
+        payload = {
+            "symbol": candidate.symbol,
+            "horizon": candidate.horizon,
+            "setup_type": candidate.setup_type,
+            "headline_summary": candidate.headline_summary,
+            "action_hint": candidate.action_hint,
+            "reason_to_watch": candidate.reason_to_watch,
+        }
+        serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha1(serialized.encode("utf-8")).hexdigest()
+
+    def _record_prewatch_alert_sent(self, candidate) -> None:
+        self.store.set_state(
+            self._prewatch_alert_state_key(candidate.symbol),
+            json.dumps(
+                {
+                    "sent_at": utcnow().isoformat(),
+                    "score": round(float(candidate.score), 2),
+                    "signature": self._prewatch_alert_signature(candidate),
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+            ),
+        )
 
     def _prewatch_failure_state_key(self, symbol: str) -> str:
         return f"prewatch_failure:{symbol.upper()}"
@@ -1534,7 +2017,9 @@ class SatelliteAgentService:
                     )
                     if memory_bonus > 0:
                         bonus += memory_bonus
-                        notes.append(f"题材近期持续活跃：{display_theme_name(theme_key)}")
+                        notes.append(
+                            f"题材近期持续活跃：{display_theme_name(theme_key, self.theme_display_name_map)}"
+                        )
             if bonus <= 0:
                 themed_candidates.append(candidate)
                 continue
@@ -1676,7 +2161,11 @@ class SatelliteAgentService:
                 theme_memberships=self.theme_memberships,
                 confirmed_symbols=confirmed_symbols,
             )
-            base_theme_tags = theme_tags_for_symbol(card.symbol, self.symbol_theme_map)
+            base_theme_tags = theme_tags_for_symbol(
+                card.symbol,
+                self.symbol_theme_map,
+                self.theme_display_name_map,
+            )
             if not context["confirmed_peer_symbols"]:
                 adjusted_cards.append(
                     replace(

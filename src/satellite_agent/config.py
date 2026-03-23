@@ -11,12 +11,28 @@ DEFAULT_DB_PATH = Path("./data/satellite_agent/agent.db")
 LEGACY_DB_PATH = Path("./data/satellite_agent.db")
 DEFAULT_CONFIG_PATH = Path("./config/satellite_agent/agent.json")
 LEGACY_CONFIG_PATH = Path("./config/agent.json")
+DEFAULT_LOCAL_ENV_PATH = Path("./config/satellite_agent/.env.local")
+LEGACY_LOCAL_ENV_PATH = Path("./config/.env.local")
 
 
 def _resolve_default_path(preferred: Path, legacy: Path) -> Path:
     if preferred.exists() or not legacy.exists():
         return preferred
     return legacy
+
+
+def _load_local_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'").strip('"')
+        if key and key not in os.environ:
+            os.environ[key] = value
 
 
 @dataclass(frozen=True)
@@ -28,6 +44,24 @@ class HorizonSettings:
     rsi_floor: float
     rsi_ceiling: float
     atr_percent_ceiling: float
+
+
+@dataclass(frozen=True)
+class EventScoreWeights:
+    importance: float = 0.30
+    source_credibility: float = 0.25
+    novelty: float = 0.20
+    theme_relevance: float = 0.15
+    sentiment: float = 0.10
+
+    def to_record(self) -> dict[str, float]:
+        return {
+            "importance": self.importance,
+            "source_credibility": self.source_credibility,
+            "novelty": self.novelty,
+            "theme_relevance": self.theme_relevance,
+            "sentiment": self.sentiment,
+        }
 
 
 @dataclass(frozen=True)
@@ -49,6 +83,8 @@ class Settings:
     prewatch_alert_min_score: float = 78.0
     max_prewatch_alerts_per_run: int = 2
     prewatch_alert_cooldown_minutes: int = 240
+    prewatch_alert_repeat_window_minutes: int = 720
+    prewatch_alert_repeat_min_score_delta: float = 4.0
     prewatch_failure_cooldown_minutes: int = 90
     prewatch_concurrency: int = 8
     prewatch_theme_relaxed_margin: float = 6.0
@@ -69,6 +105,10 @@ class Settings:
     openai_base_url: str = "https://api.openai.com/v1/chat/completions"
     llm_max_requests_per_run: int = 6
     llm_max_requests_per_day: int = 2000
+    use_llm_event_extraction: bool = False
+    use_llm_narration: bool = True
+    use_llm_ranking_assist: bool = True
+    use_macro_risk_overlay: bool = True
     dry_run: bool = False
     sec_user_agent: str = "satellite-agent research contact@example.com"
     use_sec_filings_source: bool = False
@@ -78,6 +118,7 @@ class Settings:
     cross_source_dedup_hours: int = 12
     source_health_cache_seconds: int = 300
     event_score_threshold: float = 60.0
+    event_score_weights: EventScoreWeights = field(default_factory=EventScoreWeights)
     horizons: Dict[str, HorizonSettings] = field(
         default_factory=lambda: {
             "swing": HorizonSettings(
@@ -107,6 +148,8 @@ class Settings:
         config_path = Path(
             os.getenv("SATELLITE_CONFIG_PATH", str(_resolve_default_path(DEFAULT_CONFIG_PATH, LEGACY_CONFIG_PATH)))
         )
+        _load_local_env_file(config_path.parent / ".env.local")
+        _load_local_env_file(_resolve_default_path(DEFAULT_LOCAL_ENV_PATH, LEGACY_LOCAL_ENV_PATH))
         poll_seconds = int(os.getenv("SATELLITE_POLL_SECONDS", "60"))
         return cls(
             database_path=db_path,
@@ -145,6 +188,12 @@ class Settings:
             ),
             prewatch_alert_cooldown_minutes=int(
                 os.getenv("SATELLITE_PREWATCH_ALERT_COOLDOWN_MINUTES", "240")
+            ),
+            prewatch_alert_repeat_window_minutes=int(
+                os.getenv("SATELLITE_PREWATCH_ALERT_REPEAT_WINDOW_MINUTES", "720")
+            ),
+            prewatch_alert_repeat_min_score_delta=float(
+                os.getenv("SATELLITE_PREWATCH_ALERT_REPEAT_MIN_SCORE_DELTA", "4")
             ),
             prewatch_failure_cooldown_minutes=int(
                 os.getenv("SATELLITE_PREWATCH_FAILURE_COOLDOWN_MINUTES", "90")
@@ -198,6 +247,14 @@ class Settings:
             llm_max_requests_per_day=int(
                 os.getenv("SATELLITE_LLM_MAX_REQUESTS_PER_DAY", "2000")
             ),
+            use_llm_event_extraction=os.getenv("SATELLITE_USE_LLM_EVENT_EXTRACTION", "0").lower()
+            in {"1", "true", "yes"},
+            use_llm_narration=os.getenv("SATELLITE_USE_LLM_NARRATION", "1").lower()
+            in {"1", "true", "yes"},
+            use_llm_ranking_assist=os.getenv("SATELLITE_USE_LLM_RANKING_ASSIST", "1").lower()
+            in {"1", "true", "yes"},
+            use_macro_risk_overlay=os.getenv("SATELLITE_USE_MACRO_RISK_OVERLAY", "1").lower()
+            in {"1", "true", "yes"},
             dry_run=os.getenv("SATELLITE_DRY_RUN", "0").lower() in {"1", "true", "yes"},
             sec_user_agent=os.getenv(
                 "SATELLITE_SEC_USER_AGENT", "satellite-agent research contact@example.com"
@@ -235,11 +292,25 @@ class Settings:
         self,
         *,
         event_score_threshold: float | None = None,
+        event_score_weights: dict[str, Any] | None = None,
         horizons: Dict[str, Dict[str, Any]] | None = None,
     ) -> "Settings":
         next_settings = self
         if event_score_threshold is not None:
             next_settings = replace(next_settings, event_score_threshold=event_score_threshold)
+        if event_score_weights:
+            current_weights = next_settings.event_score_weights.to_record()
+            current_weights.update(
+                {
+                    key: float(value)
+                    for key, value in event_score_weights.items()
+                    if value is not None and key in current_weights
+                }
+            )
+            next_settings = replace(
+                next_settings,
+                event_score_weights=EventScoreWeights(**current_weights),
+            )
         for horizon_name, overrides in (horizons or {}).items():
             next_settings = next_settings.with_horizon_overrides(horizon_name, **overrides)
         return next_settings
@@ -276,6 +347,8 @@ class Settings:
             "prewatch_alert_min_score": self.prewatch_alert_min_score,
             "max_prewatch_alerts_per_run": self.max_prewatch_alerts_per_run,
             "prewatch_alert_cooldown_minutes": self.prewatch_alert_cooldown_minutes,
+            "prewatch_alert_repeat_window_minutes": self.prewatch_alert_repeat_window_minutes,
+            "prewatch_alert_repeat_min_score_delta": self.prewatch_alert_repeat_min_score_delta,
             "prewatch_failure_cooldown_minutes": self.prewatch_failure_cooldown_minutes,
             "prewatch_concurrency": self.prewatch_concurrency,
             "prewatch_theme_relaxed_margin": self.prewatch_theme_relaxed_margin,
@@ -296,6 +369,10 @@ class Settings:
             "openai_api_key_configured": bool(self.openai_api_key),
             "llm_max_requests_per_run": self.llm_max_requests_per_run,
             "llm_max_requests_per_day": self.llm_max_requests_per_day,
+            "use_llm_event_extraction": self.use_llm_event_extraction,
+            "use_llm_narration": self.use_llm_narration,
+            "use_llm_ranking_assist": self.use_llm_ranking_assist,
+            "use_macro_risk_overlay": self.use_macro_risk_overlay,
             "dry_run": self.dry_run,
             "sec_user_agent": self.sec_user_agent,
             "use_sec_filings_source": self.use_sec_filings_source,
@@ -305,5 +382,6 @@ class Settings:
             "cross_source_dedup_hours": self.cross_source_dedup_hours,
             "source_health_cache_seconds": self.source_health_cache_seconds,
             "event_score_threshold": self.event_score_threshold,
+            "event_score_weights": self.event_score_weights.to_record(),
             "horizons": horizons_record,
         }

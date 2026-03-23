@@ -20,6 +20,7 @@ from satellite_agent.reporting import (
     format_batch_comparison,
     format_batch_replay,
     format_error_summary,
+    format_llm_usage_report_payload,
     format_recent_performance_review,
     format_replay_evaluation,
     format_run_review,
@@ -42,17 +43,368 @@ from satellite_agent.main import main
 from satellite_agent.main import _build_historical_effect_review_data
 from satellite_agent.main import build_batch_replay_payload
 from satellite_agent.main import build_demo_flow_payload
+from satellite_agent.main import build_llm_usage_report_payload
 from satellite_agent.main import build_replay_evaluation_payload
 from satellite_agent.main import build_run_comparison_payload
 from satellite_agent.main import build_strategy_report_payload
+from satellite_agent.main import build_theme_reference_payload
+from satellite_agent.main import format_theme_reference_payload
 from satellite_agent.main import write_live_run_artifacts
 from satellite_agent.config import Settings
-from satellite_agent.models import SourceHealthCheck, utcnow
+from satellite_agent.models import Bar, SourceHealthCheck, utcnow
 from satellite_agent.runtime_config import AgentRuntimeConfig
 from satellite_agent.store import Store
+from satellite_agent.theme_linkage import build_symbol_theme_map_from_watchlist_payload, build_theme_snapshot_rows
 
 
 class ReportingTests(unittest.TestCase):
+    def test_format_llm_usage_report_payload_summarizes_components(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+
+            store.record_llm_usage(
+                run_id="run-1",
+                event_id="evt-1",
+                symbol="NVDA",
+                component="event_extraction",
+                model="Qwen/Test",
+                used_llm=True,
+                success=True,
+                prompt_tokens_estimate=120,
+                completion_tokens_estimate=36,
+                latency_ms=820,
+                reason="ok",
+                created_at=datetime(2026, 3, 22, 2, 0, tzinfo=timezone.utc).isoformat(),
+            )
+            store.record_llm_usage(
+                run_id="run-1",
+                event_id="evt-1",
+                symbol="NVDA",
+                component="narration",
+                model="Qwen/Test",
+                used_llm=True,
+                success=False,
+                prompt_tokens_estimate=80,
+                completion_tokens_estimate=0,
+                latency_ms=1500,
+                reason="api_error:TimeoutError",
+                created_at=datetime(2026, 3, 22, 2, 5, tzinfo=timezone.utc).isoformat(),
+            )
+            store.record_llm_usage(
+                run_id="run-2",
+                event_id="evt-2",
+                symbol="META",
+                component="narration",
+                model="Qwen/Test",
+                used_llm=False,
+                success=False,
+                prompt_tokens_estimate=0,
+                completion_tokens_estimate=0,
+                latency_ms=0,
+                reason="missing_api_key",
+                created_at=datetime(2026, 3, 22, 3, 0, tzinfo=timezone.utc).isoformat(),
+            )
+
+            payload = build_llm_usage_report_payload(store, days=7)
+            report_text = format_llm_usage_report_payload(payload)
+
+            self.assertIn("LLM 用量报告", report_text)
+            self.assertIn("真实调用数：2", report_text)
+            self.assertIn("失败回退数：1", report_text)
+            self.assertIn("跳过调用数：1", report_text)
+            self.assertIn("按环节：", report_text)
+            self.assertIn("事件抽取：调用 1", report_text)
+            self.assertIn("卡片叙事：调用 1", report_text)
+            self.assertIn("高频原因：", report_text)
+            self.assertIn("api_error:TimeoutError", report_text)
+
+    def test_symbol_theme_map_from_payload_ignores_disabled_symbols(self) -> None:
+        mapping = build_symbol_theme_map_from_watchlist_payload(
+            {
+                "stock_items": {
+                    "NVDA": {"symbol": "NVDA", "name": "NVIDIA"},
+                    "MSFT": {"symbol": "MSFT", "name": "Microsoft", "enabled": False},
+                },
+                "themes": [
+                    {
+                        "theme_id": "semiconductors_and_ai",
+                        "display_name": "半导体与AI",
+                        "symbols": ["NVDA", "MSFT"],
+                    }
+                ],
+            }
+        )
+        self.assertEqual(mapping, {"NVDA": ["semiconductors_and_ai"]})
+
+    def test_symbol_theme_map_from_payload_uses_default_theme_catalog_without_explicit_themes(self) -> None:
+        mapping = build_symbol_theme_map_from_watchlist_payload(
+            {
+                "stock_items": {
+                    "NVDA": {"symbol": "NVDA", "name": "NVIDIA"},
+                    "TSLA": {"symbol": "TSLA", "name": "Tesla"},
+                    "RKLB": {"symbol": "RKLB", "name": "Rocket Lab"},
+                },
+                "etf_items": {
+                    "SMH": {"symbol": "SMH", "name": "VanEck Semiconductor ETF"},
+                    "BBJP": {"symbol": "BBJP", "name": "JPMorgan BetaBuilders Japan ETF"},
+                },
+            }
+        )
+        self.assertEqual(
+            mapping,
+            {
+                "NVDA": ["semiconductors_and_ai"],
+                "TSLA": ["automotive_and_mobility"],
+                "RKLB": ["space_and_defense"],
+                "SMH": ["semiconductors_and_ai"],
+                "BBJP": ["non_us_markets"],
+            },
+        )
+
+    def test_report_watchlist_config_cli_outputs_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "agent.json"
+            db_path = Path(temp_dir) / "agent.db"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "watchlist": {
+                            "stocks": ["NVDA", "TSLA"],
+                            "stock_items": {
+                                "NVDA": {"symbol": "NVDA", "name": "NVIDIA"},
+                                "TSLA": {"symbol": "TSLA"},
+                            },
+                            "themes": [
+                                {
+                                    "theme_id": "semiconductors_and_ai",
+                                    "display_name": "半导体与AI",
+                                    "symbols": ["NVDA"],
+                                }
+                            ],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+            argv = [
+                "satellite_agent.main",
+                "report-watchlist-config",
+            ]
+            env = {
+                "SATELLITE_DATABASE_PATH": str(db_path),
+                "SATELLITE_CONFIG_PATH": str(config_path),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                with patch.object(sys, "argv", argv):
+                    with patch("sys.stdout", stdout):
+                        main()
+            output = stdout.getvalue()
+            self.assertIn("卫星观察池与题材映射诊断：", output)
+            self.assertIn("缺少展示名称的标的： TSLA", output)
+            self.assertIn("未挂题材的活跃标的： TSLA", output)
+
+    def test_theme_reference_payload_uses_single_primary_theme_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "agent.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "watchlist": {
+                            "stock_items": {
+                                "META": {"symbol": "META", "name": "Meta"},
+                                "TCEHY": {"symbol": "TCEHY", "name": "Tencent"},
+                                "NBIS": {"symbol": "NBIS", "name": "Nebius"},
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            runtime_config = AgentRuntimeConfig.load(config_path)
+            payload = build_theme_reference_payload(runtime_config, config_path=config_path)
+            symbol_map = {row["symbol"]: row for row in payload["symbol_theme_map"]}
+            self.assertEqual(symbol_map["NBIS"]["theme_name"], "数据中心基建与算力网络")
+            self.assertEqual(symbol_map["META"]["theme_name"], "AI软件与大模型应用")
+            self.assertEqual(symbol_map["TCEHY"]["theme_name"], "新兴市场互联网与电商")
+
+            text = format_theme_reference_payload(payload)
+            self.assertIn("卫星题材闭集参考：", text)
+            self.assertIn("META", text)
+            self.assertIn("AI软件与大模型应用", text)
+            self.assertIn("新兴市场互联网与电商", text)
+
+    def test_report_theme_reference_cli_outputs_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "agent.json"
+            db_path = Path(temp_dir) / "agent.db"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "watchlist": {
+                            "stock_items": {
+                                "META": {"symbol": "META", "name": "Meta"},
+                                "TCEHY": {"symbol": "TCEHY", "name": "Tencent"},
+                                "NBIS": {"symbol": "NBIS", "name": "Nebius"},
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+            argv = ["satellite_agent.main", "report-theme-reference"]
+            env = {
+                "SATELLITE_DATABASE_PATH": str(db_path),
+                "SATELLITE_CONFIG_PATH": str(config_path),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                with patch.object(sys, "argv", argv):
+                    with patch("sys.stdout", stdout):
+                        main()
+            output = stdout.getvalue()
+            self.assertIn("卫星题材闭集参考：", output)
+            self.assertIn("Meta（META）", output)
+            self.assertIn("Tencent（TCEHY）", output)
+            self.assertIn("AI软件与大模型应用", output)
+            self.assertIn("新兴市场互联网与电商", output)
+            self.assertIn("Nebius（NBIS）", output)
+            self.assertIn("数据中心基建与算力网络", output)
+
+    def test_write_theme_reference_cli_writes_reference_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "agent.json"
+            db_path = Path(temp_dir) / "agent.db"
+            output_path = Path(temp_dir) / "theme_reference.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "watchlist": {
+                            "stock_items": {
+                                "META": {"symbol": "META", "name": "Meta"},
+                                "NBIS": {"symbol": "NBIS", "name": "Nebius"},
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+            argv = [
+                "satellite_agent.main",
+                "write-theme-reference",
+                "--path",
+                str(output_path),
+            ]
+            env = {
+                "SATELLITE_DATABASE_PATH": str(db_path),
+                "SATELLITE_CONFIG_PATH": str(config_path),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                with patch.object(sys, "argv", argv):
+                    with patch("sys.stdout", stdout):
+                        main()
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+            symbol_map = {row["symbol"]: row for row in payload["symbol_theme_map"]}
+            self.assertEqual(symbol_map["META"]["theme_id"], "software_and_cloud")
+            self.assertEqual(symbol_map["NBIS"]["theme_id"], "data_center")
+
+    def test_write_batch_replay_template_cli_writes_template_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "agent.json"
+            db_path = Path(temp_dir) / "agent.db"
+            output_path = Path(temp_dir) / "batch_replay.local.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "watchlist": {
+                            "stock_items": {
+                                "NVDA": {"symbol": "NVDA", "name": "NVIDIA"},
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+            argv = [
+                "satellite_agent.main",
+                "write-batch-replay-template",
+                "--path",
+                str(output_path),
+            ]
+            env = {
+                "SATELLITE_DATABASE_PATH": str(db_path),
+                "SATELLITE_CONFIG_PATH": str(config_path),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                with patch.object(sys, "argv", argv):
+                    with patch("sys.stdout", stdout):
+                        main()
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertIn("_meta", payload)
+            self.assertEqual(payload["_meta"]["managed_by"], "satellite_agent")
+            self.assertGreaterEqual(len(payload.get("experiments", [])), 4)
+            experiment_names = {item.get("name") for item in payload.get("experiments", [])}
+            self.assertIn("rules_only", experiment_names)
+            self.assertIn("rules_plus_macro_overlay", experiment_names)
+
+    def test_report_llm_usage_cli_outputs_aggregated_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "agent.json"
+            db_path = Path(temp_dir) / "agent.db"
+            config_path.write_text(json.dumps({"watchlist": {"stock_items": {}}}), encoding="utf-8")
+            store = Store(db_path)
+            store.initialize()
+            store.record_llm_usage(
+                run_id="run-cli",
+                event_id="evt-cli",
+                symbol="NVDA",
+                component="narration",
+                model="Qwen/Test",
+                used_llm=True,
+                success=True,
+                prompt_tokens_estimate=64,
+                completion_tokens_estimate=18,
+                latency_ms=640,
+                reason="ok",
+                created_at=datetime.now(timezone.utc).isoformat(),
+            )
+
+            stdout = io.StringIO()
+            argv = ["satellite_agent.main", "report-llm-usage", "--days", "7"]
+            env = {
+                "SATELLITE_DB_PATH": str(db_path),
+                "SATELLITE_CONFIG_PATH": str(config_path),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                with patch.object(sys, "argv", argv):
+                    with patch("sys.stdout", stdout):
+                        main()
+            output = stdout.getvalue()
+            self.assertIn("LLM 用量报告", output)
+            self.assertIn("卡片叙事：调用 1", output)
+            self.assertIn("Qwen/Test", output)
+
+    def test_theme_snapshot_prefers_independent_theme_display_names(self) -> None:
+        rows = build_theme_snapshot_rows(
+            symbol_theme_map={"NVDA": ["semiconductors_and_ai"]},
+            theme_display_name_map={"semiconductors_and_ai": "芯片与AI主线"},
+            card_diagnostics=[
+                {
+                    "symbol": "NVDA",
+                    "priority": "high",
+                    "promoted_from_prewatch": False,
+                    "sent": True,
+                }
+            ],
+            prewatch_candidates=[],
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["theme_name"], "芯片与AI主线")
+
     def test_historical_effect_review_localizes_labels_and_counts_not_entered_rows(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "agent.db"
@@ -506,6 +858,17 @@ class ReportingTests(unittest.TestCase):
                     "settings": {
                         "dry_run": True,
                         "event_score_threshold": 60.0,
+                        "use_llm_event_extraction": True,
+                        "use_llm_narration": True,
+                        "use_llm_ranking_assist": True,
+                        "use_macro_risk_overlay": True,
+                        "event_score_weights": {
+                            "importance": 0.30,
+                            "source_credibility": 0.25,
+                            "novelty": 0.20,
+                            "theme_relevance": 0.15,
+                            "sentiment": 0.10,
+                        },
                         "cross_source_dedup_hours": 12,
                         "horizons": {
                             "swing": {"market_score_threshold": 55.0, "priority_threshold": 75.0},
@@ -859,17 +1222,17 @@ class ReportingTests(unittest.TestCase):
             self.assertNotIn("后验建议：", review_text)
             self.assertNotIn("策略倾向：", review_text)
             self.assertIn("升池确认：", review_text)
-            self.assertIn("NVDA / 交易周期：短线 / 财报事件 / 高优先级", review_text)
+            self.assertIn("NVDA / 交易周期：短线（1-7个交易日） / 财报事件 / 高优先级", review_text)
             self.assertIn("升池原因：此前处于突破预热预备状态（81.50 分），本轮事件达到确认条件。", review_text)
             self.assertIn("池位：预备池升级确认池（突破预热 / 预备池 81.50 分）", review_text)
             self.assertIn("仓位提示：可从观察仓提升到主交易仓位，优先等待盘中回踩确认。", review_text)
             self.assertIn("事件解读：财报事件：AI 需求改善带动 NVDA 进入确认阶段。", review_text)
-            self.assertIn("题材解读：题材：半导体与AI", review_text)
+            self.assertIn("题材解读：题材：AI芯片与半导体设备", review_text)
             self.assertIn("题材链路：", review_text)
-            self.assertIn("半导体与AI / 热度 8", review_text)
+            self.assertIn("AI芯片与半导体设备 / 热度 8", review_text)
             self.assertIn("确认池：NVDA", review_text)
             self.assertIn("预备池：NBIS", review_text)
-            self.assertIn("题材：半导体与AI", review_text)
+            self.assertIn("题材：AI芯片与半导体设备", review_text)
             self.assertIn("本轮状态 成功，健康判断为 阻塞；共处理 2 个事件，生成 4 张卡片，发送 1 条提醒，识别 1 个预备池候选，并发出 1 条预备池轻推。", review_text)
             self.assertEqual(replay_json["run"]["run_id"], "run-1")
             self.assertEqual(replay_json["run"]["run_name"], "baseline")
@@ -880,7 +1243,10 @@ class ReportingTests(unittest.TestCase):
             self.assertEqual(replay_json["decision_diagnostics"][0]["pool_outcome_context"]["take_profit_hits"], 1)
             self.assertIn("Run Comparison", comparison_text)
             self.assertIn("name=baseline", comparison_text)
-            self.assertIn("cfg=E60.0/S55.0-75.0/P58.0-80.0/D12", comparison_text)
+            self.assertIn(
+                "cfg=E60.0/S55.0-75.0/P58.0-80.0/D12/X1/N1/R1/M1/I0.3,C0.25,Nv0.2,T0.15,S0.1",
+                comparison_text,
+            )
             self.assertEqual(comparison_payload["runs"][0]["run_id"], "run-1")
 
     def test_annotate_run_cli_updates_metadata(self) -> None:
@@ -983,6 +1349,54 @@ class ReportingTests(unittest.TestCase):
             self.assertEqual(payload["run_id"], "run-performance")
             self.assertEqual(payload["window_days"], 14)
             self.assertIn("sample_audit", payload)
+
+    def test_write_llm_usage_report_cli_writes_report_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            db_path = temp_path / "agent.db"
+            workspace_dir = temp_path / "reports"
+            store = Store(db_path)
+            store.initialize()
+            store.record_llm_usage(
+                run_id="run-llm-1",
+                event_id="evt-1",
+                symbol="NVDA",
+                component="narration",
+                model="Qwen/Test",
+                used_llm=True,
+                success=True,
+                prompt_tokens_estimate=120,
+                completion_tokens_estimate=40,
+                latency_ms=980,
+                reason="ok",
+                created_at=datetime(2026, 3, 22, 2, 0, tzinfo=timezone.utc).isoformat(),
+            )
+            store.close()
+
+            stdout = io.StringIO()
+            argv = [
+                "satellite-agent",
+                "write-llm-usage-report",
+                "--workspace-dir",
+                str(workspace_dir),
+                "--days",
+                "7",
+            ]
+            with patch.dict(os.environ, {"SATELLITE_DB_PATH": str(db_path)}, clear=False):
+                with patch.object(sys, "argv", argv):
+                    with patch("sys.stdout", stdout):
+                        main()
+
+            output = stdout.getvalue()
+            report_path = workspace_dir / "llm_usage" / "report.md"
+            payload_path = workspace_dir / "llm_usage" / "report_payload.json"
+            self.assertIn("LLM 用量报告：", output)
+            self.assertIn(str(report_path), output)
+            self.assertTrue(report_path.exists())
+            self.assertTrue(payload_path.exists())
+            report_text = report_path.read_text(encoding="utf-8")
+            self.assertIn("LLM 用量报告", report_text)
+            self.assertIn("卡片叙事", report_text)
 
     def test_report_outcome_samples_cli_outputs_sample_rows(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1199,7 +1613,93 @@ class ReportingTests(unittest.TestCase):
             self.assertIn("AI样本复核记录：", audit_text)
             self.assertIn("状态：通过", audit_text)
 
-    def test_performance_review_uses_completed_manual_audit_to_clear_blocker(self) -> None:
+    def test_write_ai_review_alias_cli_writes_audit_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_dir = Path(temp_dir)
+            db_path = workspace_dir / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+            created_at = datetime(2026, 3, 14, 14, 0, tzinfo=timezone.utc).isoformat()
+            store.save_decision_record(
+                decision_id="decision-ai-review-alias-1",
+                run_id="run-ai-review-alias",
+                event_id="evt-ai-review-alias",
+                symbol="AAPL",
+                event_type="earnings",
+                pool="confirmation",
+                action="确认做多",
+                priority="高",
+                confidence="高",
+                event_score=82.0,
+                market_score=76.0,
+                theme_score=68.0,
+                final_score=79.0,
+                trigger_mode="event",
+                llm_used=False,
+                theme_ids=["ai"],
+                entry_plan={
+                    "entry_range": {"low": 100.0, "high": 102.0},
+                    "take_profit_range": {"low": 104.0, "high": 106.0},
+                },
+                invalidation={"invalidation_level": 95.0},
+                ttl="",
+                packet={"event_type": "earnings"},
+                created_at=created_at,
+            )
+            store.save_decision_outcome(
+                decision_id="decision-ai-review-alias-1",
+                entered=True,
+                entered_at=created_at,
+                entry_price=101.0,
+                exit_price=105.0,
+                realized_return=3.96,
+                holding_days=1,
+                close_reason="hit_take_profit",
+                hit_take_profit=True,
+                updated_at=created_at,
+            )
+            store.upsert_price_bars(
+                "AAPL",
+                "1d",
+                [
+                    Bar(
+                        timestamp=datetime(2026, 3, 14, 0, 0, tzinfo=timezone.utc),
+                        open=101.0,
+                        high=106.0,
+                        low=99.0,
+                        close=105.0,
+                        volume=110000,
+                        adjusted=True,
+                    )
+                ],
+            )
+            store.close()
+
+            stdout = io.StringIO()
+            argv = [
+                "satellite-agent",
+                "write-ai-review",
+                "--workspace-dir",
+                str(workspace_dir),
+                "--days",
+                "30",
+                "--limit",
+                "5",
+            ]
+            with patch.dict(os.environ, {"SATELLITE_DB_PATH": str(db_path)}, clear=False):
+                with patch.object(sys, "argv", argv):
+                    with patch("sys.stdout", stdout):
+                        main()
+
+            output = stdout.getvalue()
+            audit_path = workspace_dir / "historical_effect" / "ai_review.md"
+            audit_payload_path = workspace_dir / "historical_effect" / "ai_review_payload.json"
+            self.assertIn("AI样本复核：", output)
+            self.assertIn(str(audit_path), output)
+            self.assertTrue(audit_path.exists())
+            self.assertTrue(audit_payload_path.exists())
+
+    def test_performance_review_uses_completed_ai_review_to_clear_blocker(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             db_path = temp_path / "agent.db"
@@ -1272,7 +1772,7 @@ class ReportingTests(unittest.TestCase):
 
             review_window = _resolve_review_window(days=30)
             store.set_state(
-                "historical_effect_manual_audit",
+                "historical_effect_ai_review",
                 json.dumps(
                     {
                         "status": "通过",
@@ -1293,7 +1793,7 @@ class ReportingTests(unittest.TestCase):
 
             review = _build_historical_effect_review_data(store, days=30, limit=5)
 
-            self.assertEqual(review["manual_audit"]["status"], "通过")
+            self.assertEqual(review["ai_review"]["status"], "通过")
             self.assertIn("AI复核：通过", format_recent_performance_review(review))
             self.assertNotIn("AI样本复核尚未完成。", review["formal_readiness"]["blockers"])
 
@@ -1403,7 +1903,7 @@ class ReportingTests(unittest.TestCase):
 
             review_window = _resolve_review_window(days=30)
             store.set_state(
-                "historical_effect_manual_audit",
+                "historical_effect_ai_review",
                 json.dumps(
                     {
                         "status": "通过",
@@ -1546,14 +2046,14 @@ class ReportingTests(unittest.TestCase):
 
             self.assertEqual(len(payload["experiments"]), 2)
             self.assertEqual(payload["experiments"][0]["name"], "baseline")
-            self.assertIn("Batch Replay", text)
+            self.assertIn("策略赛马结果", text)
             self.assertIn("baseline", text)
-            self.assertIn("event_margin", text)
-            self.assertIn("Recommendation:", text)
-            self.assertIn("Summary:", text)
-            self.assertIn("Winner Snapshot:", text)
-            self.assertIn("Next Step:", text)
-            self.assertIn("Report:", text)
+            self.assertIn("事件阈值差", text)
+            self.assertIn("推荐策略：", text)
+            self.assertIn("摘要：", text)
+            self.assertIn("胜者快照：", text)
+            self.assertIn("下一步：", text)
+            self.assertIn("报告文件：", text)
             self.assertEqual(data["ranking"][0]["name"], "baseline")
             self.assertEqual(data["recommendation"]["name"], "baseline")
             self.assertIn("Top output:", data["summary"]["line_items"][0])
@@ -1586,7 +2086,7 @@ class ReportingTests(unittest.TestCase):
             self.assertTrue(manifest_path.exists())
             report_path = Path(cli_payload["report_path"])
             self.assertTrue(report_path.exists())
-            self.assertIn("Recommendation:", report_path.read_text(encoding="utf-8"))
+            self.assertIn("推荐策略：", report_path.read_text(encoding="utf-8"))
 
             report_stdout = io.StringIO()
             report_argv = [
@@ -1598,13 +2098,13 @@ class ReportingTests(unittest.TestCase):
             with patch.object(sys, "argv", report_argv):
                 with patch("sys.stdout", report_stdout):
                     main()
-            self.assertIn("Manifest:", report_stdout.getvalue())
+            self.assertIn("清单文件：", report_stdout.getvalue())
             self.assertIn("baseline", report_stdout.getvalue())
-            self.assertIn("Recommendation:", report_stdout.getvalue())
-            self.assertIn("Summary:", report_stdout.getvalue())
-            self.assertIn("Winner Snapshot:", report_stdout.getvalue())
-            self.assertIn("Next Step:", report_stdout.getvalue())
-            self.assertIn("Report:", report_stdout.getvalue())
+            self.assertIn("推荐策略：", report_stdout.getvalue())
+            self.assertIn("摘要：", report_stdout.getvalue())
+            self.assertIn("胜者快照：", report_stdout.getvalue())
+            self.assertIn("下一步：", report_stdout.getvalue())
+            self.assertIn("报告文件：", report_stdout.getvalue())
 
     def test_compare_batches_uses_manifest_payloads(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1616,14 +2116,14 @@ class ReportingTests(unittest.TestCase):
                 "manifest_path": str(left_manifest),
                 "recommendation": {
                     "name": "baseline",
-                    "config_summary": "E60.0/S55.0-75.0/P55.0-75.0/D12",
+                    "config_summary": "E60.0/S55.0-75.0/P55.0-75.0/D12/N1/R1/M1",
                 },
                 "experiments": [
                     {
                         "name": "baseline",
                         "status": "success",
                         "summary": {"alerts_sent": 1, "cards_generated": 2, "events_processed": 1},
-                        "config_summary": "E60.0/S55.0-75.0/P55.0-75.0/D12",
+                        "config_summary": "E60.0/S55.0-75.0/P55.0-75.0/D12/N1/R1/M1",
                         "closest_market_margin": 3.5,
                         "closest_priority_margin": -4.5,
                     }
@@ -1634,14 +2134,14 @@ class ReportingTests(unittest.TestCase):
                 "manifest_path": str(right_manifest),
                 "recommendation": {
                     "name": "baseline",
-                    "config_summary": "E65.0/S58.0-78.0/P60.0-80.0/D12",
+                    "config_summary": "E65.0/S58.0-78.0/P60.0-80.0/D12/N1/R1/M1",
                 },
                 "experiments": [
                     {
                         "name": "baseline",
                         "status": "success",
                         "summary": {"alerts_sent": 2, "cards_generated": 3, "events_processed": 1},
-                        "config_summary": "E65.0/S58.0-78.0/P60.0-80.0/D12",
+                        "config_summary": "E65.0/S58.0-78.0/P60.0-80.0/D12/N1/R1/M1",
                         "closest_market_margin": 0.9,
                         "closest_priority_margin": -7.4,
                     }
@@ -1729,7 +2229,7 @@ class ReportingTests(unittest.TestCase):
                         ],
                         "recommendation": {
                             "name": "tuned",
-                            "config_summary": "E65.0/S58.0-78.0/P60.0-80.0/D12",
+                            "config_summary": "E65.0/S58.0-78.0/P60.0-80.0/D12/N1/R1/M1",
                             "alerts_sent": 2,
                             "cards_generated": 2,
                             "events_processed": 1,
@@ -1780,7 +2280,7 @@ class ReportingTests(unittest.TestCase):
                     "name": "baseline",
                     "status": "success",
                     "summary": {"alerts_sent": 2, "cards_generated": 2, "events_processed": 1},
-                    "config_summary": "E60.0/S55.0-75.0/P55.0-75.0/D12",
+                    "config_summary": "E60.0/S55.0-75.0/P55.0-75.0/D12/N1/R1/M1",
                     "closest_market_margin": 3.9,
                     "closest_priority_margin": -4.4,
                     "failures": 0,
@@ -1789,7 +2289,7 @@ class ReportingTests(unittest.TestCase):
                     "name": "tuned",
                     "status": "success",
                     "summary": {"alerts_sent": 2, "cards_generated": 2, "events_processed": 1},
-                    "config_summary": "E65.0/S58.0-78.0/P60.0-80.0/D12",
+                    "config_summary": "E65.0/S58.0-78.0/P60.0-80.0/D12/N1/R1/M1",
                     "closest_market_margin": 0.9,
                     "closest_priority_margin": -7.4,
                     "failures": 0,
@@ -1806,7 +2306,7 @@ class ReportingTests(unittest.TestCase):
                 "name": "busy",
                 "status": "success",
                 "summary": {"alerts_sent": 3, "cards_generated": 3, "events_processed": 1},
-                "config_summary": "E60.0/S55.0-75.0/P55.0-75.0/D12",
+                "config_summary": "E60.0/S55.0-75.0/P55.0-75.0/D12/N1/R1/M1",
                 "closest_market_margin": 4.0,
                 "closest_priority_margin": -2.0,
                 "failures": 0,
@@ -1815,7 +2315,7 @@ class ReportingTests(unittest.TestCase):
                 "name": "strict",
                 "status": "success",
                 "summary": {"alerts_sent": 2, "cards_generated": 2, "events_processed": 1},
-                "config_summary": "E65.0/S58.0-78.0/P60.0-80.0/D12",
+                "config_summary": "E65.0/S58.0-78.0/P60.0-80.0/D12/N1/R1/M1",
                 "closest_market_margin": 0.2,
                 "closest_priority_margin": -6.0,
                 "failures": 0,
@@ -2142,19 +2642,23 @@ class ReportingTests(unittest.TestCase):
             review_path = workspace_dir / "daily_run_review.md"
             payload_path = workspace_dir / "daily_run_payload.json"
             performance_review_path = workspace_dir / "historical_effect" / "review.md"
+            llm_usage_report_path = workspace_dir / "llm_usage" / "report.md"
             self.assertIn("日常运行", output)
             self.assertIn("配置文件：", output)
             self.assertIn("健康判断：正常", output)
             self.assertIn("后验回补：最近 45 天，扫描", output)
+            self.assertIn("LLM 用量报告：", output)
             self.assertTrue(review_path.exists())
             self.assertTrue(payload_path.exists())
             self.assertTrue(performance_review_path.exists())
+            self.assertTrue(llm_usage_report_path.exists())
             review_text = review_path.read_text(encoding="utf-8")
             performance_text = performance_review_path.read_text(encoding="utf-8")
             self.assertIn("运行复盘", review_text)
             self.assertIn("健康判断为 正常", review_text)
             self.assertIn("结论摘要", review_text)
             self.assertIn("运行健康：", review_text)
+            self.assertIn("LLM 用量摘要：", review_text)
             self.assertNotIn("后验结果概览：", review_text)
             self.assertIn("机会概览", review_text)
             self.assertIn("卡片解读", review_text)
@@ -2190,7 +2694,7 @@ class ReportingTests(unittest.TestCase):
                     {
                         "batch_id": "batch-001",
                         "manifest_path": str(manifest_path),
-                        "recommendation": {"name": "tuned", "config_summary": "E65.0/S58.0-78.0/P60.0-80.0/D12"},
+                        "recommendation": {"name": "tuned", "config_summary": "E65.0/S58.0-78.0/P60.0-80.0/D12/N1/R1/M1"},
                         "experiments": [
                             {
                                 "name": "tuned",
@@ -2313,7 +2817,7 @@ class ReportingTests(unittest.TestCase):
                     {
                         "batch_id": "batch-002",
                         "manifest_path": str(manifest_path),
-                        "recommendation": {"name": "tuned", "config_summary": "E65.0/S58.0-78.0/P60.0-80.0/D12"},
+                        "recommendation": {"name": "tuned", "config_summary": "E65.0/S58.0-78.0/P60.0-80.0/D12/N1/R1/M1"},
                         "experiments": [
                             {
                                 "name": "tuned",
@@ -2402,6 +2906,63 @@ class ReportingTests(unittest.TestCase):
         self.assertIn("飞书测试提醒", output)
         self.assertIn("TSLA", output)
         self.assertIn("feishu", output)
+
+    def test_preview_alert_render_cli_prints_rendered_body(self) -> None:
+        stdout = io.StringIO()
+        argv = [
+            "satellite-agent",
+            "preview-alert-render",
+            "--symbol",
+            "NVDA",
+        ]
+        with patch.object(sys, "argv", argv):
+            with patch("sys.stdout", stdout):
+                with patch("satellite_agent.main.build_preview_alert_payload") as mocked_preview:
+                    mocked_preview.return_value = {
+                        "symbol": "NVDA",
+                        "watch_mode": False,
+                        "llm_enabled": True,
+                        "llm_used": True,
+                        "title": "NVIDIA（NVDA） | 确认做多 | 战略合作",
+                        "body": "资讯摘要：测试摘要\\n影响推理：测试推理",
+                        "delivery_view": {},
+                        "feishu_card": {},
+                    }
+                    main()
+
+        output = stdout.getvalue()
+        self.assertIn("本地预览卡片", output)
+        self.assertIn("LLM 实际参与：是", output)
+        self.assertIn("测试摘要", output)
+
+    def test_preview_alert_render_cli_supports_prewatch_light_mode(self) -> None:
+        stdout = io.StringIO()
+        argv = [
+            "satellite-agent",
+            "preview-alert-render",
+            "--symbol",
+            "NBIS",
+            "--prewatch-light",
+        ]
+        with patch.object(sys, "argv", argv):
+            with patch("sys.stdout", stdout):
+                with patch("satellite_agent.main.build_preview_alert_payload") as mocked_preview:
+                    mocked_preview.return_value = {
+                        "symbol": "NBIS",
+                        "watch_mode": False,
+                        "prewatch_light": True,
+                        "llm_enabled": True,
+                        "llm_used": True,
+                        "title": "[预备池] Nebius（NBIS） | 加入观察 | 战略合作",
+                        "body": "事实摘要：测试轻推摘要\n为什么现在先观察：测试轻推理由",
+                        "delivery_view": {},
+                        "feishu_card": {},
+                    }
+                    main()
+
+        output = stdout.getvalue()
+        self.assertIn("模式：预备池轻推送", output)
+        self.assertIn("测试轻推摘要", output)
 
     def test_run_once_writes_latest_live_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2613,6 +3174,9 @@ class ReportingTests(unittest.TestCase):
             historical_review_path = workspace_dir / "historical_effect" / "review.md"
             historical_review_path.parent.mkdir(parents=True, exist_ok=True)
             historical_review_path.write_text("existing review", encoding="utf-8")
+            llm_usage_report_path = workspace_dir / "llm_usage" / "report.md"
+            llm_usage_report_path.parent.mkdir(parents=True, exist_ok=True)
+            llm_usage_report_path.write_text("existing llm usage", encoding="utf-8")
             store = Store(db_path)
             store.initialize()
 
@@ -2637,10 +3201,13 @@ class ReportingTests(unittest.TestCase):
                                 review_filename="serve_review.md",
                                 payload_filename="serve_payload.json",
                                 historical_effect_min_interval_seconds=3600,
+                                llm_usage_min_interval_seconds=3600,
                             )
 
             self.assertFalse(payload["historical_effect_review_refreshed"])
             self.assertEqual(payload["historical_effect_review_path"], str(historical_review_path.resolve()))
+            self.assertFalse(payload["llm_usage_report_refreshed"])
+            self.assertEqual(payload["llm_usage_report_path"], str(llm_usage_report_path.resolve()))
             performance_review_mock.assert_not_called()
             store.close()
 

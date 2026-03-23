@@ -158,11 +158,13 @@ class Store:
             run_id TEXT NOT NULL,
             event_id TEXT NOT NULL,
             symbol TEXT NOT NULL,
+            component TEXT NOT NULL DEFAULT 'event_extraction',
             model TEXT NOT NULL,
             used_llm INTEGER NOT NULL,
             success INTEGER NOT NULL,
             prompt_tokens_estimate INTEGER NOT NULL DEFAULT 0,
             completion_tokens_estimate INTEGER NOT NULL DEFAULT 0,
+            latency_ms INTEGER NOT NULL DEFAULT 0,
             reason TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
@@ -655,6 +657,25 @@ class Store:
             """,
             (run_id,),
         )
+        return cursor.fetchall()
+
+    def load_alert_history_for_window(self, *, since: str, symbol: str = "") -> list[sqlite3.Row]:
+        query = """
+            SELECT
+                ah.*,
+                oc.card_json
+            FROM alert_history ah
+            LEFT JOIN opportunity_cards oc ON ah.card_id = oc.card_id
+            WHERE ah.notified_at >= ?
+        """
+        params: list[Any] = [since]
+        if symbol:
+            query += " AND ah.symbol = ?"
+            params.append(symbol.upper())
+        query += """
+            ORDER BY ah.notified_at ASC, ah.alert_id ASC
+        """
+        cursor = self.connection.execute(query, tuple(params))
         return cursor.fetchall()
 
     def load_source_health(self, run_id: str) -> list[sqlite3.Row]:
@@ -1317,29 +1338,33 @@ class Store:
         run_id: str,
         event_id: str,
         symbol: str,
+        component: str = "event_extraction",
         model: str,
         used_llm: bool,
         success: bool,
         prompt_tokens_estimate: int = 0,
         completion_tokens_estimate: int = 0,
+        latency_ms: int = 0,
         reason: str = "",
         created_at: str,
     ) -> None:
         self.connection.execute(
             """
             INSERT INTO llm_usage
-            (run_id, event_id, symbol, model, used_llm, success, prompt_tokens_estimate, completion_tokens_estimate, reason, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (run_id, event_id, symbol, component, model, used_llm, success, prompt_tokens_estimate, completion_tokens_estimate, latency_ms, reason, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
                 event_id,
                 symbol,
+                component,
                 model,
                 1 if used_llm else 0,
                 1 if success else 0,
                 int(prompt_tokens_estimate),
                 int(completion_tokens_estimate),
+                int(latency_ms),
                 reason,
                 created_at,
             ),
@@ -1357,6 +1382,126 @@ class Store:
         )
         row = cursor.fetchone()
         return int(row["usage_count"]) if row else 0
+
+    def aggregate_llm_usage(self, *, start_at: str, end_at: str) -> dict[str, list[sqlite3.Row]]:
+        summary_cursor = self.connection.execute(
+            """
+            SELECT
+                COUNT(*) AS total_records,
+                SUM(CASE WHEN used_llm = 1 THEN 1 ELSE 0 END) AS llm_calls,
+                SUM(CASE WHEN used_llm = 1 AND success = 1 THEN 1 ELSE 0 END) AS success_calls,
+                SUM(CASE WHEN used_llm = 1 AND success = 0 THEN 1 ELSE 0 END) AS failed_calls,
+                SUM(CASE WHEN used_llm = 0 THEN 1 ELSE 0 END) AS skipped_calls,
+                SUM(prompt_tokens_estimate) AS prompt_tokens,
+                SUM(completion_tokens_estimate) AS completion_tokens,
+                AVG(CASE WHEN latency_ms > 0 THEN latency_ms END) AS avg_latency_ms,
+                MAX(latency_ms) AS max_latency_ms
+            FROM llm_usage
+            WHERE created_at >= ? AND created_at < ?
+            """,
+            (start_at, end_at),
+        )
+        by_day_cursor = self.connection.execute(
+            """
+            SELECT
+                substr(created_at, 1, 10) AS usage_date,
+                COUNT(*) AS total_records,
+                SUM(CASE WHEN used_llm = 1 THEN 1 ELSE 0 END) AS llm_calls,
+                SUM(CASE WHEN used_llm = 1 AND success = 1 THEN 1 ELSE 0 END) AS success_calls,
+                SUM(CASE WHEN used_llm = 1 AND success = 0 THEN 1 ELSE 0 END) AS failed_calls,
+                SUM(CASE WHEN used_llm = 0 THEN 1 ELSE 0 END) AS skipped_calls,
+                SUM(prompt_tokens_estimate) AS prompt_tokens,
+                SUM(completion_tokens_estimate) AS completion_tokens,
+                AVG(CASE WHEN latency_ms > 0 THEN latency_ms END) AS avg_latency_ms
+            FROM llm_usage
+            WHERE created_at >= ? AND created_at < ?
+            GROUP BY usage_date
+            ORDER BY usage_date ASC
+            """,
+            (start_at, end_at),
+        )
+        by_component_cursor = self.connection.execute(
+            """
+            SELECT
+                component,
+                COUNT(*) AS total_records,
+                SUM(CASE WHEN used_llm = 1 THEN 1 ELSE 0 END) AS llm_calls,
+                SUM(CASE WHEN used_llm = 1 AND success = 1 THEN 1 ELSE 0 END) AS success_calls,
+                SUM(CASE WHEN used_llm = 1 AND success = 0 THEN 1 ELSE 0 END) AS failed_calls,
+                SUM(CASE WHEN used_llm = 0 THEN 1 ELSE 0 END) AS skipped_calls,
+                SUM(prompt_tokens_estimate) AS prompt_tokens,
+                SUM(completion_tokens_estimate) AS completion_tokens,
+                AVG(CASE WHEN latency_ms > 0 THEN latency_ms END) AS avg_latency_ms
+            FROM llm_usage
+            WHERE created_at >= ? AND created_at < ?
+            GROUP BY component
+            ORDER BY llm_calls DESC, component ASC
+            """,
+            (start_at, end_at),
+        )
+        by_model_cursor = self.connection.execute(
+            """
+            SELECT
+                model,
+                COUNT(*) AS total_records,
+                SUM(CASE WHEN used_llm = 1 THEN 1 ELSE 0 END) AS llm_calls,
+                SUM(CASE WHEN used_llm = 1 AND success = 1 THEN 1 ELSE 0 END) AS success_calls,
+                SUM(CASE WHEN used_llm = 1 AND success = 0 THEN 1 ELSE 0 END) AS failed_calls,
+                SUM(prompt_tokens_estimate) AS prompt_tokens,
+                SUM(completion_tokens_estimate) AS completion_tokens,
+                AVG(CASE WHEN latency_ms > 0 THEN latency_ms END) AS avg_latency_ms
+            FROM llm_usage
+            WHERE created_at >= ? AND created_at < ?
+            GROUP BY model
+            ORDER BY llm_calls DESC, model ASC
+            """,
+            (start_at, end_at),
+        )
+        top_reasons_cursor = self.connection.execute(
+            """
+            SELECT
+                component,
+                reason,
+                COUNT(*) AS occurrence_count
+            FROM llm_usage
+            WHERE created_at >= ? AND created_at < ?
+              AND reason <> ''
+            GROUP BY component, reason
+            ORDER BY occurrence_count DESC, component ASC, reason ASC
+            LIMIT 10
+            """,
+            (start_at, end_at),
+        )
+        recent_calls_cursor = self.connection.execute(
+            """
+            SELECT
+                run_id,
+                event_id,
+                symbol,
+                component,
+                model,
+                used_llm,
+                success,
+                prompt_tokens_estimate,
+                completion_tokens_estimate,
+                latency_ms,
+                reason,
+                created_at
+            FROM llm_usage
+            WHERE created_at >= ? AND created_at < ?
+            ORDER BY created_at DESC
+            LIMIT 20
+            """,
+            (start_at, end_at),
+        )
+        return {
+            "summary": summary_cursor.fetchall(),
+            "by_day": by_day_cursor.fetchall(),
+            "by_component": by_component_cursor.fetchall(),
+            "by_model": by_model_cursor.fetchall(),
+            "top_reasons": top_reasons_cursor.fetchall(),
+            "recent_calls": recent_calls_cursor.fetchall(),
+        }
 
     def save_decision_record(
         self,
@@ -1512,6 +1657,8 @@ class Store:
         self._ensure_table_column("decision_outcomes", "t_plus_30_return", "REAL")
         self._ensure_table_column("price_bars_5m", "adjusted", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_table_column("price_bars_1d", "adjusted", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_table_column("llm_usage", "component", "TEXT NOT NULL DEFAULT 'event_extraction'")
+        self._ensure_table_column("llm_usage", "latency_ms", "INTEGER NOT NULL DEFAULT 0")
         self._backfill_decision_record_event_types()
 
     def _ensure_indexes(self) -> None:

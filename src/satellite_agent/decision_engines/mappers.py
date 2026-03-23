@@ -11,7 +11,7 @@ CN_TZ = timezone(timedelta(hours=8))
 
 
 def _display_horizon(horizon: str) -> str:
-    return {"swing": "短线", "position": "波段"}.get(horizon, horizon)
+    return {"swing": "短线（1-7个交易日）", "position": "波段（2-6周）"}.get(horizon, horizon)
 
 
 def _display_priority(priority: str) -> str:
@@ -34,12 +34,38 @@ def _display_event_type(event_type: str) -> str:
 
 def _display_trend_state(value: str) -> str:
     return {
-        "bullish": "多头",
-        "bearish": "空头",
-        "neutral": "震荡",
-        "uptrend": "多头",
-        "downtrend": "空头",
+        "bullish": "多头（结构向上）",
+        "bearish": "空头（结构走弱）",
+        "neutral": "震荡（等待方向）",
+        "uptrend": "多头（结构向上）",
+        "downtrend": "空头（结构走弱）",
     }.get(value, value or "未识别")
+
+
+def _display_event_bias(value: str) -> str:
+    return {
+        "long": "偏利多",
+        "short": "偏利空",
+        "neutral": "中性",
+    }.get((value or "").strip().lower(), "中性")
+
+
+def _event_bias_explainer(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    if normalized == "long":
+        return "代表事件内容整体偏正面，更容易支持做多叙事"
+    if normalized == "short":
+        return "代表事件内容整体偏负面，做多需要更谨慎"
+    return "代表事件方向不够鲜明，需要更多市场信号来确认"
+
+
+def _trend_state_explainer(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    if normalized in {"bullish", "uptrend"}:
+        return "代表价格结构仍偏强，做多更容易得到市场确认"
+    if normalized in {"bearish", "downtrend"}:
+        return "代表价格结构仍偏弱，做多信号需要更谨慎"
+    return "代表当前没有清晰方向，更多依赖后续催化与量价确认"
 
 
 def _source_label(source_ref: str) -> str:
@@ -81,6 +107,89 @@ def _action_label(action_label: str, *, market_data_complete: bool, priority: st
     return {"high": "确认做多", "normal": "试探建仓", "suppressed": "加入观察"}.get(priority, "加入观察")
 
 
+def _score_label(score: float | None, *, high: float, medium: float, low: float, labels: tuple[str, str, str, str]) -> str:
+    if score is None:
+        return "未识别"
+    if score >= high:
+        return labels[0]
+    if score >= medium:
+        return labels[1]
+    if score >= low:
+        return labels[2]
+    return labels[3]
+
+
+def _rsi_label(rsi: float | None) -> str:
+    if rsi is None:
+        return "未识别"
+    if rsi >= 70:
+        return "过热"
+    if rsi >= 58:
+        return "偏强"
+    if rsi >= 43:
+        return "中性"
+    return "偏弱"
+
+
+def _relative_volume_label(value: float | None) -> str:
+    if value is None:
+        return "未识别"
+    if value >= 2.2:
+        return "异常放量"
+    if value >= 1.5:
+        return "明显放量"
+    if value >= 1.15:
+        return "温和放量"
+    return "未放量"
+
+
+def _relative_volume_explainer(value: float | None) -> str:
+    label = _relative_volume_label(value)
+    mapping = {
+        "异常放量": "说明资金参与非常集中，走势确认度高但波动也可能放大",
+        "明显放量": "说明有较明显的资金参与，信号可信度更高",
+        "温和放量": "说明有一定量能配合，但确认力度还不算很强",
+        "未放量": "说明资金跟随有限，走势延续性需要继续观察",
+        "未识别": "暂时无法判断量能是否真正配合这次波动",
+    }
+    return mapping.get(label, "")
+
+
+def _score_explainer(kind: str, label: str) -> str:
+    explanations = {
+        "event": {
+            "强催化": "代表消息本身强度高，容易驱动短中期交易情绪",
+            "中强催化": "代表消息有明显催化，但还需要市场配合确认",
+            "一般催化": "代表消息存在，但单独驱动行情的力度有限",
+            "弱催化": "代表消息偏弱，更像背景噪音而不是强触发点",
+            "未识别": "暂时无法稳定识别事件催化强度",
+        },
+        "market": {
+            "强确认": "代表趋势、位置和量价配合较完整",
+            "中等确认": "代表市场结构基本支持，但还不算特别扎实",
+            "边缘确认": "代表市场确认偏弱，动作上应更保守",
+            "未确认": "代表市场结构尚未支持直接执行",
+            "未识别": "暂时无法稳定识别市场确认程度",
+        },
+        "final": {
+            "高质量": "代表事件和市场同时较强，可优先关注",
+            "可执行": "代表条件基本成立，但仍需控制节奏",
+            "观察优先": "代表更适合先观察，不宜太激进",
+            "不足": "代表当前不足以支持明确动作",
+            "未识别": "暂时无法稳定识别综合质量",
+        },
+    }
+    return explanations.get(kind, {}).get(label, "")
+
+
+def _market_regime_display(value: str) -> str:
+    return {"risk_on": "风险偏好回升", "neutral": "中性", "risk_off": "风险偏好下降"}.get(value, value or "中性")
+
+
+def _risk_level_display(value: str) -> str:
+    return {"low": "低", "medium": "中", "high": "高"}.get(value, value or "未识别")
+
+
 def build_delivery_view_from_card(card: OpportunityCard) -> dict:
     return build_delivery_view_from_record(card.to_record())
 
@@ -101,6 +210,7 @@ def build_delivery_view_from_record(card: dict) -> dict:
         market_data_complete=market_data_complete,
         priority=priority,
     )
+    event_bias = str(card.get("bias") or "")
     event_line = f"{_display_event_type(str(card.get('event_type') or ''))}：{card.get('headline_summary') or ''}".strip("：")
     if market_data_complete:
         market_bits = []
@@ -151,8 +261,41 @@ def build_delivery_view_from_record(card: dict) -> dict:
         "event_reason_line": event_line,
         "market_reason_line": market_line,
         "theme_reason_line": theme_line,
+        "event_bias_display": _display_event_bias(event_bias),
+        "event_bias_raw": event_bias,
+        "event_bias_explainer": _event_bias_explainer(event_bias),
         "trend_state_display": _display_trend_state(trend_state),
         "trend_state_raw": trend_state,
+        "event_score_label": _score_label(card.get("event_score"), high=80.0, medium=68.0, low=55.0, labels=("强催化", "中强催化", "一般催化", "弱催化")),
+        "market_score_label": _score_label(card.get("market_score"), high=75.0, medium=62.0, low=50.0, labels=("强确认", "中等确认", "边缘确认", "未确认")),
+        "final_score_label": _score_label(card.get("final_score"), high=82.0, medium=72.0, low=60.0, labels=("高质量", "可执行", "观察优先", "不足")),
+        "rsi_label": _rsi_label(card.get("rsi_14")),
+        "relative_volume_label": _relative_volume_label(card.get("relative_volume")),
+        "relative_volume_explainer": _relative_volume_explainer(card.get("relative_volume")),
+        "trend_state_explainer": _trend_state_explainer(trend_state),
+        "event_score_explainer": _score_explainer(
+            "event",
+            _score_label(card.get("event_score"), high=80.0, medium=68.0, low=55.0, labels=("强催化", "中强催化", "一般催化", "弱催化")),
+        ),
+        "market_score_explainer": _score_explainer(
+            "market",
+            _score_label(card.get("market_score"), high=75.0, medium=62.0, low=50.0, labels=("强确认", "中等确认", "边缘确认", "未确认")),
+        ),
+        "final_score_explainer": _score_explainer(
+            "final",
+            _score_label(card.get("final_score"), high=82.0, medium=72.0, low=60.0, labels=("高质量", "可执行", "观察优先", "不足")),
+        ),
+        "chain_summary": str(card.get("chain_summary") or "首次出现"),
+        "llm_summary": str(card.get("llm_summary") or card.get("headline_summary") or ""),
+        "llm_impact_inference": str(card.get("llm_impact_inference") or ""),
+        "llm_reasoning": str(card.get("llm_reasoning") or ""),
+        "llm_uncertainty": str(card.get("llm_uncertainty") or ""),
+        "market_regime_display": _market_regime_display(str(card.get("market_regime") or "")),
+        "rate_risk_display": _risk_level_display(str(card.get("rate_risk") or "")),
+        "geopolitical_risk_display": _risk_level_display(str(card.get("geopolitical_risk") or "")),
+        "macro_penalty_applied": float(card.get("macro_penalty_applied") or 0.0),
+        "macro_action_before_overlay": str(card.get("macro_action_before_overlay") or ""),
+        "macro_overlay_note": str(card.get("macro_overlay_note") or ""),
         "valid_until_text": valid_until_text,
         "market_data_complete": market_data_complete,
     }

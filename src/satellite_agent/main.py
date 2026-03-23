@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -16,7 +17,7 @@ from .config import Settings
 from .archive import archive_decision_history
 from .entry_exit import EntryExitEngine
 from .event_normalizer import EventNormalizer
-from .llm import OpenAIExtractor
+from .llm import OpenAIExtractor, OpenAINarrator
 from .decision_engines.mappers import build_delivery_view_from_record
 from .market_data import (
     CachedMarketDataProvider,
@@ -32,6 +33,7 @@ from .reporting import (
     format_batch_index,
     format_batch_comparison,
     format_batch_replay,
+    format_llm_usage_report_payload,
     format_recent_performance_review,
     format_run_review,
     summarize_run_health,
@@ -46,6 +48,7 @@ from .reporting import (
     serialize_batch_index,
     serialize_batch_replay,
     serialize_error_summary,
+    serialize_llm_usage_report_payload,
     serialize_replay_evaluation,
     serialize_run_comparison,
     serialize_run_detail,
@@ -69,7 +72,7 @@ from .sources import (
     StaticSourceAdapter,
 )
 from .store import Store
-from .models import Bar, utcnow
+from .models import Bar, EventInsight, PrewatchCandidate, utcnow
 from .models import OpportunityCard, PriceRange
 from .theme_linkage import build_symbol_theme_map_from_watchlist_payload, theme_tags_for_symbol
 from .timefmt import BEIJING_TZ, format_beijing_minute
@@ -83,12 +86,15 @@ RECENT_PERFORMANCE_WINDOW_DAYS = 30
 OUTCOME_SAMPLE_AUDIT_LIMIT = 10
 DEFAULT_ARCHIVE_DB_PATH = Path("./data/satellite_agent/archive/decision_history.db")
 HISTORICAL_EFFECT_REVIEW_VERSION = "v1"
-MANUAL_OUTCOME_AUDIT_STATE_KEY = "historical_effect_manual_audit"
+AI_OUTCOME_REVIEW_STATE_KEY = "historical_effect_ai_review"
+LEGACY_MANUAL_OUTCOME_AUDIT_STATE_KEY = "historical_effect_manual_audit"
 HISTORICAL_EFFECT_BASELINE_STATE_KEY = "historical_effect_review_baseline"
 EXECUTABLE_DECISION_ACTIONS = ("试探建仓", "确认做多")
 OBSERVATION_DECISION_ACTION = "加入观察"
 US_MARKET_TZ = ZoneInfo("America/New_York")
 SERVE_HISTORICAL_EFFECT_REFRESH_SECONDS = 3600
+LLM_USAGE_REPORT_WINDOW_DAYS = 7
+SERVE_LLM_USAGE_REFRESH_SECONDS = 3600
 RUN_ONCE_WORKSPACE_DIR = "./data/satellite_agent/run_once"
 SERVE_WORKSPACE_DIR = "./data/satellite_agent/serve"
 DAILY_RUN_WORKSPACE_DIR = "./data/satellite_agent/daily_run"
@@ -96,6 +102,17 @@ BATCH_RUNS_DIR = "./data/satellite_agent/experiments/batch_runs"
 DEMO_FLOW_DIR = "./data/satellite_agent/experiments/demo_flow"
 SATELLITE_BATCH_REPLAY_TEMPLATE_PATH = "./config/satellite_agent/batch_replay.template.json"
 LEGACY_BATCH_REPLAY_TEMPLATE_PATH = "./config/batch_replay.template.json"
+SATELLITE_THEME_REFERENCE_PATH = "./config/satellite_agent/theme_reference.json"
+SATELLITE_FORMAL_WATCHLIST_EXCLUSIONS = {
+    "SPY",
+    "QQQ",
+    "QQQM",
+    "VOO",
+    "SCHD",
+    "TLT",
+    "GLD",
+    "BRK.B",
+}
 
 
 def _parse_local_date(value: str) -> date:
@@ -254,6 +271,313 @@ def _percentage(numerator: int, denominator: int) -> float | None:
     if denominator <= 0:
         return None
     return round((numerator / denominator) * 100.0, 2)
+
+
+def build_watchlist_config_review_payload(runtime_config: AgentRuntimeConfig, *, config_path: Path) -> dict[str, Any]:
+    watchlist = runtime_config.watchlist
+    symbol_theme_map = watchlist.symbol_theme_map()
+    theme_display_name_map = watchlist.theme_display_name_map()
+    display_name_map = watchlist.symbol_display_name_map()
+
+    active_stock_symbols = list(watchlist.stocks)
+    active_etf_symbols = list(watchlist.etfs)
+    active_symbols = active_stock_symbols + active_etf_symbols
+    active_symbol_set = set(active_symbols)
+
+    excluded_symbols = sorted(symbol for symbol in active_symbols if symbol in SATELLITE_FORMAL_WATCHLIST_EXCLUSIONS)
+    missing_display_names = sorted(symbol for symbol in active_symbols if not display_name_map.get(symbol))
+    unthemed_symbols = sorted(symbol for symbol in active_symbols if not symbol_theme_map.get(symbol))
+    disabled_symbols = sorted(
+        symbol
+        for symbol, item in {**watchlist.stock_items, **watchlist.etf_items}.items()
+        if not item.enabled
+    )
+    uses_legacy_groups = bool(watchlist.stock_groups or watchlist.etf_groups)
+    uses_explicit_themes = bool(watchlist.themes)
+
+    theme_rows: list[dict[str, Any]] = []
+    themes_without_active_members: list[dict[str, Any]] = []
+    themes_with_off_watchlist_members: list[dict[str, Any]] = []
+    for theme in watchlist.themes:
+        members = list(theme.symbols) + list(theme.etfs)
+        normalized_members = [str(symbol).strip().upper() for symbol in members if str(symbol).strip()]
+        active_members = [symbol for symbol in normalized_members if symbol in active_symbol_set]
+        off_watchlist_members = sorted(symbol for symbol in normalized_members if symbol not in active_symbol_set)
+        row = {
+            "theme_id": theme.theme_id,
+            "display_name": theme.display_name or theme_display_name_map.get(theme.theme_id, theme.theme_id),
+            "member_count": len(normalized_members),
+            "active_member_count": len(active_members),
+            "active_members": active_members,
+            "off_watchlist_members": off_watchlist_members,
+        }
+        theme_rows.append(row)
+        if not active_members:
+            themes_without_active_members.append(row)
+        if off_watchlist_members:
+            themes_with_off_watchlist_members.append(row)
+
+    symbol_rows: list[dict[str, Any]] = []
+    for symbol in active_symbols:
+        asset_type = "ETF" if symbol in watchlist.etfs else "股票"
+        theme_ids = symbol_theme_map.get(symbol, [])
+        theme_names = [
+            theme_display_name_map.get(theme_id, theme_id)
+            for theme_id in theme_ids
+        ]
+        issues: list[str] = []
+        if symbol in excluded_symbols:
+            issues.append("不建议保留在正式卫星观察池")
+        if symbol in missing_display_names:
+            issues.append("缺少展示名称")
+        if symbol in unthemed_symbols:
+            issues.append("未挂题材")
+        symbol_rows.append(
+            {
+                "symbol": symbol,
+                "display_name": display_name_map.get(symbol, ""),
+                "asset_type": asset_type,
+                "theme_ids": theme_ids,
+                "theme_names": theme_names,
+                "issues": issues,
+            }
+        )
+
+    suggestions: list[str] = []
+    if uses_legacy_groups:
+        suggestions.append("当前配置仍在使用 legacy groups，建议后续只维护 watchlist 项，逐步把 groups 从用户配置里淡出。")
+    if uses_explicit_themes:
+        suggestions.append("当前配置仍在显式维护 themes；如果你希望只维护 watchlist，可以后续把 themes 交给系统内置题材目录托管。")
+    if excluded_symbols:
+        suggestions.append(
+            "把不适合留在正式卫星观察池的宽基/宏观代理标的移出 watchlist，仅保留为内部环境代理。"
+        )
+    if missing_display_names:
+        suggestions.append("给缺少展示名称的标的补齐公司名或 ETF 名称，避免推送里只显示代码。")
+    if unthemed_symbols:
+        suggestions.append("给未挂题材的活跃标的补齐 themes 映射，避免题材链路和扩散提示失真。")
+    if themes_without_active_members:
+        suggestions.append("清理没有活跃成员的空题材，或确认这些题材是否还需要保留。")
+    if themes_with_off_watchlist_members:
+        suggestions.append("检查题材里挂到观察池外的成员，确认是配置遗留还是故意保留的扩展映射。")
+    if not suggestions:
+        suggestions.append("当前卫星观察池和题材映射没有发现明显结构性问题。")
+
+    return {
+        "config_path": str(config_path),
+        "active_stock_count": len(active_stock_symbols),
+        "active_etf_count": len(active_etf_symbols),
+        "active_symbol_count": len(active_symbols),
+        "active_symbols": active_symbols,
+        "excluded_symbols": excluded_symbols,
+        "missing_display_names": missing_display_names,
+        "unthemed_symbols": unthemed_symbols,
+        "disabled_symbols": disabled_symbols,
+        "uses_legacy_groups": uses_legacy_groups,
+        "uses_explicit_themes": uses_explicit_themes,
+        "themes_without_active_members": themes_without_active_members,
+        "themes_with_off_watchlist_members": themes_with_off_watchlist_members,
+        "theme_rows": theme_rows,
+        "symbol_rows": symbol_rows,
+        "suggestions": suggestions,
+    }
+
+
+def format_watchlist_config_review_payload(payload: dict[str, Any]) -> str:
+    lines = [
+        "卫星观察池与题材映射诊断：",
+        f"配置文件：{payload.get('config_path', '-')}",
+        (
+            "活跃观察池："
+            f" 股票 {payload.get('active_stock_count', 0)}"
+            f" / ETF {payload.get('active_etf_count', 0)}"
+            f" / 合计 {payload.get('active_symbol_count', 0)}"
+        ),
+    ]
+
+    suggestions = list(payload.get("suggestions") or [])
+    if suggestions:
+        lines.append("建议优先处理：")
+        for item in suggestions:
+            lines.append(f"- {item}")
+
+    lines.append(
+        "配置形态："
+        f" {'仍在使用 legacy groups' if payload.get('uses_legacy_groups') else '未使用 legacy groups'}"
+        f" / {'显式维护 themes' if payload.get('uses_explicit_themes') else '未显式维护 themes'}"
+    )
+
+    excluded_symbols = list(payload.get("excluded_symbols") or [])
+    lines.append(
+        "正式卫星池内不建议保留的标的："
+        + (" " + "、".join(excluded_symbols) if excluded_symbols else " 无")
+    )
+
+    missing_display_names = list(payload.get("missing_display_names") or [])
+    lines.append(
+        "缺少展示名称的标的："
+        + (" " + "、".join(missing_display_names) if missing_display_names else " 无")
+    )
+
+    unthemed_symbols = list(payload.get("unthemed_symbols") or [])
+    lines.append(
+        "未挂题材的活跃标的："
+        + (" " + "、".join(unthemed_symbols) if unthemed_symbols else " 无")
+    )
+
+    disabled_symbols = list(payload.get("disabled_symbols") or [])
+    lines.append(
+        "已禁用但仍保留在配置里的标的："
+        + (" " + "、".join(disabled_symbols) if disabled_symbols else " 无")
+    )
+
+    empty_theme_rows = list(payload.get("themes_without_active_members") or [])
+    lines.append("空题材：")
+    if empty_theme_rows:
+        for row in empty_theme_rows:
+            lines.append(f"- {row.get('display_name', row.get('theme_id', '-'))}（{row.get('theme_id', '-') }）")
+    else:
+        lines.append("- 无")
+
+    off_watchlist_rows = list(payload.get("themes_with_off_watchlist_members") or [])
+    lines.append("题材中挂到观察池外的成员：")
+    if off_watchlist_rows:
+        for row in off_watchlist_rows:
+            lines.append(
+                f"- {row.get('display_name', row.get('theme_id', '-'))}："
+                + "、".join(row.get("off_watchlist_members") or [])
+            )
+    else:
+        lines.append("- 无")
+
+    lines.append("当前活跃标的与题材：")
+    for row in payload.get("symbol_rows") or []:
+        display_name = str(row.get("display_name") or "").strip()
+        identity = f"{display_name}（{row.get('symbol', '-') }）" if display_name else str(row.get("symbol", "-"))
+        themes = "、".join(row.get("theme_names") or []) or "未挂题材"
+        issues = "；".join(row.get("issues") or []) or "无"
+        lines.append(f"- {identity} | {row.get('asset_type', '-')} | 题材：{themes} | 问题：{issues}")
+    return "\n".join(lines)
+
+
+def build_theme_reference_payload(runtime_config: AgentRuntimeConfig, *, config_path: Path) -> dict[str, Any]:
+    watchlist = runtime_config.watchlist
+    symbol_theme_map = watchlist.symbol_theme_map()
+    theme_display_name_map = watchlist.theme_display_name_map()
+    display_name_map = watchlist.symbol_display_name_map()
+
+    active_symbols = list(watchlist.stocks) + list(watchlist.etfs)
+    symbol_rows: list[dict[str, Any]] = []
+    for symbol in active_symbols:
+        theme_ids = symbol_theme_map.get(symbol, [])
+        primary_theme_id = theme_ids[0] if theme_ids else ""
+        symbol_rows.append(
+            {
+                "symbol": symbol,
+                "display_name": display_name_map.get(symbol, ""),
+                "asset_type": "ETF" if symbol in watchlist.etfs else "股票",
+                "theme_id": primary_theme_id,
+                "theme_name": theme_display_name_map.get(primary_theme_id, primary_theme_id) if primary_theme_id else "",
+            }
+        )
+
+    used_theme_ids = sorted({str(row.get("theme_id") or "").strip() for row in symbol_rows if str(row.get("theme_id") or "").strip()})
+    theme_catalog = [
+        {
+            "theme_id": theme_id,
+            "display_name": theme_display_name_map.get(theme_id, theme_id),
+        }
+        for theme_id in used_theme_ids
+    ]
+
+    return {
+        "_meta": {
+            "managed_by": "satellite_agent",
+            "editable": False,
+            "config_path": str(config_path),
+            "note": "这是系统托管的题材闭集与当前标的映射，仅供参考，不建议手工修改。",
+        },
+        "theme_catalog": theme_catalog,
+        "symbol_theme_map": symbol_rows,
+    }
+
+
+def build_llm_usage_report_payload(store: Store, *, days: int) -> dict[str, Any]:
+    end_at = utcnow()
+    start_at = end_at - timedelta(days=max(1, days))
+    rows = store.aggregate_llm_usage(
+        start_at=start_at.isoformat(),
+        end_at=end_at.isoformat(),
+    )
+    return serialize_llm_usage_report_payload(
+        start_at=start_at.isoformat(),
+        end_at=end_at.isoformat(),
+        rows=rows,
+    )
+
+
+def build_write_llm_usage_report_payload(
+    store: Store,
+    *,
+    workspace_dir: Path,
+    days: int,
+) -> dict[str, Any]:
+    workspace_dir = workspace_dir.resolve()
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    llm_usage_dir = workspace_dir / "llm_usage"
+    report_path = llm_usage_dir / "report.md"
+    payload_path = llm_usage_dir / "report_payload.json"
+    report_payload = build_llm_usage_report_payload(store, days=days)
+    report_text = format_llm_usage_report_payload(report_payload)
+    _write_report(report_path, report_text)
+    _write_json(payload_path, report_payload)
+    return {
+        "workspace_dir": str(workspace_dir),
+        "days": days,
+        "report_path": str(report_path),
+        "payload_path": str(payload_path),
+        "report": report_payload,
+    }
+
+
+def format_write_llm_usage_report_result(payload: dict[str, Any]) -> str:
+    report = payload.get("report") or {}
+    summary = report.get("summary") or {}
+    return "\n".join(
+        [
+            "LLM 用量报告：",
+            f"工作目录：{payload.get('workspace_dir', '-')}",
+            f"统计窗口：最近 {payload.get('days', '-')} 天",
+            f"真实调用数：{summary.get('actual_calls', 0)}",
+            f"失败回退数：{summary.get('fallback_calls', 0)}",
+            f"跳过调用数：{summary.get('skipped_calls', 0)}",
+            f"报告文件：{payload.get('report_path', '-')}",
+            f"结构化数据：{payload.get('payload_path', '-')}",
+        ]
+    )
+
+
+def format_theme_reference_payload(payload: dict[str, Any]) -> str:
+    meta = payload.get("_meta") or {}
+    lines = [
+        "卫星题材闭集参考：",
+        f"配置文件：{meta.get('config_path', '-')}",
+        f"说明：{meta.get('note', '-')}",
+        "题材闭集：",
+    ]
+    for row in payload.get("theme_catalog") or []:
+        lines.append(f"- {row.get('theme_id', '-')} = {row.get('display_name', '-')}")
+
+    lines.append("当前标的与题材映射：")
+    for row in payload.get("symbol_theme_map") or []:
+        display_name = str(row.get("display_name") or "").strip()
+        identity = f"{display_name}（{row.get('symbol', '-') }）" if display_name else str(row.get("symbol", "-"))
+        theme_id = str(row.get("theme_id") or "").strip() or "未归类"
+        theme_name = str(row.get("theme_name") or "").strip() or "未归类"
+        lines.append(
+            f"- {identity} | {row.get('asset_type', '-')} | theme_id={theme_id} | 主题：{theme_name}"
+        )
+    return "\n".join(lines)
 
 
 def _merge_decision_rows(
@@ -557,8 +881,8 @@ def _build_historical_effect_review_data(
         end_date=end_date,
     )
     sample_audit = _summarize_outcome_sample_audit(sample_audit_payload)
-    manual_audit = _load_manual_outcome_audit(store)
-    manual_audit_completed = _manual_audit_matches_review(manual_audit, window)
+    ai_review = _load_ai_outcome_review(store)
+    ai_review_completed = _ai_review_matches_review(ai_review, window)
     review_baseline = _load_review_baseline(store)
     baseline_frozen = _review_baseline_matches_version(review_baseline)
     draft_reasons = [
@@ -578,7 +902,7 @@ def _build_historical_effect_review_data(
     ]
     if not baseline_frozen:
         formal_blockers.append("复盘口径仍处于开发阶段，尚未冻结。")
-    if not manual_audit_completed:
+    if not ai_review_completed:
         formal_blockers.append("AI样本复核尚未完成。")
     if sample_audit["mismatched"] > 0:
         formal_blockers.append("程序样本抽检存在不一致结果。")
@@ -604,7 +928,7 @@ def _build_historical_effect_review_data(
         "adjusted_price_protection_ready": adjusted_price_protection_ready,
         "adjusted_price_status": adjusted_price_status,
         "sample_audit": sample_audit,
-        "manual_audit": manual_audit if manual_audit_completed else {},
+        "ai_review": ai_review if ai_review_completed else {},
         "review_baseline": review_baseline if baseline_frozen else {},
         "formal_readiness": {
             "ready": formal_ready,
@@ -1012,8 +1336,10 @@ def _summarize_outcome_sample_audit(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _load_manual_outcome_audit(store: Store) -> dict[str, Any]:
-    raw = store.get_state(MANUAL_OUTCOME_AUDIT_STATE_KEY)
+def _load_ai_outcome_review(store: Store) -> dict[str, Any]:
+    raw = store.get_state(AI_OUTCOME_REVIEW_STATE_KEY)
+    if not raw:
+        raw = store.get_state(LEGACY_MANUAL_OUTCOME_AUDIT_STATE_KEY)
     if not raw:
         return {}
     try:
@@ -1023,14 +1349,14 @@ def _load_manual_outcome_audit(store: Store) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _manual_audit_matches_review(manual_audit: dict[str, Any], review_window: dict[str, Any]) -> bool:
-    if not manual_audit:
+def _ai_review_matches_review(ai_review: dict[str, Any], review_window: dict[str, Any]) -> bool:
+    if not ai_review:
         return False
-    if str(manual_audit.get("review_version") or "") != HISTORICAL_EFFECT_REVIEW_VERSION:
+    if str(ai_review.get("review_version") or "") != HISTORICAL_EFFECT_REVIEW_VERSION:
         return False
-    if str(manual_audit.get("status") or "") != "通过":
+    if str(ai_review.get("status") or "") != "通过":
         return False
-    audit_window = manual_audit.get("review_window") or {}
+    audit_window = ai_review.get("review_window") or {}
     return (
         str(audit_window.get("start_date") or "") == str(review_window.get("start_date") or "")
         and str(audit_window.get("end_date") or "") == str(review_window.get("end_date") or "")
@@ -1114,7 +1440,7 @@ def format_outcome_sample_payload(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def build_manual_outcome_audit_payload(
+def build_ai_outcome_review_payload(
     store: Store,
     *,
     days: int,
@@ -1152,7 +1478,7 @@ def build_manual_outcome_audit_payload(
     }
 
 
-def format_manual_outcome_audit_payload(payload: dict[str, Any]) -> str:
+def format_ai_outcome_review_payload(payload: dict[str, Any]) -> str:
     window = payload.get("review_window") or {}
     lines = [
         "AI样本复核记录：",
@@ -1375,6 +1701,36 @@ def _add_experiment_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Override position high-priority threshold",
     )
+    parser.add_argument(
+        "--event-weight-importance",
+        type=float,
+        default=None,
+        help="Override event score weight for importance",
+    )
+    parser.add_argument(
+        "--event-weight-source-credibility",
+        type=float,
+        default=None,
+        help="Override event score weight for source credibility",
+    )
+    parser.add_argument(
+        "--event-weight-novelty",
+        type=float,
+        default=None,
+        help="Override event score weight for novelty",
+    )
+    parser.add_argument(
+        "--event-weight-theme-relevance",
+        type=float,
+        default=None,
+        help="Override event score weight for theme relevance",
+    )
+    parser.add_argument(
+        "--event-weight-sentiment",
+        type=float,
+        default=None,
+        help="Override event score weight for sentiment strength",
+    )
 
 
 def _apply_cli_experiment_overrides(settings: Settings, args: argparse.Namespace) -> Settings:
@@ -1390,13 +1746,21 @@ def _apply_cli_experiment_overrides(settings: Settings, args: argparse.Namespace
     }
     return settings.with_strategy_overrides(
         event_score_threshold=getattr(args, "event_score_threshold", None),
+        event_score_weights={
+            "importance": getattr(args, "event_weight_importance", None),
+            "source_credibility": getattr(args, "event_weight_source_credibility", None),
+            "novelty": getattr(args, "event_weight_novelty", None),
+            "theme_relevance": getattr(args, "event_weight_theme_relevance", None),
+            "sentiment": getattr(args, "event_weight_sentiment", None),
+        },
         horizons=horizon_overrides,
     )
 
 
 def _apply_override_mapping(settings: Settings, overrides: dict) -> Settings:
-    return settings.with_strategy_overrides(
+    next_settings = settings.with_strategy_overrides(
         event_score_threshold=overrides.get("event_score_threshold"),
+        event_score_weights=overrides.get("event_score_weights"),
         horizons={
             "swing": {
                 "market_score_threshold": overrides.get("swing_market_score_threshold"),
@@ -1408,6 +1772,14 @@ def _apply_override_mapping(settings: Settings, overrides: dict) -> Settings:
             },
         },
     )
+    toggle_overrides = {
+        "use_llm_event_extraction": overrides.get("use_llm_event_extraction"),
+        "use_llm_narration": overrides.get("use_llm_narration"),
+        "use_llm_ranking_assist": overrides.get("use_llm_ranking_assist"),
+        "use_macro_risk_overlay": overrides.get("use_macro_risk_overlay"),
+    }
+    toggle_overrides = {key: value for key, value in toggle_overrides.items() if value is not None}
+    return next_settings.with_overrides(**toggle_overrides) if toggle_overrides else next_settings
 
 
 def _resolve_replay_path(spec_path: Path, replay_path: str) -> str:
@@ -2165,6 +2537,21 @@ def build_batch_replay_payload(
             event_types = strategy_report.get("event_type_performance", [])
             summary = run.get("summary", {})
             card_diagnostics = payload.get("card_diagnostics", [])
+            experiment_store = Store(db_path)
+            experiment_store.initialize()
+            historical_effect = _build_historical_effect_review_data(
+                experiment_store,
+                days=days,
+                limit=limit,
+            )
+            experiment_store.close()
+            overview = historical_effect.get("overview", {})
+            execution_quality = historical_effect.get("execution_quality", {})
+            auxiliary_observation = historical_effect.get("auxiliary_observation", [])
+            t7_metric = next((row for row in auxiliary_observation if row.get("field") == "t_plus_7_return"), {})
+            t14_metric = next((row for row in auxiliary_observation if row.get("field") == "t_plus_14_return"), {})
+            t30_metric = next((row for row in auxiliary_observation if row.get("field") == "t_plus_30_return"), {})
+            max_drawdown_metric = next((row for row in auxiliary_observation if row.get("field") == "max_drawdown"), {})
             failures = (
                 summary.get("extraction_failures", 0)
                 + summary.get("market_data_failures", 0)
@@ -2187,6 +2574,21 @@ def build_batch_replay_payload(
                     "card_diagnostics": card_diagnostics,
                     "closest_market_margin": round(min(market_margins), 2) if market_margins else None,
                     "closest_priority_margin": round(min(priority_margins), 2) if priority_margins else None,
+                    "historical_effect": historical_effect,
+                    "metrics": {
+                        "decision_count": int(overview.get("decision_count", 0) or 0),
+                        "entered_count": int(overview.get("entered_count", 0) or 0),
+                        "take_profit_exit_count": int(overview.get("take_profit_exit_count", 0) or 0),
+                        "invalidation_exit_count": int(overview.get("invalidation_exit_count", 0) or 0),
+                        "avg_realized_return": overview.get("avg_realized_return"),
+                        "win_rate": overview.get("win_rate"),
+                        "profit_loss_ratio": overview.get("profit_loss_ratio"),
+                        "avg_t_plus_7_return": t7_metric.get("avg_value"),
+                        "avg_t_plus_14_return": t14_metric.get("avg_value"),
+                        "avg_t_plus_30_return": t30_metric.get("avg_value"),
+                        "avg_max_drawdown": max_drawdown_metric.get("avg_value"),
+                        "completed_outcome_count": int(execution_quality.get("completed_outcome_count", 0) or 0),
+                    },
                     "failures": failures,
                     "evaluation": payload,
                 }
@@ -2297,6 +2699,34 @@ def _preferred_batch_replay_template_path() -> str:
     return str(legacy)
 
 
+def _load_batch_replay_template_payload() -> dict[str, Any]:
+    template_path = Path(_preferred_batch_replay_template_path()).resolve()
+    with template_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    payload["_meta"] = {
+        "managed_by": "satellite_agent",
+        "editable": True,
+        "template_path": str(template_path),
+        "note": "这是策略赛马模板。你可以在副本里调整实验名称、阈值和开关，再用于 batch-replay。",
+    }
+    return payload
+
+
+def _relativize_replay_path_for_output(payload: dict[str, Any], output_path: Path) -> dict[str, Any]:
+    replay_path = payload.get("replay_path")
+    template_path = payload.get("_meta", {}).get("template_path")
+    if not replay_path or not template_path:
+        return payload
+    resolved = _resolve_replay_path(Path(template_path), str(replay_path))
+    try:
+        relative = os.path.relpath(resolved, start=str(output_path.parent.resolve()))
+    except ValueError:
+        relative = resolved
+    next_payload = dict(payload)
+    next_payload["replay_path"] = relative
+    return next_payload
+
+
 def _extract_recommended_experiment(payload: dict) -> dict:
     recommendation = payload.get("recommendation") or {}
     experiment_name = recommendation.get("name")
@@ -2311,6 +2741,12 @@ def _extract_recommended_experiment(payload: dict) -> dict:
 def _strategy_field_map() -> list[tuple[str, str]]:
     return [
         ("event_score_threshold", "全局事件阈值"),
+        ("use_llm_event_extraction", "LLM事件抽取"),
+        ("event_score_weights.importance", "事件分权重-重要性"),
+        ("event_score_weights.source_credibility", "事件分权重-来源可信度"),
+        ("event_score_weights.novelty", "事件分权重-新颖度"),
+        ("event_score_weights.theme_relevance", "事件分权重-题材相关度"),
+        ("event_score_weights.sentiment", "事件分权重-事件情绪"),
         ("swing.ttl_days", "swing 持有有效期"),
         ("swing.market_score_threshold", "swing 市场阈值"),
         ("swing.priority_threshold", "swing 高优先级阈值"),
@@ -2332,8 +2768,15 @@ def _extract_strategy_fields(payload: dict | None) -> dict[str, object]:
     horizons = strategy.get("horizons", {})
     swing = horizons.get("swing", {})
     position = horizons.get("position", {})
+    event_score_weights = strategy.get("event_score_weights", {})
     return {
         "event_score_threshold": strategy.get("event_score_threshold"),
+        "use_llm_event_extraction": strategy.get("use_llm_event_extraction"),
+        "event_score_weights.importance": event_score_weights.get("importance"),
+        "event_score_weights.source_credibility": event_score_weights.get("source_credibility"),
+        "event_score_weights.novelty": event_score_weights.get("novelty"),
+        "event_score_weights.theme_relevance": event_score_weights.get("theme_relevance"),
+        "event_score_weights.sentiment": event_score_weights.get("sentiment"),
         "swing.ttl_days": swing.get("ttl_days"),
         "swing.market_score_threshold": swing.get("market_score_threshold"),
         "swing.priority_threshold": swing.get("priority_threshold"),
@@ -2526,6 +2969,7 @@ def build_daily_run_payload(
             event_type_context=event_type_context,
             pool_context=pool_context,
         )
+        llm_usage_report = build_llm_usage_report_payload(service.store, days=LLM_USAGE_REPORT_WINDOW_DAYS)
 
         review_path = workspace_dir / "daily_run_review.md"
         payload_path = workspace_dir / "daily_run_payload.json"
@@ -2535,6 +2979,7 @@ def build_daily_run_payload(
             source_health,
             card_diagnostics,
             decision_diagnostics,
+            llm_usage_report,
         )
         health_summary = summarize_run_health(
             run_detail,
@@ -2549,6 +2994,7 @@ def build_daily_run_payload(
             "source_health": source_health,
             "card_diagnostics": card_diagnostics,
             "decision_diagnostics": decision_diagnostics,
+            "llm_usage_report": llm_usage_report,
             "health_summary": health_summary,
             "outcome_backfill": outcome_backfill,
         }
@@ -2560,6 +3006,11 @@ def build_daily_run_payload(
             run_id=run_id,
             days=RECENT_PERFORMANCE_WINDOW_DAYS,
             limit=limit,
+        )
+        llm_usage_payload = build_write_llm_usage_report_payload(
+            service.store,
+            workspace_dir=workspace_dir,
+            days=LLM_USAGE_REPORT_WINDOW_DAYS,
         )
 
         top_event = (
@@ -2583,6 +3034,7 @@ def build_daily_run_payload(
             "outcome_backfill": outcome_backfill,
             "review_path": str(review_path),
             "historical_effect_review_path": historical_effect_payload.get("performance_review_path", ""),
+            "llm_usage_report_path": llm_usage_payload.get("report_path", ""),
             "payload_path": str(payload_path),
         }
     finally:
@@ -2612,6 +3064,7 @@ def format_daily_run(payload: dict) -> str:
             ),
         f"运行过程复盘：{payload.get('review_path', '-')}",
         f"历史效果复盘：{payload.get('historical_effect_review_path', '-')}",
+        f"LLM 用量报告：{payload.get('llm_usage_report_path', '-')}",
         f"结构化数据：{payload.get('payload_path', '-')}",
     ]
     if payload.get("replay_path"):
@@ -2746,6 +3199,16 @@ def _should_refresh_historical_effect_review(*, workspace_dir: Path, min_interva
     return (utcnow() - modified_at).total_seconds() >= float(min_interval_seconds)
 
 
+def _should_refresh_llm_usage_report(*, workspace_dir: Path, min_interval_seconds: int) -> bool:
+    if min_interval_seconds <= 0:
+        return True
+    report_path = workspace_dir / "llm_usage" / "report.md"
+    if not report_path.exists():
+        return True
+    modified_at = datetime.fromtimestamp(report_path.stat().st_mtime, tz=timezone.utc)
+    return (utcnow() - modified_at).total_seconds() >= float(min_interval_seconds)
+
+
 def write_live_run_artifacts(
     store: Store,
     *,
@@ -2755,6 +3218,7 @@ def write_live_run_artifacts(
     review_filename: str,
     payload_filename: str,
     historical_effect_min_interval_seconds: int = 0,
+    llm_usage_min_interval_seconds: int = 0,
 ) -> dict:
     workspace_dir = workspace_dir.resolve()
     workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -2768,6 +3232,7 @@ def write_live_run_artifacts(
         payload["source_health"],
         payload["card_diagnostics"],
         payload.get("decision_diagnostics", []),
+        build_llm_usage_report_payload(store, days=LLM_USAGE_REPORT_WINDOW_DAYS),
     )
     _write_report(review_path, review_text)
     _write_json(payload_path, payload)
@@ -2785,12 +3250,26 @@ def write_live_run_artifacts(
             limit=limit,
         )
         historical_effect_review_path = historical_effect_payload.get("performance_review_path", historical_effect_review_path)
+    should_refresh_llm_usage = _should_refresh_llm_usage_report(
+        workspace_dir=workspace_dir,
+        min_interval_seconds=llm_usage_min_interval_seconds,
+    )
+    llm_usage_report_path = str((workspace_dir / "llm_usage" / "report.md").resolve())
+    if should_refresh_llm_usage:
+        llm_usage_payload = build_write_llm_usage_report_payload(
+            store,
+            workspace_dir=workspace_dir,
+            days=LLM_USAGE_REPORT_WINDOW_DAYS,
+        )
+        llm_usage_report_path = llm_usage_payload.get("report_path", llm_usage_report_path)
     return {
         "run_id": run_id,
         "outcome_backfill": outcome_backfill,
         "review_path": str(review_path),
         "historical_effect_review_path": historical_effect_review_path,
         "historical_effect_review_refreshed": should_refresh_historical_effect,
+        "llm_usage_report_path": llm_usage_report_path,
+        "llm_usage_report_refreshed": should_refresh_llm_usage,
         "payload_path": str(payload_path),
     }
 
@@ -2799,6 +3278,9 @@ def format_live_run_artifacts(payload: dict) -> str:
     historical_effect_line = f"历史效果复盘：{payload.get('historical_effect_review_path', '-')}"
     if not payload.get("historical_effect_review_refreshed", True):
         historical_effect_line += "（本轮沿用上次刷新）"
+    llm_usage_line = f"LLM 用量报告：{payload.get('llm_usage_report_path', '-')}"
+    if not payload.get("llm_usage_report_refreshed", True):
+        llm_usage_line += "（本轮沿用上次刷新）"
     return "\n".join(
         [
             "实时运行结果已落盘：",
@@ -2813,6 +3295,7 @@ def format_live_run_artifacts(payload: dict) -> str:
             ),
             f"运行过程复盘：{payload.get('review_path', '-')}",
             historical_effect_line,
+            llm_usage_line,
             f"结构化数据：{payload.get('payload_path', '-')}",
         ]
     )
@@ -2931,6 +3414,240 @@ def _build_test_notification_card(symbol: str = "NVDA") -> OpportunityCard:
     )
 
 
+def _preview_display_name(runtime_config: AgentRuntimeConfig, symbol: str) -> str:
+    name = runtime_config.watchlist.display_name_for(symbol)
+    return name or symbol.upper()
+
+
+def _preview_theme_tags(runtime_config: AgentRuntimeConfig, symbol: str) -> list[str]:
+    theme_map = runtime_config.watchlist.symbol_theme_map()
+    theme_display_map = runtime_config.watchlist.theme_display_name_map()
+    return [
+        theme_display_map.get(theme_id, theme_id)
+        for theme_id in theme_map.get(symbol.upper(), [])
+    ]
+
+
+def _build_preview_notification_card(
+    runtime_config: AgentRuntimeConfig,
+    *,
+    symbol: str = "NVDA",
+    watch_mode: bool = False,
+) -> OpportunityCard:
+    now = utcnow()
+    normalized_symbol = symbol.upper()
+    display_name = _preview_display_name(runtime_config, normalized_symbol)
+    theme_tags = _preview_theme_tags(runtime_config, normalized_symbol)
+    if watch_mode:
+        return OpportunityCard(
+            card_id=f"preview-watch:{normalized_symbol}",
+            event_id=f"preview-watch-event:{normalized_symbol}",
+            symbol=normalized_symbol,
+            horizon="position",
+            event_type="strategic",
+            headline_summary="模拟预备池卡片，用于预览当前文案与展示层效果。",
+            bull_case="若题材发酵持续、价格结构继续转强，后续有机会升级为正式操作卡。",
+            bear_case="若量能衰减或结构转弱，观察价值会快速下降。",
+            event_score=74.0,
+            market_score=61.0,
+            final_score=67.2,
+            entry_range=PriceRange(100.0, 102.0),
+            take_profit_range=PriceRange(108.0, 112.0),
+            invalidation_level=97.0,
+            invalidation_reason="模拟卡片，不作为真实交易依据。",
+            risk_notes=["模拟预览用卡片", "正式执行前需结合真实行情与事件确认"],
+            source_refs=["https://example.com/preview-alert"],
+            created_at=now,
+            ttl=now + timedelta(days=10),
+            priority="suppressed",
+            dedup_key=f"preview-watch:{normalized_symbol}",
+            bias="long",
+            display_name=display_name,
+            action_label="加入观察",
+            confidence_label="中",
+            confidence_score=64.0,
+            reason_to_watch="先盯合作细节、订单金额和时间表是否继续落地，再决定是否升级。",
+            trend_state="neutral",
+            rsi_14=54.2,
+            relative_volume=1.18,
+            theme_tags=theme_tags,
+            chain_summary="2天前加入观察 -> 今日继续跟踪",
+            market_regime="neutral",
+            rate_risk="medium",
+            geopolitical_risk="low",
+            macro_risk_score=35.0,
+            promoted_from_prewatch=True,
+            prewatch_score=78.0,
+            prewatch_setup_type="pullback_watch",
+            positioning_hint="当前先放入观察名单，不追价，等结构和催化进一步确认后再升级。",
+        )
+    return OpportunityCard(
+        card_id=f"preview-formal:{normalized_symbol}",
+        event_id=f"preview-formal-event:{normalized_symbol}",
+        symbol=normalized_symbol,
+        horizon="swing",
+        event_type="strategic",
+        headline_summary="模拟正式卡片，用于预览当前 LLM 文案和完整通知渲染效果。",
+        bull_case="若事件兑现顺利，叙事会继续强化，短线资金更容易沿主线加速交易。",
+        bear_case="若预期兑现不足或量能回落，强势信号容易迅速降温。",
+        event_score=82.0,
+        market_score=76.0,
+        final_score=79.6,
+        entry_range=PriceRange(100.0, 102.0),
+        take_profit_range=PriceRange(108.0, 112.0),
+        invalidation_level=97.0,
+        invalidation_reason="模拟卡片，不作为真实交易依据。",
+        risk_notes=["模拟预览用卡片", "正式执行前需结合真实行情与事件确认"],
+        source_refs=["https://example.com/preview-alert"],
+        created_at=now,
+        ttl=now + timedelta(days=5),
+        priority="high",
+        dedup_key=f"preview-formal:{normalized_symbol}",
+        bias="long",
+        display_name=display_name,
+        action_label="确认做多",
+        confidence_label="高",
+        confidence_score=84.0,
+        reason_to_watch="如果当前文案读起来足够清楚，说明 Qwen 生成链路已经适合继续上线观察。",
+        trend_state="bullish",
+        rsi_14=61.5,
+        relative_volume=1.72,
+        theme_tags=theme_tags,
+        chain_summary="昨晚试探建仓 -> 今日升级确认做多",
+        market_regime="risk_on",
+        rate_risk="medium",
+        geopolitical_risk="low",
+        macro_risk_score=25.0,
+        positioning_hint="适合按价格计划跟随，不适合追高扩仓。",
+    )
+
+
+def _build_preview_event_insight(symbol: str) -> EventInsight:
+    now = utcnow()
+    normalized_symbol = symbol.upper()
+    return EventInsight(
+        event_id=f"preview-insight:{normalized_symbol}",
+        symbol=normalized_symbol,
+        event_type="strategic",
+        headline_summary="公司宣布扩大与 AI 基建相关的合作与投入。",
+        bull_case="合作落地会强化市场对后续订单与资本开支扩张的预期。",
+        bear_case="若合作更多停留在叙事层，市场可能快速回吐短线溢价。",
+        importance=84.0,
+        source_credibility=86.0,
+        novelty=72.0,
+        sentiment=0.70,
+        theme_relevance=90.0,
+        llm_confidence=80.0,
+        risk_notes=["兑现节奏低于预期是主要失败点。"],
+        source_refs=["https://example.com/preview-alert"],
+        raw_payload={"mode": "preview"},
+        created_at=now,
+    )
+
+
+def build_preview_alert_payload(
+    settings: Settings,
+    runtime_config: AgentRuntimeConfig,
+    store: Store,
+    *,
+    symbol: str = "NVDA",
+    watch_mode: bool = False,
+    prewatch_light: bool = False,
+) -> dict[str, Any]:
+    llm_used = False
+    if prewatch_light:
+        service = build_service(
+            settings,
+            runtime_config=runtime_config,
+            apply_runtime_config=False,
+        )
+        candidate = PrewatchCandidate(
+            symbol=symbol.upper(),
+            horizon="position",
+            setup_type="pullback_watch",
+            score=78.0,
+            headline_summary="模拟预备池轻推送，用于预览当前轻推正文与 LLM 文案效果。",
+            action_hint="轻仓观察",
+            reason_to_watch="先盯合作细节、订单金额和时间表是否继续落地，再决定是否升级。",
+            last_price=100.0,
+            rsi_14=54.2,
+            relative_volume=1.18,
+            trend_state="neutral",
+            support_20=97.0,
+            resistance_20=103.0,
+            trigger_mode="event",
+            trigger_event_type="strategic",
+            as_of=utcnow(),
+        )
+        card = service._build_prewatch_notification_card(  # type: ignore[attr-defined]
+            candidate,
+            macro_context={
+                "market_regime": "neutral",
+                "rate_risk": "medium",
+                "geopolitical_risk": "low",
+                "macro_risk_score": 35.0,
+            },
+            run_id="preview-prewatch-light",
+        )
+        llm_used = any(
+            [
+                card.llm_summary,
+                card.llm_impact_inference,
+                card.llm_reasoning,
+                card.llm_uncertainty,
+            ]
+        )
+    else:
+        card = _build_preview_notification_card(runtime_config, symbol=symbol, watch_mode=watch_mode)
+        insight = _build_preview_event_insight(card.symbol)
+        if settings.openai_api_key and settings.use_llm_narration:
+            narrator = OpenAINarrator(
+                api_key=settings.openai_api_key,
+                model=settings.openai_model,
+                base_url=settings.openai_base_url,
+            )
+            narrative = narrator.narrate(
+                insight=insight,
+                card=card,
+                market_regime=card.market_regime or "neutral",
+                rate_risk=card.rate_risk or "low",
+                geopolitical_risk=card.geopolitical_risk or "low",
+                theme_text=" / ".join(card.theme_tags) if card.theme_tags else "未标注",
+                chain_summary=card.chain_summary or "首次出现",
+            )
+            card = OpportunityCard(
+                **{
+                    **card.__dict__,
+                    "llm_summary": narrative.summary,
+                    "llm_impact_inference": narrative.impact_inference,
+                    "llm_reasoning": narrative.reasoning,
+                    "llm_uncertainty": narrative.uncertainty,
+                    "narrative_priority_adjustment": narrative.priority_adjustment,
+                }
+            )
+            llm_used = any(
+                [
+                    narrative.summary,
+                    narrative.impact_inference,
+                    narrative.reasoning,
+                    narrative.uncertainty,
+                ]
+            )
+    notifier = Notifier(store=store, transport=None, dry_run=True)
+    transport = FeishuTransport("https://example.com/preview-webhook")
+    return {
+        "symbol": card.symbol,
+        "watch_mode": watch_mode,
+        "prewatch_light": prewatch_light,
+        "llm_enabled": bool(settings.openai_api_key and settings.use_llm_narration),
+        "llm_used": llm_used,
+        "title": f"[预备池] {notifier._title(card)}" if prewatch_light else notifier._title(card),
+        "body": notifier._body(card),
+        "delivery_view": build_delivery_view_from_record(card.to_record()),
+        "feishu_card": transport._build_interactive_payload(card),
+    }
+
+
 def send_test_notification(settings: Settings, *, symbol: str = "NVDA") -> dict:
     if not settings.feishu_webhook:
         raise ValueError(
@@ -2958,6 +3675,28 @@ def format_test_notification_result(payload: dict) -> str:
             f"测试标的：{payload.get('symbol', '-')}",
             f"优先级：{payload.get('priority', '-')}",
             f"说明：{payload.get('headline', '-')}",
+        ]
+    )
+
+
+def format_preview_alert_result(payload: dict) -> str:
+    if payload.get("prewatch_light"):
+        mode_text = "预备池轻推送"
+    else:
+        mode_text = "预备池观察卡" if payload.get("watch_mode") else "正式操作卡"
+    return "\n".join(
+        [
+            "本地预览卡片：",
+            f"模式：{mode_text}",
+            f"标的：{payload.get('symbol', '-')}",
+            f"LLM 已启用：{'是' if payload.get('llm_enabled') else '否'}",
+            f"LLM 实际参与：{'是' if payload.get('llm_used') else '否'}",
+            "",
+            "标题：",
+            str(payload.get("title", "")),
+            "",
+            "正文：",
+            str(payload.get("body", "")),
         ]
     )
 
@@ -3132,6 +3871,25 @@ def main() -> None:
     report_sources_parser = subparsers.add_parser("report-sources")
     report_sources_parser.add_argument("--json", action="store_true")
 
+    report_llm_usage_parser = subparsers.add_parser("report-llm-usage")
+    report_llm_usage_parser.add_argument("--days", type=int, default=LLM_USAGE_REPORT_WINDOW_DAYS)
+    report_llm_usage_parser.add_argument("--json", action="store_true")
+
+    write_llm_usage_parser = subparsers.add_parser("write-llm-usage-report")
+    write_llm_usage_parser.add_argument("--workspace-dir", default=SERVE_WORKSPACE_DIR)
+    write_llm_usage_parser.add_argument("--days", type=int, default=LLM_USAGE_REPORT_WINDOW_DAYS)
+    write_llm_usage_parser.add_argument("--json", action="store_true")
+
+    watchlist_review_parser = subparsers.add_parser("report-watchlist-config")
+    watchlist_review_parser.add_argument("--json", action="store_true")
+
+    theme_reference_parser = subparsers.add_parser("report-theme-reference")
+    theme_reference_parser.add_argument("--json", action="store_true")
+
+    write_theme_reference_parser = subparsers.add_parser("write-theme-reference")
+    write_theme_reference_parser.add_argument("--path", default=SATELLITE_THEME_REFERENCE_PATH)
+    write_theme_reference_parser.add_argument("--print", action="store_true", dest="print_output")
+
     report_strategy_parser = subparsers.add_parser("report-strategy")
     report_strategy_parser.add_argument("--days", type=int, default=RECENT_PERFORMANCE_WINDOW_DAYS)
     report_strategy_parser.add_argument("--start-date", default="", help="历史效果复盘起始日期，格式 YYYY-MM-DD")
@@ -3155,14 +3913,14 @@ def main() -> None:
     outcome_sample_parser.add_argument("--limit", type=int, default=10)
     outcome_sample_parser.add_argument("--json", action="store_true")
 
-    manual_audit_parser = subparsers.add_parser("write-outcome-audit")
-    manual_audit_parser.add_argument("--workspace-dir", default=SERVE_WORKSPACE_DIR)
-    manual_audit_parser.add_argument("--days", type=int, default=RECENT_PERFORMANCE_WINDOW_DAYS)
-    manual_audit_parser.add_argument("--start-date", default="", help="AI复核起始日期，格式 YYYY-MM-DD")
-    manual_audit_parser.add_argument("--end-date", default="", help="AI复核结束日期，格式 YYYY-MM-DD")
-    manual_audit_parser.add_argument("--limit", type=int, default=OUTCOME_SAMPLE_AUDIT_LIMIT)
-    manual_audit_parser.add_argument("--reviewer", default="codex")
-    manual_audit_parser.add_argument("--json", action="store_true")
+    ai_review_parser = subparsers.add_parser("write-outcome-audit", aliases=["write-ai-review"])
+    ai_review_parser.add_argument("--workspace-dir", default=SERVE_WORKSPACE_DIR)
+    ai_review_parser.add_argument("--days", type=int, default=RECENT_PERFORMANCE_WINDOW_DAYS)
+    ai_review_parser.add_argument("--start-date", default="", help="AI复核起始日期，格式 YYYY-MM-DD")
+    ai_review_parser.add_argument("--end-date", default="", help="AI复核结束日期，格式 YYYY-MM-DD")
+    ai_review_parser.add_argument("--limit", type=int, default=OUTCOME_SAMPLE_AUDIT_LIMIT)
+    ai_review_parser.add_argument("--reviewer", default="codex")
+    ai_review_parser.add_argument("--json", action="store_true")
 
     freeze_review_parser = subparsers.add_parser("freeze-review-baseline")
     freeze_review_parser.add_argument("--workspace-dir", default=SERVE_WORKSPACE_DIR)
@@ -3197,6 +3955,15 @@ def main() -> None:
     batch_replay_parser.add_argument("--markdown-path", default="")
     batch_replay_parser.add_argument("--json", action="store_true")
 
+    write_batch_replay_template_parser = subparsers.add_parser("write-batch-replay-template")
+    write_batch_replay_template_parser.add_argument(
+        "--path",
+        default=_preferred_batch_replay_template_path(),
+        help="输出赛马模板 spec 的路径",
+    )
+    write_batch_replay_template_parser.add_argument("--print-output", action="store_true")
+    write_batch_replay_template_parser.add_argument("--json", action="store_true")
+
     report_batch_parser = subparsers.add_parser("report-batch")
     report_batch_parser.add_argument("--manifest-path", required=True)
     report_batch_parser.add_argument("--markdown-path", default="")
@@ -3224,6 +3991,12 @@ def main() -> None:
     send_test_parser = subparsers.add_parser("send-test-notification")
     send_test_parser.add_argument("--symbol", default="NVDA")
     send_test_parser.add_argument("--json", action="store_true")
+
+    preview_alert_parser = subparsers.add_parser("preview-alert-render")
+    preview_alert_parser.add_argument("--symbol", default="NVDA")
+    preview_alert_parser.add_argument("--watch", action="store_true")
+    preview_alert_parser.add_argument("--prewatch-light", action="store_true")
+    preview_alert_parser.add_argument("--json", action="store_true")
 
     promote_batch_parser = subparsers.add_parser("promote-batch")
     promote_batch_parser.add_argument("--manifest-path", required=True)
@@ -3320,6 +4093,73 @@ def main() -> None:
             return
         print(format_source_health(rows))
         return
+    if args.command == "report-llm-usage":
+        payload = build_llm_usage_report_payload(store, days=args.days)
+        if args.json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+            return
+        print(format_llm_usage_report_payload(payload))
+        return
+    if args.command == "write-llm-usage-report":
+        payload = build_write_llm_usage_report_payload(
+            store,
+            workspace_dir=Path(args.workspace_dir),
+            days=args.days,
+        )
+        if args.json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+            return
+        print(format_write_llm_usage_report_result(payload))
+        return
+    if args.command == "report-watchlist-config":
+        payload = build_watchlist_config_review_payload(runtime_config, config_path=settings.config_path)
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return
+        print(format_watchlist_config_review_payload(payload))
+        return
+    if args.command == "report-theme-reference":
+        payload = build_theme_reference_payload(runtime_config, config_path=settings.config_path)
+        if args.json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+            return
+        print(format_theme_reference_payload(payload))
+        return
+    if args.command == "write-theme-reference":
+        payload = build_theme_reference_payload(runtime_config, config_path=settings.config_path)
+        output_path = Path(args.path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+        if args.print_output:
+            print(format_theme_reference_payload(payload))
+            return
+        print(str(output_path))
+        return
+    if args.command == "write-batch-replay-template":
+        payload = _load_batch_replay_template_payload()
+        output_path = Path(args.path)
+        payload = _relativize_replay_path_for_output(payload, output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        result = {
+            "template_path": str(output_path.resolve()),
+            "source_template_path": payload.get("_meta", {}).get("template_path", ""),
+            "experiments": [
+                {
+                    "name": item.get("name", ""),
+                    "note": item.get("note", ""),
+                }
+                for item in payload.get("experiments", [])
+            ],
+        }
+        if args.json:
+            print(json.dumps(result, indent=2, ensure_ascii=False, sort_keys=True))
+            return
+        if args.print_output:
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+            return
+        print(str(output_path.resolve()))
+        return
     if args.command == "report-strategy":
         report = _build_historical_strategy_report(
             store,
@@ -3370,12 +4210,12 @@ def main() -> None:
             return
         print(format_outcome_sample_payload(payload))
         return
-    if args.command == "write-outcome-audit":
+    if args.command in {"write-outcome-audit", "write-ai-review"}:
         workspace_dir = Path(args.workspace_dir).resolve()
         workspace_dir.mkdir(parents=True, exist_ok=True)
         historical_effect_dir = workspace_dir / "historical_effect"
         historical_effect_dir.mkdir(parents=True, exist_ok=True)
-        payload = build_manual_outcome_audit_payload(
+        payload = build_ai_outcome_review_payload(
             store,
             days=args.days,
             limit=args.limit,
@@ -3385,8 +4225,8 @@ def main() -> None:
         )
         audit_path = historical_effect_dir / "ai_review.md"
         audit_payload_path = historical_effect_dir / "ai_review_payload.json"
-        store.set_state(MANUAL_OUTCOME_AUDIT_STATE_KEY, json.dumps(payload, ensure_ascii=False, sort_keys=True))
-        _write_report(audit_path, format_manual_outcome_audit_payload(payload))
+        store.set_state(AI_OUTCOME_REVIEW_STATE_KEY, json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        _write_report(audit_path, format_ai_outcome_review_payload(payload))
         _write_json(audit_payload_path, payload)
         result = {
             "workspace_dir": str(workspace_dir),
@@ -3588,6 +4428,20 @@ def main() -> None:
             return
         print(format_test_notification_result(payload))
         return
+    if args.command == "preview-alert-render":
+        payload = build_preview_alert_payload(
+            settings,
+            runtime_config,
+            store,
+            symbol=args.symbol,
+            watch_mode=args.watch,
+            prewatch_light=args.prewatch_light,
+        )
+        if args.json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+            return
+        print(format_preview_alert_result(payload))
+        return
     if args.command == "promote-batch":
         manifest_payload = _load_manifest(Path(args.manifest_path))
         output_config_path = Path(args.output_config_path).resolve()
@@ -3685,6 +4539,7 @@ def main() -> None:
                     limit=args.limit,
                     review_filename="run_once_review.md",
                     payload_filename="run_once_payload.json",
+                    llm_usage_min_interval_seconds=0,
                 )
                 print(format_live_run_artifacts(payload), flush=True)
             raise
@@ -3697,6 +4552,7 @@ def main() -> None:
                 limit=args.limit,
                 review_filename="run_once_review.md",
                 payload_filename="run_once_payload.json",
+                llm_usage_min_interval_seconds=0,
             )
             print(format_live_run_artifacts(payload), flush=True)
             print(
@@ -3736,6 +4592,7 @@ def main() -> None:
                         review_filename="serve_review.md",
                         payload_filename="serve_payload.json",
                         historical_effect_min_interval_seconds=SERVE_HISTORICAL_EFFECT_REFRESH_SECONDS,
+                        llm_usage_min_interval_seconds=SERVE_LLM_USAGE_REFRESH_SECONDS,
                     )
                     print(format_live_run_artifacts(payload), flush=True)
                 raise
@@ -3749,6 +4606,7 @@ def main() -> None:
                     review_filename="serve_review.md",
                     payload_filename="serve_payload.json",
                     historical_effect_min_interval_seconds=SERVE_HISTORICAL_EFFECT_REFRESH_SECONDS,
+                    llm_usage_min_interval_seconds=SERVE_LLM_USAGE_REFRESH_SECONDS,
                 )
                 print(format_live_run_artifacts(payload), flush=True)
                 print(

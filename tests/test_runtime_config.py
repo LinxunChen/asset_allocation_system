@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -21,6 +22,8 @@ from satellite_agent.main import (
     _prioritize_symbols_for_source,
     _runtime_window_pause,
     _sync_watchlist_if_needed,
+    build_watchlist_config_review_payload,
+    format_watchlist_config_review_payload,
 )
 from satellite_agent.runtime_config import (
     AgentRuntimeConfig,
@@ -33,6 +36,38 @@ from satellite_agent.store import Store
 
 
 class RuntimeConfigTests(unittest.TestCase):
+    def test_settings_from_env_loads_local_env_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_dir = root / "config" / "satellite_agent"
+            config_dir.mkdir(parents=True)
+            (config_dir / ".env.local").write_text(
+                "\n".join(
+                    [
+                        "SATELLITE_OPENAI_API_KEY=test-local-key",
+                        "SATELLITE_OPENAI_MODEL=Qwen/Qwen3.5-35B-A3B",
+                        "SATELLITE_OPENAI_BASE_URL=https://api.siliconflow.com/v1/chat/completions",
+                        "SATELLITE_USE_LLM_NARRATION=1",
+                        "SATELLITE_USE_LLM_RANKING_ASSIST=0",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config_path = config_dir / "agent.json"
+            config_path.write_text("{}", encoding="utf-8")
+            with mock.patch.dict(
+                "os.environ",
+                {"SATELLITE_CONFIG_PATH": str(config_path)},
+                clear=True,
+            ):
+                settings = Settings.from_env()
+            self.assertEqual(settings.openai_api_key, "test-local-key")
+            self.assertEqual(settings.openai_model, "Qwen/Qwen3.5-35B-A3B")
+            self.assertEqual(settings.openai_base_url, "https://api.siliconflow.com/v1/chat/completions")
+            self.assertTrue(settings.use_llm_narration)
+            self.assertFalse(settings.use_llm_ranking_assist)
+
     def test_runtime_config_applies_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "agent.json"
@@ -57,8 +92,22 @@ class RuntimeConfigTests(unittest.TestCase):
                             "feishu_webhook": "https://example.feishu.cn/webhook/test",
                             "dry_run": True,
                         },
+                        "llm": {
+                            "model": "Qwen/Qwen3.5-35B-A3B",
+                            "base_url": "https://api.siliconflow.com/v1/chat/completions",
+                            "use_narration": True,
+                            "use_ranking_assist": False,
+                        },
                         "strategy": {
                             "event_score_threshold": 65,
+                            "use_llm_event_extraction": False,
+                            "event_score_weights": {
+                                "importance": 0.35,
+                                "source_credibility": 0.20,
+                                "novelty": 0.15,
+                                "theme_relevance": 0.20,
+                                "sentiment": 0.10
+                            },
                             "horizons": {
                                 "swing": {
                                     "market_score_threshold": 58,
@@ -88,12 +137,20 @@ class RuntimeConfigTests(unittest.TestCase):
             self.assertEqual(settings.cross_source_dedup_hours, 6)
             self.assertEqual(settings.feishu_webhook, "https://example.feishu.cn/webhook/test")
             self.assertTrue(settings.dry_run)
+            self.assertEqual(settings.openai_model, "Qwen/Qwen3.5-35B-A3B")
+            self.assertEqual(settings.openai_base_url, "https://api.siliconflow.com/v1/chat/completions")
+            self.assertTrue(settings.use_llm_narration)
+            self.assertFalse(settings.use_llm_ranking_assist)
             self.assertTrue(runtime_config.runtime_window.enabled)
             self.assertEqual(runtime_config.runtime_window.timezone, "Asia/Shanghai")
             self.assertEqual(runtime_config.runtime_window.weekdays, ["mon", "tue", "wed", "thu", "fri"])
             self.assertEqual(runtime_config.runtime_window.start_time, "18:00")
             self.assertEqual(runtime_config.runtime_window.end_time, "04:00")
             self.assertEqual(settings.event_score_threshold, 65)
+            self.assertFalse(settings.use_llm_event_extraction)
+            self.assertEqual(settings.event_score_weights.importance, 0.35)
+            self.assertEqual(settings.event_score_weights.source_credibility, 0.20)
+            self.assertEqual(settings.event_score_weights.theme_relevance, 0.20)
             self.assertEqual(settings.horizons["swing"].market_score_threshold, 58)
             self.assertEqual(settings.horizons["swing"].priority_threshold, 78)
             self.assertEqual(settings.horizons["swing"].rsi_floor, 47)
@@ -168,12 +225,216 @@ class RuntimeConfigTests(unittest.TestCase):
                 },
             )
 
+    def test_runtime_config_builds_symbol_theme_map_from_defaults_when_no_groups_or_themes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "agent.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "watchlist": {
+                            "stock_items": {
+                                "NVDA": {"symbol": "NVDA", "name": "NVIDIA"},
+                                "TSLA": {"symbol": "TSLA", "name": "Tesla"},
+                                "RKLB": {"symbol": "RKLB", "name": "Rocket Lab"},
+                                "NBIS": {"symbol": "NBIS", "name": "Nebius Group"},
+                            },
+                            "etf_items": {
+                                "SMH": {"symbol": "SMH", "name": "VanEck Semiconductor ETF"},
+                                "BBJP": {"symbol": "BBJP", "name": "JPMorgan BetaBuilders Japan ETF"},
+                                "EMXC": {"symbol": "EMXC", "name": "iShares Emerging Markets ex China ETF"},
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            runtime_config = AgentRuntimeConfig.load(config_path)
+            self.assertEqual(runtime_config.watchlist.stocks, ["NVDA", "TSLA", "RKLB", "NBIS"])
+            self.assertEqual(runtime_config.watchlist.etfs, ["SMH", "BBJP", "EMXC"])
+            self.assertEqual(
+                runtime_config.watchlist.symbol_theme_map(),
+                {
+                    "NVDA": ["semiconductors_and_ai"],
+                    "TSLA": ["automotive_and_mobility"],
+                    "RKLB": ["space_and_defense"],
+                    "NBIS": ["data_center"],
+                    "SMH": ["semiconductors_and_ai"],
+                    "BBJP": ["non_us_markets"],
+                    "EMXC": ["non_us_markets"],
+                },
+            )
+            self.assertEqual(
+                runtime_config.watchlist.theme_display_name_map(),
+                {
+                    "automotive_and_mobility": "电动车与智能出行",
+                    "data_center": "数据中心基建与算力网络",
+                    "semiconductors_and_ai": "AI芯片与半导体设备",
+                    "space_and_defense": "国防军工与航空航天",
+                    "non_us_markets": "非美市场",
+                },
+            )
+
+    def test_runtime_config_loads_named_items_and_independent_themes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "agent.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "watchlist": {
+                            "stock_groups": {
+                                "core_platforms": ["nvda"],
+                            },
+                            "stock_items": {
+                                "NVDA": {"symbol": "NVDA", "name": "NVIDIA"},
+                                "MSFT": {"symbol": "MSFT", "name": "Microsoft", "enabled": False},
+                            },
+                            "etf_items": {
+                                "SMH": {"symbol": "SMH", "name": "VanEck Semiconductor ETF"},
+                            },
+                            "themes": [
+                                {
+                                    "theme_id": "semiconductors_and_ai",
+                                    "display_name": "半导体与AI",
+                                    "symbols": ["NVDA", "MSFT"],
+                                    "etfs": ["SMH"],
+                                }
+                            ],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            runtime_config = AgentRuntimeConfig.load(config_path)
+            self.assertEqual(runtime_config.watchlist.display_name_for("NVDA"), "NVIDIA")
+            self.assertEqual(runtime_config.watchlist.display_name_for("SMH"), "VanEck Semiconductor ETF")
+            self.assertEqual(runtime_config.watchlist.stocks, ["NVDA"])
+            self.assertEqual(
+                runtime_config.watchlist.symbol_theme_map(),
+                {
+                    "NVDA": ["semiconductors_and_ai"],
+                    "SMH": ["semiconductors_and_ai"],
+                },
+            )
+            self.assertEqual(
+                runtime_config.watchlist.theme_display_name_map(),
+                {"semiconductors_and_ai": "半导体与AI"},
+            )
+
+    def test_runtime_config_excludes_disabled_symbols_from_grouped_watchlist(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "agent.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "watchlist": {
+                            "stock_groups": {
+                                "core_platforms": ["nvda", "msft", "aapl"],
+                            },
+                            "stock_items": {
+                                "NVDA": {"symbol": "NVDA", "name": "NVIDIA"},
+                                "MSFT": {"symbol": "MSFT", "name": "Microsoft", "enabled": False},
+                                "AAPL": {"symbol": "AAPL", "name": "Apple"},
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            runtime_config = AgentRuntimeConfig.load(config_path)
+
+            self.assertEqual(runtime_config.watchlist.stocks, ["NVDA", "AAPL"])
+            self.assertEqual(
+                runtime_config.watchlist.stock_groups,
+                {"core_platforms": ["NVDA", "AAPL"]},
+            )
+
     def test_write_default_config_creates_expected_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "agent.json"
             write_default_config(config_path)
             payload = json.loads(config_path.read_text(encoding="utf-8"))
             self.assertEqual(payload, load_default_template_payload())
+
+    def test_watchlist_config_review_flags_missing_names_and_unthemed_symbols(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "agent.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "watchlist": {
+                            "stocks": ["NVDA", "TSLA"],
+                            "etfs": ["SMH"],
+                            "stock_items": {
+                                "NVDA": {"symbol": "NVDA", "name": "NVIDIA"},
+                                "TSLA": {"symbol": "TSLA"},
+                            },
+                            "etf_items": {
+                                "SMH": {"symbol": "SMH", "name": "VanEck Semiconductor ETF"},
+                            },
+                            "themes": [
+                                {
+                                    "theme_id": "semiconductors_and_ai",
+                                    "display_name": "半导体与AI",
+                                    "symbols": ["NVDA", "AMD"],
+                                    "etfs": ["SMH"],
+                                }
+                            ],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            runtime_config = AgentRuntimeConfig.load(config_path)
+            payload = build_watchlist_config_review_payload(runtime_config, config_path=config_path)
+            report_text = format_watchlist_config_review_payload(payload)
+
+            self.assertEqual(payload["missing_display_names"], ["TSLA"])
+            self.assertEqual(payload["unthemed_symbols"], ["TSLA"])
+            self.assertEqual(payload["excluded_symbols"], [])
+            self.assertEqual(
+                payload["themes_with_off_watchlist_members"][0]["off_watchlist_members"],
+                ["AMD"],
+            )
+            self.assertIn("缺少展示名称的标的： TSLA", report_text)
+            self.assertIn("未挂题材的活跃标的： TSLA", report_text)
+            self.assertIn("题材中挂到观察池外的成员：", report_text)
+
+    def test_watchlist_config_review_flags_formal_watchlist_exclusions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "agent.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "watchlist": {
+                            "stocks": ["NVDA"],
+                            "etfs": ["QQQ", "SMH"],
+                            "stock_items": {
+                                "NVDA": {"symbol": "NVDA", "name": "NVIDIA"},
+                            },
+                            "etf_items": {
+                                "QQQ": {"symbol": "QQQ", "name": "Invesco QQQ Trust"},
+                                "SMH": {"symbol": "SMH", "name": "VanEck Semiconductor ETF"},
+                            },
+                            "themes": [
+                                {
+                                    "theme_id": "semiconductors_and_ai",
+                                    "display_name": "半导体与AI",
+                                    "symbols": ["NVDA"],
+                                    "etfs": ["SMH"],
+                                }
+                            ],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            runtime_config = AgentRuntimeConfig.load(config_path)
+            payload = build_watchlist_config_review_payload(runtime_config, config_path=config_path)
+
+            self.assertEqual(payload["excluded_symbols"], ["QQQ"])
 
     def test_replace_watchlist_disables_removed_symbols(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -1,115 +1,77 @@
 {
   "_meta": {
-    "description": "更易维护的观察池模板。推荐只维护 stock_groups 和 etf_groups，程序会自动拍平成实际 watchlist。",
+    "description": "卫星仓位观察池模板。正式观察范围只保留个股、行业/主题ETF、数字货币ETF、非美市场ETF；宽基与宏观对冲品种仅作为内部环境代理使用。",
     "how_to_use": [
       "复制为 config/satellite_agent/agent.json。",
-      "按分组增删标的，不需要手动维护第二份平铺列表。",
-      "修改完成后直接运行 run-once 或 serve，程序会自动同步 watchlist。"
+      "你只需要维护 watchlist.stock_items / etf_items。",
+      "名称展示统一来自 stock_items / etf_items，题材归属默认由系统内置题材目录自动维护。",
+      "stock_groups / etf_groups / themes 仅作为高级兼容能力保留，日常不用手写。"
     ],
     "notes": {
       "sec_filings": "SEC 只读取股票池。",
-      "google_news": "Google News 会读取整个 watchlist（股票 + ETF）。"
+      "google_news": "Google News 读取正式观察池（股票 + ETF）。",
+      "market_proxies": "SPY、QQQ、SMH、TLT 仍可作为内部环境代理，但不属于正式卫星观察池。"
     }
   },
   "watchlist": {
-    "stock_groups": {
-      "core_platforms": [
-        "NVDA",
-        "MSFT",
-        "AAPL",
-        "AMZN",
-        "META",
-        "GOOG",
-        "TSLA"
-      ],
-      "semiconductors_and_ai": [
-        "AMD",
-        "AVGO",
-        "QCOM",
-        "MU",
-        "ARM",
-        "TSM",
-        "ASML",
-        "AMAT",
-        "LRCX",
-        "KLAC",
-        "MRVL",
-        "NBIS"
-      ],
-      "software_and_cloud": [
-        "CRM",
-        "ORCL",
-        "SNOW",
-        "PLTR",
-        "NOW",
-        "ADBE",
-        "MDB",
-        "DDOG",
-        "NET"
-      ],
-      "financials_and_fintech": [
-        "FUTU",
-        "BRK.B",
-        "JPM",
-        "GS",
-        "MS",
-        "BLK",
-        "SCHW",
-        "V",
-        "MA",
-        "AXP",
-        "HOOD"
-      ],
-      "healthcare": [
-        "UNH",
-        "HIMS",
-        "LLY",
-        "ISRG",
-        "VRTX"
-      ],
-      "international_and_consumer": [
-        "SE",
-        "TCEHY",
-        "LVMHF",
-        "MELI"
-      ],
-      "special_situations": [
-        "IREN",
-        "EOSE",
-        "RDW",
-        "RKLB"
-      ]
+    "stock_items": {
+      "AAPL": { "symbol": "AAPL", "name": "Apple" },
+      "ADBE": { "symbol": "ADBE", "name": "Adobe" },
+      "AMAT": { "symbol": "AMAT", "name": "Applied Materials" },
+      "AMD": { "symbol": "AMD", "name": "AMD" },
+      "AMZN": { "symbol": "AMZN", "name": "Amazon" },
+      "ARM": { "symbol": "ARM", "name": "Arm Holdings" },
+      "ASML": { "symbol": "ASML", "name": "ASML" },
+      "AVGO": { "symbol": "AVGO", "name": "Broadcom" },
+      "AXP": { "symbol": "AXP", "name": "American Express" },
+      "BLK": { "symbol": "BLK", "name": "BlackRock" },
+      "CRM": { "symbol": "CRM", "name": "Salesforce" },
+      "DDOG": { "symbol": "DDOG", "name": "Datadog" },
+      "GOOG": { "symbol": "GOOG", "name": "Alphabet" },
+      "GS": { "symbol": "GS", "name": "Goldman Sachs" },
+      "HIMS": { "symbol": "HIMS", "name": "Hims & Hers" },
+      "HOOD": { "symbol": "HOOD", "name": "Robinhood" },
+      "ISRG": { "symbol": "ISRG", "name": "Intuitive Surgical" },
+      "JPM": { "symbol": "JPM", "name": "JPMorgan Chase" },
+      "KLAC": { "symbol": "KLAC", "name": "KLA" },
+      "LLY": { "symbol": "LLY", "name": "Eli Lilly" },
+      "LRCX": { "symbol": "LRCX", "name": "Lam Research" },
+      "LVMHF": { "symbol": "LVMHF", "name": "LVMH" },
+      "MA": { "symbol": "MA", "name": "Mastercard" },
+      "MDB": { "symbol": "MDB", "name": "MongoDB" },
+      "MELI": { "symbol": "MELI", "name": "MercadoLibre" },
+      "META": { "symbol": "META", "name": "Meta Platforms" },
+      "MRVL": { "symbol": "MRVL", "name": "Marvell Technology" },
+      "MS": { "symbol": "MS", "name": "Morgan Stanley" },
+      "MSFT": { "symbol": "MSFT", "name": "Microsoft" },
+      "MU": { "symbol": "MU", "name": "Micron" },
+      "NBIS": { "symbol": "NBIS", "name": "Nebius Group" },
+      "NET": { "symbol": "NET", "name": "Cloudflare" },
+      "NOW": { "symbol": "NOW", "name": "ServiceNow" },
+      "NVDA": { "symbol": "NVDA", "name": "NVIDIA" },
+      "ORCL": { "symbol": "ORCL", "name": "Oracle" },
+      "PLTR": { "symbol": "PLTR", "name": "Palantir" },
+      "QCOM": { "symbol": "QCOM", "name": "Qualcomm" },
+      "SCHW": { "symbol": "SCHW", "name": "Charles Schwab" },
+      "SE": { "symbol": "SE", "name": "Sea Limited" },
+      "SNOW": { "symbol": "SNOW", "name": "Snowflake" },
+      "TCEHY": { "symbol": "TCEHY", "name": "Tencent" },
+      "TSLA": { "symbol": "TSLA", "name": "Tesla" },
+      "TSM": { "symbol": "TSM", "name": "Taiwan Semiconductor" },
+      "UNH": { "symbol": "UNH", "name": "UnitedHealth" },
+      "VRTX": { "symbol": "VRTX", "name": "Vertex Pharmaceuticals" }
     },
-    "etf_groups": {
-      "core_index": [
-        "SPY",
-        "QQQ",
-        "QQQM",
-        "VOO",
-        "SCHD"
-      ],
-      "leveraged_and_tactical": [
-        "TQQQ",
-        "SQQQ"
-      ],
-      "sectors_and_themes": [
-        "SMH",
-        "XBI",
-        "ARKK"
-      ],
-      "non_us_markets": [
-        "BBJP",
-        "EMXC",
-        "FRDM",
-        "EWY",
-        "VNM"
-      ],
-      "macro_and_alternatives": [
-        "GLD",
-        "TLT",
-        "IBIT",
-        "ETHA"
-      ]
+    "etf_items": {
+      "ARKK": { "symbol": "ARKK", "name": "ARK Innovation ETF" },
+      "BBJP": { "symbol": "BBJP", "name": "JPMorgan BetaBuilders Japan ETF" },
+      "EMXC": { "symbol": "EMXC", "name": "iShares Emerging Markets ex China ETF" },
+      "ETHA": { "symbol": "ETHA", "name": "iShares Ethereum Trust ETF" },
+      "EWY": { "symbol": "EWY", "name": "iShares MSCI South Korea ETF" },
+      "FRDM": { "symbol": "FRDM", "name": "Freedom 100 Emerging Markets ETF" },
+      "IBIT": { "symbol": "IBIT", "name": "iShares Bitcoin Trust ETF" },
+      "SMH": { "symbol": "SMH", "name": "VanEck Semiconductor ETF" },
+      "VNM": { "symbol": "VNM", "name": "VanEck Vietnam ETF" },
+      "XBI": { "symbol": "XBI", "name": "SPDR S&P Biotech ETF" }
     }
   },
   "sources": {
@@ -124,13 +86,7 @@
   "runtime_window": {
     "enabled": false,
     "timezone": "Asia/Shanghai",
-    "weekdays": [
-      "mon",
-      "tue",
-      "wed",
-      "thu",
-      "fri"
-    ],
+    "weekdays": ["mon", "tue", "wed", "thu", "fri"],
     "start_time": "18:00",
     "end_time": "04:00"
   },
@@ -138,8 +94,25 @@
     "feishu_webhook": "",
     "dry_run": false
   },
+  "llm": {
+    "_help": {
+      "model": "LLM 模型名。当前默认接 SiliconFlow 的 Qwen/Qwen3.5-35B-A3B。",
+      "base_url": "OpenAI 兼容 chat.completions 地址。当前默认使用 SiliconFlow。",
+      "use_narration": "是否启用 LLM 卡片文案增强，包括资讯摘要、影响推理、决策理由和风险提示。",
+      "use_ranking_assist": "是否启用 LLM 排序辅助。当前建议先保持 false，先只优化卡片表达。",
+      "api_key_note": "API key 不写在这个文件里。请通过环境变量 SATELLITE_OPENAI_API_KEY 注入。"
+    },
+    "model": "Qwen/Qwen3.5-35B-A3B",
+    "base_url": "https://api.siliconflow.cn/v1/chat/completions",
+    "use_narration": true,
+    "use_ranking_assist": false
+  },
   "strategy": {
+    "_help": {
+      "use_llm_event_extraction": "是否让 LLM 参与事件特征抽取。当前建议先保持 false，只先上线卡片表达增强。"
+    },
     "event_score_threshold": 60.0,
+    "use_llm_event_extraction": false,
     "horizons": {
       "position": {
         "market_score_threshold": 55.0,

@@ -5,12 +5,21 @@ from typing import Any
 
 
 THEME_DISPLAY_NAMES: dict[str, str] = {
-    "core_platforms": "核心平台科技",
-    "semiconductors_and_ai": "半导体与AI",
-    "software_and_cloud": "软件与云",
-    "financials_and_fintech": "金融与金融科技",
-    "healthcare": "医疗健康",
-    "international_and_consumer": "国际与消费",
+    "semiconductors_and_ai": "AI芯片与半导体设备",
+    "software_and_cloud": "AI软件与大模型应用",
+    "data_center": "数据中心基建与算力网络",
+    "consumer_and_devices": "消费电子与硬件终端",
+    "automotive_and_mobility": "电动车与智能出行",
+    "financials_and_fintech": "金融科技与数字支付",
+    "healthcare": "医疗健康与生物制药",
+    "digital_health": "数字医疗与健康消费",
+    "biotech_and_pharma": "生物技术与创新药",
+    "premium_consumer": "高端消费与奢侈品",
+    "em_internet": "新兴市场互联网与电商",
+    "international_and_consumer": "平台、社交与消费互联网",
+    "digital_assets": "数字资产",
+    "innovation_and_growth": "高成长科技",
+    "space_and_defense": "国防军工与航空航天",
     "special_situations": "特殊题材",
     "core_index": "核心指数ETF",
     "leveraged_and_tactical": "杠杆与战术ETF",
@@ -19,15 +28,152 @@ THEME_DISPLAY_NAMES: dict[str, str] = {
     "sectors_and_themes": "行业与主题ETF",
 }
 
+DEFAULT_PRIMARY_THEME_BY_SYMBOL: dict[str, str] = {
+    "AAPL": "consumer_and_devices",
+    "ADBE": "software_and_cloud",
+    "AMAT": "semiconductors_and_ai",
+    "AMD": "semiconductors_and_ai",
+    "AMZN": "software_and_cloud",
+    "ARM": "semiconductors_and_ai",
+    "ARKK": "innovation_and_growth",
+    "ASML": "semiconductors_and_ai",
+    "AVGO": "semiconductors_and_ai",
+    "AXP": "financials_and_fintech",
+    "BBJP": "non_us_markets",
+    "BLK": "financials_and_fintech",
+    "CRM": "software_and_cloud",
+    "DDOG": "software_and_cloud",
+    "EMXC": "non_us_markets",
+    "ETHA": "digital_assets",
+    "EWY": "non_us_markets",
+    "FRDM": "non_us_markets",
+    "GOOG": "software_and_cloud",
+    "GS": "financials_and_fintech",
+    "HIMS": "digital_health",
+    "HOOD": "financials_and_fintech",
+    "IBIT": "digital_assets",
+    "ISRG": "healthcare",
+    "JPM": "financials_and_fintech",
+    "KLAC": "semiconductors_and_ai",
+    "LLY": "healthcare",
+    "LRCX": "semiconductors_and_ai",
+    "LVMHF": "premium_consumer",
+    "MA": "financials_and_fintech",
+    "MDB": "software_and_cloud",
+    "MELI": "international_and_consumer",
+    "META": "software_and_cloud",
+    "MRVL": "semiconductors_and_ai",
+    "MS": "financials_and_fintech",
+    "MSFT": "software_and_cloud",
+    "MU": "semiconductors_and_ai",
+    "NBIS": "data_center",
+    "NET": "software_and_cloud",
+    "NOW": "software_and_cloud",
+    "NVDA": "semiconductors_and_ai",
+    "ORCL": "software_and_cloud",
+    "PLTR": "software_and_cloud",
+    "QCOM": "semiconductors_and_ai",
+    "RKLB": "space_and_defense",
+    "SCHW": "financials_and_fintech",
+    "SE": "em_internet",
+    "SMH": "semiconductors_and_ai",
+    "SNOW": "software_and_cloud",
+    "TCEHY": "em_internet",
+    "TSLA": "automotive_and_mobility",
+    "TSM": "semiconductors_and_ai",
+    "UNH": "healthcare",
+    "VNM": "non_us_markets",
+    "VRTX": "biotech_and_pharma",
+    "XBI": "healthcare",
+}
 
-def display_theme_name(theme_key: str) -> str:
+
+def build_theme_display_name_map_from_watchlist_payload(watchlist_payload: dict[str, Any] | None) -> dict[str, str]:
+    payload = watchlist_payload or {}
+    themes = payload.get("themes", [])
+    if not isinstance(themes, list):
+        return dict(THEME_DISPLAY_NAMES)
+    mapping: dict[str, str] = {}
+    for raw in themes:
+        if not isinstance(raw, dict):
+            continue
+        theme_id = str(raw.get("theme_id", "")).strip()
+        display_name = str(raw.get("display_name", "")).strip()
+        if theme_id and display_name:
+            mapping[theme_id] = display_name
+    return mapping or dict(THEME_DISPLAY_NAMES)
+
+
+def _active_symbols_from_watchlist_payload(payload: dict[str, Any]) -> set[str]:
+    active: set[str] = set()
+    for key in ("stocks", "etfs"):
+        values = payload.get(key, [])
+        if isinstance(values, list):
+            for raw_symbol in values:
+                symbol = str(raw_symbol).strip().upper()
+                if symbol:
+                    active.add(symbol)
+    for key in ("stock_items", "etf_items"):
+        values = payload.get(key, {})
+        if not isinstance(values, dict):
+            continue
+        for raw_symbol, raw_value in values.items():
+            item = raw_value if isinstance(raw_value, dict) else {"symbol": raw_symbol}
+            symbol = str(item.get("symbol", raw_symbol)).strip().upper()
+            enabled = bool(item.get("enabled", True))
+            if not symbol:
+                continue
+            if enabled:
+                active.add(symbol)
+            elif symbol in active:
+                active.remove(symbol)
+    return active
+
+
+def display_theme_name(theme_key: str, theme_display_name_map: dict[str, str] | None = None) -> str:
     if not theme_key:
         return ""
+    if theme_display_name_map and theme_key in theme_display_name_map:
+        return theme_display_name_map[theme_key]
     return THEME_DISPLAY_NAMES.get(theme_key, theme_key.replace("_", " ").title())
+
+
+def build_default_symbol_theme_map(active_symbols: set[str] | list[str]) -> dict[str, list[str]]:
+    active = {str(symbol).strip().upper() for symbol in active_symbols if str(symbol).strip()}
+    mapping: dict[str, list[str]] = {}
+    if not active:
+        return mapping
+    for symbol in sorted(active):
+        theme_key = DEFAULT_PRIMARY_THEME_BY_SYMBOL.get(symbol)
+        if not theme_key:
+            continue
+        mapping[symbol] = [theme_key]
+    return mapping
 
 
 def build_symbol_theme_map_from_watchlist_payload(watchlist_payload: dict[str, Any] | None) -> dict[str, list[str]]:
     payload = watchlist_payload or {}
+    active_symbols = _active_symbols_from_watchlist_payload(payload)
+    if isinstance(payload.get("themes"), list):
+        mapping: dict[str, list[str]] = {}
+        for raw_theme in payload.get("themes", []):
+            if not isinstance(raw_theme, dict):
+                continue
+            theme_key = str(raw_theme.get("theme_id", "")).strip()
+            if not theme_key:
+                continue
+            members = list(raw_theme.get("symbols", [])) + list(raw_theme.get("etfs", []))
+            for raw_symbol in members:
+                symbol = str(raw_symbol).strip().upper()
+                if not symbol:
+                    continue
+                if active_symbols and symbol not in active_symbols:
+                    continue
+                bucket = mapping.setdefault(symbol, [])
+                if theme_key not in bucket:
+                    bucket.append(theme_key)
+        if mapping:
+            return mapping
     grouped_sources = [
         payload.get("stock_groups", {}),
         payload.get("etf_groups", {}),
@@ -43,14 +189,28 @@ def build_symbol_theme_map_from_watchlist_payload(watchlist_payload: dict[str, A
                 symbol = str(raw_symbol).strip().upper()
                 if not symbol:
                     continue
+                if active_symbols and symbol not in active_symbols:
+                    continue
                 bucket = mapping.setdefault(symbol, [])
                 if theme_key not in bucket:
                     bucket.append(str(theme_key))
+    if mapping:
+        return mapping
+    default_mapping = build_default_symbol_theme_map(active_symbols)
+    if default_mapping:
+        return default_mapping
     return mapping
 
 
-def theme_tags_for_symbol(symbol: str, symbol_theme_map: dict[str, list[str]]) -> list[str]:
-    return [display_theme_name(theme_key) for theme_key in symbol_theme_map.get(symbol.upper(), [])]
+def theme_tags_for_symbol(
+    symbol: str,
+    symbol_theme_map: dict[str, list[str]],
+    theme_display_name_map: dict[str, str] | None = None,
+) -> list[str]:
+    return [
+        display_theme_name(theme_key, theme_display_name_map)
+        for theme_key in symbol_theme_map.get(symbol.upper(), [])
+    ]
 
 
 def build_theme_memberships(symbol_theme_map: dict[str, list[str]]) -> dict[str, set[str]]:
@@ -100,6 +260,7 @@ def summarize_symbol_theme_context(
 def build_theme_snapshot_rows(
     *,
     symbol_theme_map: dict[str, list[str]],
+    theme_display_name_map: dict[str, str] | None = None,
     card_diagnostics: list[dict[str, Any]],
     prewatch_candidates: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -111,7 +272,7 @@ def build_theme_snapshot_rows(
         if row is None:
             row = {
                 "theme_key": theme_key,
-                "theme_name": display_theme_name(theme_key),
+                "theme_name": display_theme_name(theme_key, theme_display_name_map),
                 "confirmed_symbols": set(),
                 "promoted_symbols": set(),
                 "sent_symbols": set(),

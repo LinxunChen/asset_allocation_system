@@ -2,3 +2,8 @@ __pycache__/
 .venv/
 *.pyc
 data/
+.codex/
+config/satellite_agent/.env.local
+config/.env.local
+config/satellite_agent/agent.json.bak_watchlist_only
+config/satellite_agent/batch_replay.local.json

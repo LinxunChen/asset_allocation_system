@@ -48,6 +48,22 @@ def make_card(final_score: float) -> OpportunityCard:
         priority="high",
         dedup_key="NVDA:evt-1:earnings:swing",
         bias="long",
+        display_name="NVIDIA",
+        action_label="确认做多",
+        confidence_label="高",
+        chain_summary="2天前加入观察 -> 今日确认做多",
+        llm_summary="NVIDIA 相关财报与需求信息继续强化，短线情绪仍偏正面。",
+        llm_impact_inference="若量能继续配合，市场可能继续交易 AI 服务器需求强化。",
+        llm_reasoning="事件催化和量价配合共振，当前更像是顺趋势的二次确认。",
+        llm_uncertainty="如果开盘后量能衰减，冲高回落风险会明显抬升。",
+        market_regime="risk_off",
+        rate_risk="high",
+        macro_penalty_applied=12.0,
+        macro_action_before_overlay="确认做多",
+        macro_overlay_note="宏观风险覆盖已生效：综合分下调 12.0 分，动作由「确认做多」降为「试探建仓」",
+        relative_volume=1.85,
+        trend_state="bullish",
+        rsi_14=63.2,
     )
 
 
@@ -71,8 +87,21 @@ class NotifierTests(unittest.TestCase):
         payload = transport._build_interactive_payload(make_card(91.5))
         self.assertEqual(payload["msg_type"], "interactive")
         self.assertEqual(payload["card"]["header"]["template"], "red")
-        self.assertIn("NVDA", payload["card"]["header"]["title"]["content"])
+        self.assertIn("NVIDIA", payload["card"]["header"]["title"]["content"])
         self.assertIn("确认做多", payload["card"]["header"]["title"]["content"])
+        self.assertNotIn("高优先级", payload["card"]["header"]["title"]["content"])
+        first_block = payload["card"]["elements"][0]["text"]["content"]
+        self.assertIn("链路", first_block)
+        self.assertIn("正式操作卡", first_block)
+        event_block = payload["card"]["elements"][2]["text"]["content"]
+        self.assertIn("事件倾向", event_block)
+        self.assertIn("事实摘要", event_block)
+        market_block = payload["card"]["elements"][4]["text"]["content"]
+        self.assertIn("宏观覆盖", market_block)
+        note_text = payload["card"]["elements"][-2]["elements"][0]["content"]
+        self.assertIn("来源：example.com", note_text)
+        signal_heading = payload["card"]["elements"][5]["text"]["content"]
+        self.assertIn("信号评分", signal_heading)
         ratio_field = next(
             field["text"]["content"]
             for element in payload["card"]["elements"]
@@ -82,6 +111,41 @@ class NotifierTests(unittest.TestCase):
         )
         self.assertIn("偏弱", ratio_field)
         self.assertIn("1.00", ratio_field)
+        score_field = next(
+            field["text"]["content"]
+            for element in payload["card"]["elements"]
+            if element.get("tag") == "div"
+            for field in element.get("fields", [])
+            if "事件分" in field["text"]["content"]
+        )
+        self.assertIn("强催化", score_field)
+        self.assertIn("消息本身强度高", score_field)
+        trend_field = next(
+            field["text"]["content"]
+            for element in payload["card"]["elements"]
+            if element.get("tag") == "div"
+            for field in element.get("fields", [])
+            if "结构状态" in field["text"]["content"]
+        )
+        self.assertIn("价格结构仍偏强", trend_field)
+        bias_field = next(
+            field["text"]["content"]
+            for element in payload["card"]["elements"]
+            if element.get("tag") == "div"
+            for field in element.get("fields", [])
+            if "事件倾向" in field["text"]["content"]
+        )
+        self.assertIn("偏利多", bias_field)
+        self.assertIn("偏正面", bias_field)
+        macro_field = next(
+            field["text"]["content"]
+            for element in payload["card"]["elements"]
+            if element.get("tag") == "div"
+            for field in element.get("fields", [])
+            if "宏观覆盖" in field["text"]["content"]
+        )
+        self.assertIn("综合分下调 12.0 分", macro_field)
+        self.assertIn("环境分压制：-12.0", macro_field)
         self.assertEqual(payload["card"]["elements"][-1]["tag"], "action")
         self.assertEqual(payload["card"]["elements"][-1]["actions"][0]["url"], "https://example.com")
 
@@ -90,18 +154,38 @@ class NotifierTests(unittest.TestCase):
         card = make_card(84.0)
         card.market_data_complete = False
         card.market_data_note = "行情快照暂不可用，仅基于事件强度提醒。"
+        card.action_label = "加入观察"
         payload = transport._build_interactive_payload(card)
-        self.assertIn("事件强提醒", payload["card"]["header"]["title"]["content"])
-        content_text = payload["card"]["elements"][0]["text"]["content"]
-        self.assertIn("行情状态", content_text)
-        price_section = next(
-            field["text"]["content"]
-            for element in payload["card"]["elements"]
-            if element.get("tag") == "div"
-            for field in element.get("fields", [])
-            if "价格计划" in field["text"]["content"]
-        )
-        self.assertIn("未自动生成入场/止盈/失效价", price_section)
+        self.assertIn("加入观察", payload["card"]["header"]["title"]["content"])
+        overview_text = payload["card"]["elements"][0]["text"]["content"]
+        self.assertIn("预备池观察", overview_text)
+        market_text = payload["card"]["elements"][4]["text"]["content"]
+        self.assertIn("行情状态", market_text)
+        plan_heading = payload["card"]["elements"][9]["text"]["content"]
+        self.assertIn("观察计划", plan_heading)
+        plan_text = payload["card"]["elements"][11]["text"]["content"]
+        self.assertIn("关注重点", plan_text)
+        self.assertIn("升级触发", plan_text)
+        self.assertIn("量能继续配合", plan_text)
+
+    def test_watch_card_title_does_not_repeat_observation_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = Store(Path(temp_dir) / "test.db")
+            store.initialize()
+            notifier = Notifier(store=store, transport=None, dry_run=True)
+            card = make_card(84.0)
+            card.action_label = "加入观察"
+            title = notifier._title(card)
+            self.assertEqual(title, "NVIDIA（NVDA） | 加入观察 | 财报事件")
+
+    def test_formal_card_title_does_not_append_priority_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = Store(Path(temp_dir) / "test.db")
+            store.initialize()
+            notifier = Notifier(store=store, transport=None, dry_run=True)
+            card = make_card(91.5)
+            title = notifier._title(card)
+            self.assertEqual(title, "NVIDIA（NVDA） | 确认做多 | 财报事件")
 
     def test_no_transport_uses_explicit_reason(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -119,6 +203,29 @@ class NotifierTests(unittest.TestCase):
             notifier = Notifier(store=store, transport=None, dry_run=True)
             body = notifier._body(make_card(76.0))
             self.assertIn("预期盈亏比：偏弱（1.00）", body)
+            self.assertIn("NVIDIA（NVDA）", body)
+            self.assertIn("相对量能", body)
+            self.assertIn("链路：2天前加入观察 -> 今日确认做多", body)
+            self.assertIn("结构状态：多头（结构向上）（代表价格结构仍偏强", body)
+            self.assertIn("事件倾向：偏利多（代表事件内容整体偏正面", body)
+            self.assertIn("宏观覆盖：宏观风险覆盖已生效：综合分下调 12.0 分", body)
+            self.assertIn("事件分：80.00（强催化，代表消息本身强度高", body)
+
+    def test_plain_text_watch_card_uses_observation_specific_labels(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = Store(Path(temp_dir) / "test.db")
+            store.initialize()
+            notifier = Notifier(store=store, transport=None, dry_run=True)
+            card = make_card(76.0)
+            card.market_data_complete = False
+            card.action_label = "加入观察"
+            card.reason_to_watch = "先盯合作细节和订单金额是否继续落地。"
+            card.positioning_hint = "当前先放入观察名单，不追价。"
+            body = notifier._body(card)
+            self.assertIn("为什么现在先观察", body)
+            self.assertIn("当前处理：当前先放入观察名单，不追价。", body)
+            self.assertIn("关注重点：先盯合作细节和订单金额是否继续落地。", body)
+            self.assertIn("升级触发：若量能继续配合", body)
 
     def test_skip_records_explicit_reason(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

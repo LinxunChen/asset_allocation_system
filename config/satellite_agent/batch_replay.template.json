@@ -1,38 +1,126 @@
 {
-  "replay_path": "../tests/fixtures/events.jsonl",
-  "days": 14,
+  "replay_path": "../../tests/fixtures/events.jsonl",
+  "days": 30,
   "limit": 10,
   "recommendation": {
     "weights": {
-      "alerts_sent": 4.0,
-      "cards_generated": 2.0,
-      "events_processed": 1.0,
-      "strictness": 0.75,
-      "priority_proximity": 0.25,
+      "avg_realized_return": 5.0,
+      "win_rate": 2.5,
+      "max_drawdown": 1.5,
+      "profit_loss_ratio": 1.5,
+      "avg_t_plus_7_return": 1.0,
       "failures": 3.0
     }
   },
   "experiments": [
     {
-      "name": "baseline",
-      "note": "default thresholds",
+      "name": "rules_only",
+      "note": "纯规则基线",
       "overrides": {
         "event_score_threshold": 60.0,
+        "event_score_weights": {
+          "importance": 0.3,
+          "source_credibility": 0.25,
+          "novelty": 0.2,
+          "theme_relevance": 0.15,
+          "sentiment": 0.1
+        },
         "swing_market_score_threshold": 55.0,
         "position_market_score_threshold": 55.0,
         "swing_priority_threshold": 75.0,
-        "position_priority_threshold": 75.0
+        "position_priority_threshold": 75.0,
+        "use_llm_event_extraction": false,
+        "use_llm_narration": false,
+        "use_llm_ranking_assist": false,
+        "use_macro_risk_overlay": false
       }
     },
     {
-      "name": "tuned",
-      "note": "stricter confirmation",
+      "name": "rules_plus_llm_extraction",
+      "note": "规则 + LLM特征抽取",
       "overrides": {
-        "event_score_threshold": 65.0,
-        "swing_market_score_threshold": 58.0,
-        "position_market_score_threshold": 60.0,
-        "swing_priority_threshold": 78.0,
-        "position_priority_threshold": 80.0
+        "event_score_threshold": 60.0,
+        "event_score_weights": {
+          "importance": 0.3,
+          "source_credibility": 0.25,
+          "novelty": 0.2,
+          "theme_relevance": 0.15,
+          "sentiment": 0.1
+        },
+        "swing_market_score_threshold": 55.0,
+        "position_market_score_threshold": 55.0,
+        "swing_priority_threshold": 75.0,
+        "position_priority_threshold": 75.0,
+        "use_llm_event_extraction": true,
+        "use_llm_narration": true,
+        "use_llm_ranking_assist": false,
+        "use_macro_risk_overlay": false
+      }
+    },
+    {
+      "name": "rules_plus_llm_extraction_and_ranking",
+      "note": "规则 + LLM特征抽取 + 排序辅助",
+      "overrides": {
+        "event_score_threshold": 60.0,
+        "event_score_weights": {
+          "importance": 0.3,
+          "source_credibility": 0.25,
+          "novelty": 0.2,
+          "theme_relevance": 0.15,
+          "sentiment": 0.1
+        },
+        "swing_market_score_threshold": 55.0,
+        "position_market_score_threshold": 55.0,
+        "swing_priority_threshold": 75.0,
+        "position_priority_threshold": 75.0,
+        "use_llm_event_extraction": true,
+        "use_llm_narration": true,
+        "use_llm_ranking_assist": true,
+        "use_macro_risk_overlay": false
+      }
+    },
+    {
+      "name": "rules_plus_macro_overlay",
+      "note": "纯规则 + 宏观风险覆盖层（隔离宏观覆盖层单独效果）",
+      "overrides": {
+        "event_score_threshold": 60.0,
+        "event_score_weights": {
+          "importance": 0.3,
+          "source_credibility": 0.25,
+          "novelty": 0.2,
+          "theme_relevance": 0.15,
+          "sentiment": 0.1
+        },
+        "swing_market_score_threshold": 55.0,
+        "position_market_score_threshold": 55.0,
+        "swing_priority_threshold": 75.0,
+        "position_priority_threshold": 75.0,
+        "use_llm_event_extraction": false,
+        "use_llm_narration": false,
+        "use_llm_ranking_assist": false,
+        "use_macro_risk_overlay": true
+      }
+    },
+    {
+      "name": "rules_plus_llm_extraction_and_macro_overlay",
+      "note": "规则 + LLM特征抽取 + 宏观风险覆盖层",
+      "overrides": {
+        "event_score_threshold": 60.0,
+        "event_score_weights": {
+          "importance": 0.3,
+          "source_credibility": 0.25,
+          "novelty": 0.2,
+          "theme_relevance": 0.15,
+          "sentiment": 0.1
+        },
+        "swing_market_score_threshold": 55.0,
+        "position_market_score_threshold": 55.0,
+        "swing_priority_threshold": 75.0,
+        "position_priority_threshold": 75.0,
+        "use_llm_event_extraction": true,
+        "use_llm_narration": false,
+        "use_llm_ranking_assist": false,
+        "use_macro_risk_overlay": true
       }
     }
   ]

@@ -146,6 +146,19 @@ class OpportunityCard:
     relative_volume: Optional[float] = None
     theme_tags: List[str] = field(default_factory=list)
     confirmed_peer_symbols: List[str] = field(default_factory=list)
+    chain_summary: str = ""
+    llm_summary: str = ""
+    llm_impact_inference: str = ""
+    llm_reasoning: str = ""
+    llm_uncertainty: str = ""
+    market_regime: str = ""
+    rate_risk: str = ""
+    geopolitical_risk: str = ""
+    macro_risk_score: float = 0.0
+    macro_penalty_applied: float = 0.0
+    macro_action_before_overlay: str = ""
+    macro_overlay_note: str = ""
+    narrative_priority_adjustment: float = 0.0
     market_data_complete: bool = True
     market_data_note: str = ""
     promoted_from_prewatch: bool = False

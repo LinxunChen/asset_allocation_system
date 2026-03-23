@@ -9,6 +9,7 @@ from ..config import Settings
 from ..models import OpportunityCard, PrewatchCandidate, utcnow
 from ..store import Store
 from ..theme_linkage import (
+    build_theme_display_name_map_from_watchlist_payload,
     build_symbol_theme_map_from_watchlist_payload,
     build_theme_memberships,
     display_theme_name,
@@ -38,6 +39,7 @@ class ThemeUnderstandingEngine(Protocol):
 class StaticThemeUnderstandingEngine:
     symbol_theme_map: dict[str, list[str]]
     theme_memberships: dict[str, set[str]]
+    theme_display_name_map: dict[str, str]
 
     @classmethod
     def from_watchlist_payload(cls, watchlist_payload: dict | None) -> "StaticThemeUnderstandingEngine":
@@ -45,6 +47,7 @@ class StaticThemeUnderstandingEngine:
         return cls(
             symbol_theme_map=symbol_theme_map,
             theme_memberships=build_theme_memberships(symbol_theme_map),
+            theme_display_name_map=build_theme_display_name_map_from_watchlist_payload(watchlist_payload),
         )
 
     def assess_confirmation(self, card: OpportunityCard, *, confirmed_symbols: set[str]) -> ThemeAssessment:
@@ -66,7 +69,7 @@ class StaticThemeUnderstandingEngine:
             note = ""
             role = "standalone"
         return ThemeAssessment(
-            theme_ids=theme_tags_for_symbol(card.symbol, self.symbol_theme_map),
+            theme_ids=theme_tags_for_symbol(card.symbol, self.symbol_theme_map, self.theme_display_name_map),
             theme_heat=float(len(context["confirmed_peer_symbols"]) * 2 + len(context["peer_symbols"])),
             theme_role=role,
             confirmed_peers=list(context["confirmed_peer_symbols"]),
@@ -96,7 +99,7 @@ class StaticThemeUnderstandingEngine:
             role = "clustered"
             boosts["prewatch_cluster"] = 2.5
         return ThemeAssessment(
-            theme_ids=theme_tags_for_symbol(candidate.symbol, self.symbol_theme_map),
+            theme_ids=theme_tags_for_symbol(candidate.symbol, self.symbol_theme_map, self.theme_display_name_map),
             theme_heat=float(len(context["confirmed_peer_symbols"]) * 2 + len(context["prewatch_peer_symbols"])),
             theme_role=role,
             confirmed_peers=list(context["confirmed_peer_symbols"]),
@@ -166,7 +169,7 @@ class HybridThemeUnderstandingEngine(StaticThemeUnderstandingEngine):
             strongest_heat,
             getattr(self.settings, "prewatch_theme_memory_bonus", 3.0),
         )
-        note = assessment.theme_chain_note or f"题材近期持续活跃：{display_theme_name(strongest_key)}"
+        note = assessment.theme_chain_note or f"题材近期持续活跃：{display_theme_name(strongest_key, self.theme_display_name_map)}"
         return ThemeAssessment(
             theme_ids=assessment.theme_ids,
             theme_heat=assessment.theme_heat + strongest_heat,

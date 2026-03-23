@@ -91,7 +91,7 @@
 
 正式配置文件是：
 
-- [agent.json](/Users/linxun/CodeSpace/asset_allocation_system/config/agent.json)
+- [agent.json](/Users/linxun/CodeSpace/asset_allocation_system/config/satellite_agent/agent.json)
 
 内部会把观察池拆成：
 
@@ -306,7 +306,7 @@ Google News 不是全市场扫新闻再归因，而是：
 
 详见：
 
-- [scoring_guide.zh-CN.md](/Users/linxun/CodeSpace/asset_allocation_system/docs/scoring_guide.zh-CN.md)
+- [scoring_guide.zh-CN.md](/Users/linxun/CodeSpace/asset_allocation_system/docs/satellite_agent/scoring_guide.zh-CN.md)
 
 ### 2. 市场层
 
