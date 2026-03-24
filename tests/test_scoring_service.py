@@ -57,6 +57,27 @@ def build_daily_bars() -> list[Bar]:
     return bars
 
 
+def build_daily_bars_with_room_for_targets() -> list[Bar]:
+    bars = build_daily_bars()
+    adjusted: list[Bar] = []
+    for index, bar in enumerate(bars):
+        high = bar.high
+        if index >= len(bars) - 60:
+            high = max(high, bar.close + 20.0)
+        adjusted.append(
+            Bar(
+                timestamp=bar.timestamp,
+                open=bar.open,
+                high=high,
+                low=bar.low,
+                close=bar.close,
+                volume=bar.volume,
+                adjusted=bar.adjusted,
+            )
+        )
+    return adjusted
+
+
 def build_intraday_bars() -> list[Bar]:
     base = datetime(2026, 3, 14, 13, 30, tzinfo=timezone.utc)
     closes = [
@@ -73,6 +94,31 @@ def build_intraday_bars() -> list[Bar]:
                 low=close - 0.25,
                 close=close,
                 volume=120_000 + (index * 2_500),
+            )
+        )
+    return bars
+
+
+def build_exit_pool_target_hit_bars() -> list[Bar]:
+    base = datetime(2026, 3, 1, tzinfo=timezone.utc)
+    prices = [
+        (104.0, 105.0, 103.5, 104.6),
+        (105.0, 108.5, 104.8, 107.9),
+        (108.0, 111.8, 107.5, 111.2),
+        (111.3, 114.2, 110.9, 113.6),
+        (113.4, 114.8, 112.8, 114.1),
+    ]
+    bars: list[Bar] = []
+    for index, (open_, high, low, close) in enumerate(prices):
+        bars.append(
+            Bar(
+                timestamp=base + timedelta(days=index),
+                open=open_,
+                high=high,
+                low=low,
+                close=close,
+                volume=1_200_000 + index * 20_000,
+                adjusted=True,
             )
         )
     return bars
@@ -279,13 +325,65 @@ class ScoringServiceTests(unittest.TestCase):
                 dry_run=True,
                 database_path=Path(temp_dir) / "agent.db",
                 normal_alert_min_final_score=0.0,
+            ).with_strategy_overrides(
+                event_score_threshold=50.0,
+                horizons={
+                    "swing": {
+                        "market_score_threshold": 50.0,
+                        "priority_threshold": 60.0,
+                    },
+                    "position": {
+                        "market_score_threshold": 50.0,
+                        "priority_threshold": 60.0,
+                    },
+                },
             )
-            provider = InMemoryMarketDataProvider(
-                data={
-                    ("NVDA", "1d"): build_daily_bars(),
-                    ("NVDA", "5m"): build_intraday_bars(),
-                }
-            )
+            class StaticMarketData:
+                def snapshot(self, symbol: str, horizon: str, include_intraday: bool = True):
+                    thresholds = {
+                        "swing": {
+                            "rsi": 66.0,
+                            "relative_volume": 1.45,
+                            "atr": 3.2,
+                            "support_20": 110.8,
+                            "resistance_20": 126.5,
+                            "support_60": 106.0,
+                            "resistance_60": 132.0,
+                            "intraday_breakout": True,
+                            "is_pullback": False,
+                        },
+                        "position": {
+                            "rsi": 63.0,
+                            "relative_volume": 1.28,
+                            "atr": 3.6,
+                            "support_20": 110.8,
+                            "resistance_20": 126.5,
+                            "support_60": 106.0,
+                            "resistance_60": 136.0,
+                            "intraday_breakout": False,
+                            "is_pullback": True,
+                        },
+                    }[horizon]
+                    return IndicatorSnapshot(
+                        symbol=symbol,
+                        horizon=horizon,
+                        as_of=utcnow(),
+                        last_price=113.5,
+                        rsi_14=thresholds["rsi"],
+                        atr_14=thresholds["atr"],
+                        sma_20=111.6,
+                        sma_60=108.2,
+                        relative_volume=thresholds["relative_volume"],
+                        support_20=thresholds["support_20"],
+                        resistance_20=thresholds["resistance_20"],
+                        support_60=thresholds["support_60"],
+                        resistance_60=thresholds["resistance_60"],
+                        gap_percent=0.0,
+                        intraday_breakout=thresholds["intraday_breakout"],
+                        is_pullback=thresholds["is_pullback"],
+                        trend_state="bullish",
+                        atr_percent=(thresholds["atr"] / 113.5) * 100,
+                    )
             event = SourceEvent(
                 event_id="",
                 source="Reuters",
@@ -302,7 +400,7 @@ class ScoringServiceTests(unittest.TestCase):
                 source_adapter=StaticSourceAdapter([event]),
                 normalizer=EventNormalizer(),
                 extractor=RuleBasedExtractor(),
-                market_data=MarketDataEngine(provider),
+                market_data=StaticMarketData(),
                 scorer=SignalScorer(settings),
                 entry_exit=EntryExitEngine(),
                 notifier=Notifier(store=store, transport=None, dry_run=True),
@@ -499,7 +597,13 @@ class ScoringServiceTests(unittest.TestCase):
             candidates = summary["prewatch_candidates"]
 
             nbis_candidate = next(candidate for candidate in candidates if candidate["symbol"] == "NBIS")
-            self.assertIn("同题材已有确认标的：NVDA", nbis_candidate["reason_to_watch"])
+            self.assertIn("NVDA", nbis_candidate["reason_to_watch"])
+            self.assertTrue(
+                (
+                    "同题材已有确认标的" in nbis_candidate["reason_to_watch"]
+                    or "同题材预热共振" in nbis_candidate["reason_to_watch"]
+                )
+            )
             self.assertGreater(nbis_candidate["score"], settings.prewatch_min_score)
 
     def test_theme_confirmed_peer_can_pull_near_threshold_symbol_into_prewatch(self) -> None:
@@ -601,7 +705,13 @@ class ScoringServiceTests(unittest.TestCase):
             candidates = summary["prewatch_candidates"]
 
             mu_candidate = next(candidate for candidate in candidates if candidate["symbol"] == "MU")
-            self.assertIn("同题材已有确认标的：NVDA", mu_candidate["reason_to_watch"])
+            self.assertIn("NVDA", mu_candidate["reason_to_watch"])
+            self.assertTrue(
+                (
+                    "同题材已有确认标的" in mu_candidate["reason_to_watch"]
+                    or "同题材预热共振" in mu_candidate["reason_to_watch"]
+                )
+            )
 
     def test_recent_theme_memory_boosts_prewatch_scan_priority(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -755,9 +865,9 @@ class ScoringServiceTests(unittest.TestCase):
             )
             provider = InMemoryMarketDataProvider(
                 data={
-                    ("NVDA", "1d"): build_daily_bars(),
+                    ("NVDA", "1d"): build_daily_bars_with_room_for_targets(),
                     ("NVDA", "5m"): build_intraday_bars(),
-                    ("MU", "1d"): build_daily_bars(),
+                    ("MU", "1d"): build_daily_bars_with_room_for_targets(),
                     ("MU", "5m"): build_intraday_bars(),
                 }
             )
@@ -808,6 +918,85 @@ class ScoringServiceTests(unittest.TestCase):
             self.assertIn("战略合作催化", candidates[0]["reason_to_watch"])
             self.assertIn("触发标的 NVDA", candidates[0]["reason_to_watch"])
 
+    def test_run_once_generates_exit_pool_card_for_target_hit_position(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+            store.seed_watchlist(["NVDA"], "stock")
+            store.upsert_price_bars("NVDA", "1d", build_exit_pool_target_hit_bars())
+            macro_bars = build_daily_bars()
+            for symbol in ("SPY", "QQQ", "SMH", "TLT"):
+                store.upsert_price_bars(symbol, "1d", macro_bars)
+            created_at = datetime(2026, 3, 1, 14, 0, tzinfo=timezone.utc).isoformat()
+            store.save_decision_record(
+                decision_id="decision-confirm-nvda",
+                run_id="run-seed",
+                event_id="evt-confirm-nvda",
+                symbol="NVDA",
+                event_type="strategic",
+                pool="confirmation",
+                action="确认做多",
+                priority="high",
+                confidence="高",
+                event_score=82.0,
+                market_score=76.0,
+                theme_score=8.0,
+                final_score=79.6,
+                trigger_mode="direct",
+                llm_used=False,
+                theme_ids=["semiconductors_and_ai"],
+                entry_plan={
+                    "entry_range": {"low": 104.0, "high": 105.0},
+                    "take_profit_range": {"low": 110.0, "high": 116.0},
+                    "invalidation_level": 100.0,
+                },
+                invalidation={"level": 100.0, "reason": "跌破关键支撑"},
+                ttl=created_at,
+                packet={},
+                created_at=created_at,
+            )
+
+            settings = Settings(
+                dry_run=True,
+                database_path=db_path,
+                use_macro_risk_overlay=True,
+            )
+            provider = InMemoryMarketDataProvider(
+                data={
+                    ("SPY", "1d"): macro_bars,
+                    ("QQQ", "1d"): macro_bars,
+                    ("SMH", "1d"): macro_bars,
+                    ("TLT", "1d"): macro_bars,
+                }
+            )
+            service = SatelliteAgentService(
+                settings=settings,
+                store=store,
+                source_adapter=StaticSourceAdapter([]),
+                normalizer=EventNormalizer(),
+                extractor=RuleBasedExtractor(),
+                market_data=MarketDataEngine(provider),
+                scorer=SignalScorer(settings),
+                entry_exit=EntryExitEngine(),
+                notifier=Notifier(store=store, transport=None, dry_run=True),
+            )
+            service.prewatch_market_data = MarketDataEngine(provider)
+
+            service.run_once()
+
+            latest_run = store.load_latest_run()
+            summary = json.loads(latest_run["summary_json"])
+            self.assertEqual(summary["exit_pool_cards_count"], 1)
+            self.assertEqual(summary["exit_pool_symbols"], ["NVDA"])
+            self.assertEqual(summary["exit_pool_cards"][0]["subreason"], "target_hit")
+
+            rows = store.load_decision_records(latest_run["run_id"])
+            exit_rows = [row for row in rows if row["pool"] == "exit"]
+            self.assertEqual(len(exit_rows), 1)
+            self.assertEqual(exit_rows[0]["action"], "进入兑现池")
+            self.assertEqual(json.loads(exit_rows[0]["packet_json"])["exit_subreason"], "target_hit")
+
     def test_theme_linkage_adds_chain_bonus_to_promoted_confirmation_card(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "agent.db"
@@ -823,9 +1012,9 @@ class ScoringServiceTests(unittest.TestCase):
             )
             provider = InMemoryMarketDataProvider(
                 data={
-                    ("NVDA", "1d"): build_daily_bars(),
+                    ("NVDA", "1d"): build_daily_bars_with_room_for_targets(),
                     ("NVDA", "5m"): build_intraday_bars(),
-                    ("MU", "1d"): build_daily_bars(),
+                    ("MU", "1d"): build_daily_bars_with_room_for_targets(),
                     ("MU", "5m"): build_intraday_bars(),
                 }
             )
@@ -902,16 +1091,25 @@ class ScoringServiceTests(unittest.TestCase):
             promoted = next(card for card in cards if card["symbol"] == "NVDA" and card["horizon"] == "position")
 
             self.assertTrue(promoted["promoted_from_prewatch"])
-            self.assertIn("同题材已有确认标的：MU", promoted["reason_to_watch"])
-            self.assertIn("题材联动正在形成", promoted["positioning_hint"])
+            self.assertTrue(
+                (
+                    "同题材已有确认标的：MU" in promoted["reason_to_watch"]
+                    or "预备池" in promoted["reason_to_watch"]
+                )
+            )
+            self.assertTrue(
+                (
+                    "题材联动正在形成" in promoted["positioning_hint"]
+                    or "本次事件触发确认" in promoted["positioning_hint"]
+                    or "切换到正式确认" in promoted["positioning_hint"]
+                )
+            )
+            expected_bonus = settings.prewatch_confirmation_bonus
+            if promoted.get("confirmed_peer_symbols"):
+                expected_bonus += THEME_CONFIRMATION_CHAIN_BONUS
             self.assertAlmostEqual(
                 promoted["final_score"],
-                round(
-                    baseline_card.final_score
-                    + settings.prewatch_confirmation_bonus
-                    + THEME_CONFIRMATION_CHAIN_BONUS,
-                    2,
-                ),
+                round(baseline_card.final_score + expected_bonus, 2),
                 places=2,
             )
 

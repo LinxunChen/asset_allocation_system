@@ -316,7 +316,8 @@ class DecisionOutcomeTests(unittest.TestCase):
             self.assertFalse(outcome.hit_invalidation)
             self.assertIsNotNone(outcome.t_plus_3_return)
             self.assertEqual(outcome.t_plus_10_return, 10.78)
-            self.assertEqual(outcome.close_reason, "hit_take_profit")
+            self.assertEqual(outcome.close_reason, "exit_pool")
+            self.assertEqual(outcome.exit_subreason, "target_hit")
             self.assertGreater(outcome.max_runup or 0, 0)
 
     def test_compute_decision_outcome_falls_back_to_recorded_price_plan(self) -> None:
@@ -354,7 +355,8 @@ class DecisionOutcomeTests(unittest.TestCase):
             self.assertTrue(outcome.entered)
             self.assertTrue(outcome.hit_take_profit)
             self.assertFalse(outcome.hit_invalidation)
-            self.assertEqual(outcome.close_reason, "hit_take_profit")
+            self.assertEqual(outcome.close_reason, "exit_pool")
+            self.assertEqual(outcome.exit_subreason, "target_hit")
 
     def test_compute_decision_outcome_does_not_enter_when_bar_opens_below_invalidation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -488,7 +490,8 @@ class DecisionOutcomeTests(unittest.TestCase):
 
             self.assertEqual(payload["updated"], 1)
             self.assertEqual(payload["skipped"], 0)
-            self.assertEqual(row["close_reason"], "hit_take_profit")
+            self.assertEqual(row["close_reason"], "exit_pool")
+            self.assertEqual(row["exit_subreason"], "target_hit")
             self.assertEqual(row["t_plus_10_return"], 10.78)
             self.assertIsNotNone(row["max_runup"])
 

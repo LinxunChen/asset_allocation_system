@@ -1416,6 +1416,14 @@ def serialize_llm_usage_report_payload(
     end_at: str,
     rows: dict[str, list[object]],
 ) -> dict[str, Any]:
+    llm_input_token_price_per_k = 0.0004
+    llm_output_token_price_per_k = 0.0032
+
+    def _estimated_cost(input_tokens: int, output_tokens: int) -> float:
+        return (input_tokens / 1000.0) * llm_input_token_price_per_k + (
+            output_tokens / 1000.0
+        ) * llm_output_token_price_per_k
+
     def _normalize_row(row: object) -> dict[str, Any]:
         return normalize_timestamp_fields(dict(row)) if row is not None else {}
 
@@ -1426,25 +1434,52 @@ def serialize_llm_usage_report_payload(
     top_reason_rows = [_normalize_row(row) for row in rows.get("top_reasons", [])]
     recent_call_rows = [_normalize_row(row) for row in rows.get("recent_calls", [])]
     summary = summary_rows[0] if summary_rows else {}
-    total_tokens = int(summary.get("prompt_tokens", 0) or 0) + int(summary.get("completion_tokens", 0) or 0)
+    input_tokens = int(summary.get("prompt_tokens", 0) or 0)
+    output_tokens = int(summary.get("completion_tokens", 0) or 0)
+    total_tokens = input_tokens + output_tokens
+    summary["input_tokens"] = input_tokens
+    summary["output_tokens"] = output_tokens
     summary["total_tokens"] = total_tokens
+    summary["estimated_cost"] = _estimated_cost(input_tokens, output_tokens)
     for row in by_day_rows:
-        row["total_tokens"] = int(row.get("prompt_tokens", 0) or 0) + int(row.get("completion_tokens", 0) or 0)
+        input_tokens = int(row.get("prompt_tokens", 0) or 0)
+        output_tokens = int(row.get("completion_tokens", 0) or 0)
+        row["input_tokens"] = input_tokens
+        row["output_tokens"] = output_tokens
+        row["total_tokens"] = input_tokens + output_tokens
+        row["estimated_cost"] = _estimated_cost(input_tokens, output_tokens)
     for row in by_component_rows:
         row["component_display"] = _display_llm_component(str(row.get("component", "")))
-        row["total_tokens"] = int(row.get("prompt_tokens", 0) or 0) + int(row.get("completion_tokens", 0) or 0)
+        input_tokens = int(row.get("prompt_tokens", 0) or 0)
+        output_tokens = int(row.get("completion_tokens", 0) or 0)
+        row["input_tokens"] = input_tokens
+        row["output_tokens"] = output_tokens
+        row["total_tokens"] = input_tokens + output_tokens
+        row["estimated_cost"] = _estimated_cost(input_tokens, output_tokens)
     for row in by_model_rows:
-        row["total_tokens"] = int(row.get("prompt_tokens", 0) or 0) + int(row.get("completion_tokens", 0) or 0)
+        input_tokens = int(row.get("prompt_tokens", 0) or 0)
+        output_tokens = int(row.get("completion_tokens", 0) or 0)
+        row["input_tokens"] = input_tokens
+        row["output_tokens"] = output_tokens
+        row["total_tokens"] = input_tokens + output_tokens
+        row["estimated_cost"] = _estimated_cost(input_tokens, output_tokens)
     for row in top_reason_rows:
         row["component_display"] = _display_llm_component(str(row.get("component", "")))
     for row in recent_call_rows:
         row["component_display"] = _display_llm_component(str(row.get("component", "")))
-        row["total_tokens"] = int(row.get("prompt_tokens_estimate", 0) or 0) + int(
-            row.get("completion_tokens_estimate", 0) or 0
-        )
+        input_tokens = int(row.get("prompt_tokens_estimate", 0) or 0)
+        output_tokens = int(row.get("completion_tokens_estimate", 0) or 0)
+        row["input_tokens"] = input_tokens
+        row["output_tokens"] = output_tokens
+        row["total_tokens"] = input_tokens + output_tokens
+        row["estimated_cost"] = _estimated_cost(input_tokens, output_tokens)
     return {
         "start_at": start_at,
         "end_at": end_at,
+        "pricing": {
+            "input_price_per_k": llm_input_token_price_per_k,
+            "output_price_per_k": llm_output_token_price_per_k,
+        },
         "summary": summary,
         "by_day": by_day_rows,
         "by_component": by_component_rows,
@@ -1471,9 +1506,10 @@ def format_llm_usage_report_payload(payload: dict[str, Any]) -> str:
         f"- 成功调用数：{int(summary.get('success_calls', 0) or 0)}",
         f"- 失败回退数：{int(summary.get('failed_calls', 0) or 0)}",
         f"- 跳过调用数：{int(summary.get('skipped_calls', 0) or 0)}",
-        f"- Prompt token：{int(summary.get('prompt_tokens', 0) or 0)}",
-        f"- Completion token：{int(summary.get('completion_tokens', 0) or 0)}",
+        f"- 输入 token：{int(summary.get('input_tokens', 0) or 0)}",
+        f"- 输出 token：{int(summary.get('output_tokens', 0) or 0)}",
         f"- 总 token：{int(summary.get('total_tokens', 0) or 0)}",
+        f"- 预估成本：¥{float(summary.get('estimated_cost', 0.0) or 0.0):.6f}",
         f"- 平均延迟：{round(float(summary.get('avg_latency_ms') or 0.0), 1)} ms",
         f"- 最大延迟：{int(summary.get('max_latency_ms', 0) or 0)} ms",
     ]
@@ -1484,7 +1520,9 @@ def format_llm_usage_report_payload(payload: dict[str, Any]) -> str:
                 f"- {row.get('usage_date', '-')}"
                 f"：调用 {int(row.get('llm_calls', 0) or 0)}，成功 {int(row.get('success_calls', 0) or 0)}，"
                 f"失败 {int(row.get('failed_calls', 0) or 0)}，跳过 {int(row.get('skipped_calls', 0) or 0)}，"
-                f"总 token {int(row.get('total_tokens', 0) or 0)}，平均延迟 {round(float(row.get('avg_latency_ms') or 0.0), 1)} ms"
+                f"输入 token {int(row.get('input_tokens', 0) or 0)}，输出 token {int(row.get('output_tokens', 0) or 0)}，"
+                f"总 token {int(row.get('total_tokens', 0) or 0)}，预估成本 ¥{float(row.get('estimated_cost', 0.0) or 0.0):.6f}，"
+                f"平均延迟 {round(float(row.get('avg_latency_ms') or 0.0), 1)} ms"
             )
     else:
         lines.append("- 暂无数据")
@@ -1495,7 +1533,9 @@ def format_llm_usage_report_payload(payload: dict[str, Any]) -> str:
                 f"- {row.get('component_display', row.get('component', '-'))}"
                 f"：调用 {int(row.get('llm_calls', 0) or 0)}，成功 {int(row.get('success_calls', 0) or 0)}，"
                 f"失败 {int(row.get('failed_calls', 0) or 0)}，跳过 {int(row.get('skipped_calls', 0) or 0)}，"
-                f"总 token {int(row.get('total_tokens', 0) or 0)}，平均延迟 {round(float(row.get('avg_latency_ms') or 0.0), 1)} ms"
+                f"输入 token {int(row.get('input_tokens', 0) or 0)}，输出 token {int(row.get('output_tokens', 0) or 0)}，"
+                f"总 token {int(row.get('total_tokens', 0) or 0)}，预估成本 ¥{float(row.get('estimated_cost', 0.0) or 0.0):.6f}，"
+                f"平均延迟 {round(float(row.get('avg_latency_ms') or 0.0), 1)} ms"
             )
     else:
         lines.append("- 暂无数据")
@@ -1505,7 +1545,9 @@ def format_llm_usage_report_payload(payload: dict[str, Any]) -> str:
             lines.append(
                 f"- {row.get('model', '-')}"
                 f"：调用 {int(row.get('llm_calls', 0) or 0)}，成功 {int(row.get('success_calls', 0) or 0)}，"
-                f"失败 {int(row.get('failed_calls', 0) or 0)}，总 token {int(row.get('total_tokens', 0) or 0)}，"
+                f"失败 {int(row.get('failed_calls', 0) or 0)}，输入 token {int(row.get('input_tokens', 0) or 0)}，"
+                f"输出 token {int(row.get('output_tokens', 0) or 0)}，总 token {int(row.get('total_tokens', 0) or 0)}，"
+                f"预估成本 ¥{float(row.get('estimated_cost', 0.0) or 0.0):.6f}，"
                 f"平均延迟 {round(float(row.get('avg_latency_ms') or 0.0), 1)} ms"
             )
     else:
@@ -1528,7 +1570,9 @@ def format_llm_usage_report_payload(payload: dict[str, Any]) -> str:
                 f" | {row.get('component_display', row.get('component', '-'))}"
                 f" | {row.get('symbol', '-')}"
                 f" | {'成功' if row.get('success') else '失败/跳过'}"
+                f" | 输入 {int(row.get('input_tokens', 0) or 0)} / 输出 {int(row.get('output_tokens', 0) or 0)}"
                 f" | token {int(row.get('total_tokens', 0) or 0)}"
+                f" | ¥{float(row.get('estimated_cost', 0.0) or 0.0):.6f}"
                 f" | {row.get('reason', '-')}"
             )
     else:
@@ -1548,7 +1592,9 @@ def _format_llm_usage_snapshot_lines(payload: dict[str, Any] | None) -> list[str
         f"最近窗口：{payload.get('start_at', '-')} ~ {payload.get('end_at', '-')}",
         "  "
         f"真实调用 {summary.get('actual_calls', 0)} 次 / 失败回退 {summary.get('fallback_calls', 0)} 次 / "
-        f"跳过 {summary.get('skipped_calls', 0)} 次 / 总 token {summary.get('total_tokens', 0)}",
+        f"跳过 {summary.get('skipped_calls', 0)} 次 / 输入 token {summary.get('input_tokens', 0)} / "
+        f"输出 token {summary.get('output_tokens', 0)} / 总 token {summary.get('total_tokens', 0)} / "
+        f"预估成本 ¥{float(summary.get('estimated_cost', 0.0) or 0.0):.6f}",
     ]
     if by_component:
         parts = []
@@ -2656,10 +2702,14 @@ def _summarize_decision_outcomes(rows: list[dict[str, Any]]) -> dict[str, Any]:
     completed = sum(
         1
         for row in rows
-        if row.get("close_reason") in {"window_complete", "hit_take_profit", "hit_invalidation"}
+        if row.get("close_reason") in {"window_complete", "hit_take_profit", "exit_pool", "hit_invalidation"}
     )
     pending = sum(1 for row in rows if row.get("close_reason") == "insufficient_lookahead")
-    take_profit_hits = sum(1 for row in rows if row.get("hit_take_profit"))
+    take_profit_hits = sum(
+        1
+        for row in rows
+        if bool(row.get("hit_take_profit")) or str(row.get("close_reason") or "") in {"hit_take_profit", "exit_pool"}
+    )
     invalidation_hits = sum(1 for row in rows if row.get("hit_invalidation"))
     t_plus_3_values = [float(row["t_plus_3_return"]) for row in rows if row.get("t_plus_3_return") is not None]
     positive_t3 = sum(1 for value in t_plus_3_values if value > 0)
@@ -2906,6 +2956,24 @@ def _format_prewatch_push_lines(rows: list[dict[str, Any]], sent_symbols: list[s
     return lines
 
 
+def _format_exit_pool_lines(rows: list[dict[str, Any]]) -> list[str]:
+    if not rows:
+        return ["  本轮没有标的进入兑现池。"]
+    reason_map = {
+        "target_hit": "达标止盈",
+        "weakening_after_tp_zone": "提前锁盈",
+        "macro_protection": "宏观保护",
+    }
+    lines: list[str] = []
+    for row in rows:
+        identity = row.get("display_name") or row.get("symbol")
+        reason = reason_map.get(str(row.get("subreason") or ""), "兑现管理")
+        lines.append(f"  {identity} / {_display_horizon(str(row.get('horizon') or 'position'))} / {reason}")
+        if row.get("reason_to_watch"):
+            lines.append(f"    原因：{row['reason_to_watch']}")
+    return lines
+
+
 def _format_decision_lines(rows: list[dict[str, Any]]) -> list[str]:
     if not rows:
         return ["  本轮没有落盘的决策记录。"]
@@ -2940,6 +3008,7 @@ def _display_close_reason(value: str) -> str:
     return {
         "hit_invalidation": "触发失效位",
         "hit_take_profit": "触发止盈位",
+        "exit_pool": "兑现池退出",
         "insufficient_lookahead": "仍在等待更多 bars",
         "window_complete": "观察窗已完整",
     }.get(value, value)
@@ -2949,6 +3018,10 @@ def _format_outcome_context_line(row: dict[str, Any]) -> str | None:
     event_context = row.get("event_type_outcome_context") or {}
     pool_context = row.get("pool_outcome_context") or {}
     parts: list[str] = []
+    pool_profit_hits = max(
+        int(pool_context.get("take_profit_hits", 0) or 0),
+        int(pool_context.get("exit_pool_hits", 0) or 0),
+    )
     event_type = str(row.get("event_type") or "").strip()
     if event_context and event_type:
         parts.append(
@@ -2960,7 +3033,7 @@ def _format_outcome_context_line(row: dict[str, Any]) -> str | None:
     if pool_context and pool:
         parts.append(
             f"池子 {row.get('pool_label', pool)} T+3 均值 {pool_context.get('avg_t_plus_3_return', '-')}"
-            f"，止盈 {pool_context.get('take_profit_hits', 0)} 条"
+            f"，止盈 {pool_profit_hits} 条"
         )
     if not parts:
         return None
@@ -2990,6 +3063,7 @@ def format_run_review(
     else:
         summary = run_detail["summary"]
         prewatch_alert_symbols = summary.get("prewatch_alert_symbols", [])
+        exit_pool_cards = summary.get("exit_pool_cards", [])
         high_priority_cards = sum(int(row.get("high_priority_alerts", 0)) for row in strategy_report.get("alert_volume", []))
         sent_high_priority = sum(int(row.get("sent_high_priority_alerts", 0)) for row in strategy_report.get("alert_volume", []))
         lines.append("结论摘要：")
@@ -2998,6 +3072,8 @@ def format_run_review(
             f"本轮状态 {_display_run_status(run_detail['status'])}，健康判断为 {health['status']}；"
             f"共处理 {summary.get('events_processed', 0)} 个事件，生成 {summary.get('cards_generated', 0)} 张卡片，发送 {summary.get('alerts_sent', 0)} 条提醒，识别 {len(prewatch_candidates)} 个预备池候选，并发出 {summary.get('prewatch_alerts_sent_count', 0)} 条预备池轻推。"
         )
+        if exit_pool_cards:
+            lines.append(f"  另外有 {len(exit_pool_cards)} 个标的进入兑现池，建议优先处理已有浮盈仓位。")
         if high_priority_cards > 0:
             lines.append(
                 f"  本轮出现 {high_priority_cards} 张高优先级卡片，其中实际发送 {sent_high_priority} 条，建议优先查看对应卡片。"
@@ -3067,6 +3143,9 @@ def format_run_review(
     lines.append("预备池轻推：")
     sent_symbols = run_detail.get("summary", {}).get("prewatch_alert_symbols", []) if run_detail else []
     lines.extend(_format_prewatch_push_lines(prewatch_candidates, sent_symbols))
+    lines.append("兑现池：")
+    exit_pool_cards = run_detail.get("summary", {}).get("exit_pool_cards", []) if run_detail else []
+    lines.extend(_format_exit_pool_lines(exit_pool_cards))
     lines.append("决策记录：")
     lines.extend(_format_decision_lines(decision_diagnostics or []))
     lines.append("数据源状态：")

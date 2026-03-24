@@ -89,6 +89,19 @@ def _is_watch_card(card: OpportunityCard, delivery: dict | None = None) -> bool:
     return action == "加入观察"
 
 
+def _is_exit_card(card: OpportunityCard, delivery: dict | None = None) -> bool:
+    action = (delivery or {}).get("action_label_effective") or card.action_label
+    return action == "进入兑现池"
+
+
+def _exit_pool_subreason_display(value: str) -> str:
+    return {
+        "target_hit": "达标止盈",
+        "weakening_after_tp_zone": "提前锁盈",
+        "macro_protection": "宏观保护",
+    }.get((value or "").strip(), "兑现管理")
+
+
 def _linked_sources(card: OpportunityCard) -> list[str]:
     links: list[str] = []
     for source in card.source_refs[:3]:
@@ -167,6 +180,7 @@ class FeishuTransport:
     def _build_interactive_payload(self, card: OpportunityCard) -> dict:
         delivery = build_delivery_view_from_card(card)
         is_watch_card = _is_watch_card(card, delivery)
+        is_exit_card = _is_exit_card(card, delivery)
         header_template = (
             "blue"
             if is_watch_card
@@ -201,7 +215,7 @@ class FeishuTransport:
         )
         overview_lines = [
             f"**标的**：{identity}",
-            f"**卡片定位**：{'预备池观察（先看事件发酵与结构确认）' if is_watch_card else '正式操作卡（可结合价格计划执行）'}",
+            f"**卡片定位**：{'预备池观察（先看事件发酵与结构确认）' if is_watch_card else '兑现管理卡（优先保护利润）' if is_exit_card else '正式操作卡（可结合价格计划执行）'}",
             f"**操作建议**：{action_label}（{priority_text} / 置信度 {confidence_text}）",
             f"**交易周期**：{delivery['horizon_display']}",
             f"**链路**：{delivery['chain_summary']}",
@@ -377,6 +391,19 @@ class FeishuTransport:
                 f"**升级触发**：{delivery['llm_impact_inference'] or delivery['trend_state_explainer'] or '等待结构转强与量能进一步确认。'}",
                 f"**观察周期**：{delivery['horizon_display']}",
             ]
+        elif is_exit_card:
+            exit_reason = _exit_pool_subreason_display(card.exit_pool_subreason)
+            decision_lines = [
+                f"**为什么进入兑现池**：{delivery['llm_reasoning'] or event_line}",
+                f"**当前处理**：{card.positioning_hint or '优先兑现或保护利润，不再按新开仓逻辑对待。'}",
+                f"**兑现原因**：{exit_reason}",
+                f"**最大风险**：{delivery['llm_uncertainty'] or risk_text}",
+            ]
+            observation_lines = [
+                f"**当前状态**：{exit_reason}，这笔交易已从进攻切换到兑现管理。",
+                f"**原目标区**：{card.take_profit_range.low:.2f} - {card.take_profit_range.high:.2f}",
+                f"**处理建议**：{card.positioning_hint or '优先兑现利润，不再继续追新仓。'}",
+            ]
         else:
             decision_lines = [
                 f"**为什么可以动**：{delivery['llm_reasoning'] or event_line}",
@@ -450,7 +477,11 @@ class FeishuTransport:
                         "tag": "div",
                         "text": {
                             "tag": "lark_md",
-                            "content": "**决策结论**\n把事件、结构、题材和风险收束成一句可执行的人话结论。",
+                            "content": (
+                                "**兑现结论**\n说明当前为何从进攻切到兑现管理。"
+                                if is_exit_card
+                                else "**决策结论**\n把事件、结构、题材和风险收束成一句可执行的人话结论。"
+                            ),
                         },
                     },
                     {
@@ -464,7 +495,10 @@ class FeishuTransport:
                         "tag": "div",
                         "text": {
                             "tag": "lark_md",
-                            "content": f"**{'观察计划' if is_watch_card else '执行计划'}**\n{'当前更适合先观察后续确认。' if is_watch_card else '当前更适合按价格计划执行。'}",
+                            "content": (
+                                f"**{'观察计划' if is_watch_card else '兑现计划' if is_exit_card else '执行计划'}**\n"
+                                f"{'当前更适合先观察后续确认。' if is_watch_card else '当前更适合优先兑现或保护利润。' if is_exit_card else '当前更适合按价格计划执行。'}"
+                            ),
                         },
                     },
                     {"tag": "hr"},
@@ -512,7 +546,7 @@ class FeishuTransport:
                                 ],
                             }
                         ]
-                        if card.market_data_complete and not is_watch_card
+                        if card.market_data_complete and not is_watch_card and not is_exit_card
                         else [
                             {
                                 "tag": "div",
@@ -624,6 +658,8 @@ class Notifier:
 
     def _body(self, card: OpportunityCard) -> str:
         delivery = build_delivery_view_from_card(card)
+        is_watch_card = _is_watch_card(card, delivery)
+        is_exit_card = _is_exit_card(card, delivery)
         event_line = delivery["event_reason_line"]
         market_line = delivery["market_reason_line"]
         theme_line = delivery["theme_reason_line"]
@@ -639,7 +675,7 @@ class Notifier:
             )
         )
         price_plan_block = ""
-        if card.market_data_complete and not _is_watch_card(card, delivery):
+        if card.market_data_complete and not is_watch_card and not is_exit_card:
             price_plan_block = (
                 f"入场区间：{card.entry_range.low:.2f}-{card.entry_range.high:.2f}\n"
                 f"止盈区间：{card.take_profit_range.low:.2f}-{card.take_profit_range.high:.2f}\n"
@@ -648,7 +684,7 @@ class Notifier:
             )
         overview_lines = [
             f"标的：{delivery['identity']}",
-            f"卡片定位：{'预备池观察（先看事件发酵与结构确认）' if _is_watch_card(card, delivery) else '正式操作卡（可结合价格计划执行）'}",
+            f"卡片定位：{'预备池观察（先看事件发酵与结构确认）' if is_watch_card else '兑现管理卡（优先保护利润）' if is_exit_card else '正式操作卡（可结合价格计划执行）'}",
             _display_trade_cycle(card.horizon),
             f"操作建议：{delivery['action_label_effective']}（{_display_priority(card.priority)} / 置信度 {confidence_text}）",
             f"链路：{delivery['chain_summary']}",
@@ -682,12 +718,21 @@ class Notifier:
             f"- 综合分：{card.final_score:.2f}（{delivery['final_score_label']}，{delivery['final_score_explainer']}）",
             f"- 题材联动：{theme_line}",
         ]
-        if _is_watch_card(card, delivery):
+        if is_watch_card:
             decision_section = [
                 "决策结论：",
                 f"- 为什么现在先观察：{delivery['llm_reasoning'] or event_line}",
                 f"- 当前处理：{card.positioning_hint or '先放入观察名单，等待更明确的催化与结构确认。'}",
                 f"- 最大风险：{delivery['llm_uncertainty'] or '需继续核对原文与价格结构'}",
+            ]
+        elif is_exit_card:
+            exit_reason = _exit_pool_subreason_display(card.exit_pool_subreason)
+            decision_section = [
+                "兑现结论：",
+                f"- 为什么进入兑现池：{delivery['llm_reasoning'] or event_line}",
+                f"- 当前处理：{card.positioning_hint or '优先兑现或保护利润，不再按新开仓逻辑对待。'}",
+                f"- 兑现原因：{exit_reason}",
+                f"- 最大风险：{delivery['llm_uncertainty'] or '继续持有可能回吐利润，过早兑现也可能少赚。'}",
             ]
         else:
             decision_section = [
@@ -704,13 +749,24 @@ class Notifier:
         body_lines.extend(["", *market_section, "", *score_section, "", *decision_section])
         if price_plan_block:
             body_lines.extend(["", "执行计划：", price_plan_block.rstrip()])
-        elif _is_watch_card(card, delivery):
+        elif is_watch_card:
             body_lines.extend(
                 [
                     "",
                     "观察计划：",
                     f"- 关注重点：{card.reason_to_watch or delivery['llm_reasoning']}",
                     f"- 升级触发：{delivery['llm_impact_inference'] or delivery['trend_state_explainer']}",
+                ]
+            )
+        elif is_exit_card:
+            exit_reason = _exit_pool_subreason_display(card.exit_pool_subreason)
+            body_lines.extend(
+                [
+                    "",
+                    "兑现计划：",
+                    f"- 当前状态：{exit_reason}，这笔交易已从进攻切换到兑现管理。",
+                    f"- 原目标区：{card.take_profit_range.low:.2f}-{card.take_profit_range.high:.2f}",
+                    f"- 处理建议：{card.positioning_hint or '优先兑现利润，不再继续追新仓。'}",
                 ]
             )
         body_lines.extend(

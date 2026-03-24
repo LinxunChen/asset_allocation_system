@@ -30,6 +30,7 @@ from .market_data import (
 from .models import EventInsight, OpportunityCard, PriceRange, SourceHealthCheck, utcnow
 from .notifier import Notifier
 from .observability import RunContext, StructuredLogger
+from .outcomes import compute_decision_outcome
 from .prewatch import build_prewatch_candidate, sort_prewatch_candidates
 from .scoring import SignalScorer
 from .sources import SourceAdapter
@@ -109,6 +110,12 @@ THEME_CONFIRMATION_CHAIN_BONUS = 1.5
 THEME_MEMORY_STATE_KEY = "theme_heat_memory"
 EVENT_PREWATCH_BASE_BONUS = 4.0
 MACRO_PROXY_SYMBOLS = ("SPY", "QQQ", "SMH", "TLT")
+
+EXIT_POOL_SUBREASON_DISPLAY: dict[str, str] = {
+    "target_hit": "达标止盈",
+    "weakening_after_tp_zone": "提前锁盈",
+    "macro_protection": "宏观保护",
+}
 
 EVENT_TYPE_DISPLAY_NAMES: dict[str, str] = {
     "earnings": "财报",
@@ -343,7 +350,7 @@ class SatelliteAgentService:
         ]
         if not rows:
             return "首次出现"
-        terminal_reasons = {"hit_take_profit", "hit_invalidation", "window_complete"}
+        terminal_reasons = {"exit_pool", "hit_invalidation", "window_complete"}
         active_cycle: list[dict | object] = []
         for row in rows:
             if str(row["close_reason"] or "") in terminal_reasons:
@@ -389,6 +396,226 @@ class SatelliteAgentService:
         if not action_nodes[-1].endswith(current_action):
             action_nodes.append(f"今日{current_action}")
         return " -> ".join(action_nodes)
+
+    def _json_object(self, raw: Any) -> dict[str, Any]:
+        if not raw:
+            return {}
+        if isinstance(raw, dict):
+            return raw
+        try:
+            payload = json.loads(str(raw))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _load_local_proxy_bars(self) -> dict[str, list]:
+        return {
+            symbol: self.store.load_price_bars(symbol, "1d", 400)
+            for symbol in MACRO_PROXY_SYMBOLS
+        }
+
+    def _active_confirmation_rows_for_exit_pool(self) -> list[Any]:
+        rows = self.store.load_latest_decision_records(limit=300)
+        selected: list[Any] = []
+        closed_symbols: set[str] = set()
+        selected_symbols: set[str] = set()
+        terminal_reasons = {"exit_pool", "hit_invalidation", "window_complete"}
+        for row in rows:
+            symbol = str(row["symbol"] or "").strip().upper()
+            if not symbol or symbol in closed_symbols or symbol in selected_symbols:
+                continue
+            if str(row["pool"] or "").strip() == "exit":
+                closed_symbols.add(symbol)
+                continue
+            if str(row["close_reason"] or "").strip() in terminal_reasons:
+                closed_symbols.add(symbol)
+                continue
+            if str(row["pool"] or "").strip() != "confirmation":
+                continue
+            if str(row["action"] or "").strip() not in {"确认做多", "试探建仓"}:
+                continue
+            selected.append(row)
+            selected_symbols.add(symbol)
+        return selected
+
+    def _exit_pool_reason_text(self, subreason: str, take_profit_range: PriceRange) -> tuple[str, str]:
+        if subreason == "target_hit":
+            return (
+                "价格已进入止盈区较深位置，计划内利润目标基本兑现。",
+                f"已到达目标区更深位置（原目标区 {take_profit_range.low:.2f}-{take_profit_range.high:.2f}），优先按计划兑现利润。",
+            )
+        if subreason == "weakening_after_tp_zone":
+            return (
+                "价格进入止盈区后连续走弱，利润保护优先级上升。",
+                "进入止盈区后承接连续转弱，继续持有更容易把浮盈回吐回去。",
+            )
+        return (
+            "宏观环境转差且已有浮盈，当前更适合先保护利润。",
+            "外部风险抬升时，先把已有利润锁住，比继续硬扛更重要。",
+        )
+
+    def _exit_pool_subreason_display(self, subreason: str) -> str:
+        return EXIT_POOL_SUBREASON_DISPLAY.get(subreason, "兑现管理")
+
+    def _build_exit_pool_cards(
+        self,
+        *,
+        macro_context: dict[str, object],
+        run_id: str,
+        logger: StructuredLogger,
+    ) -> tuple[list[OpportunityCard], list[dict[str, Any]]]:
+        cards: list[OpportunityCard] = []
+        records: list[dict[str, Any]] = []
+        proxy_bars_by_symbol = self._load_local_proxy_bars()
+        for row in self._active_confirmation_rows_for_exit_pool():
+            symbol = str(row["symbol"] or "").strip().upper()
+            bars = self.store.load_price_bars(symbol, "1d", 400)
+            if not bars:
+                continue
+            outcome = compute_decision_outcome(
+                row,
+                bars,
+                proxy_bars_by_symbol=proxy_bars_by_symbol,
+            )
+            if outcome is None or not outcome.entered or outcome.close_reason != "exit_pool":
+                continue
+            exit_subreason = str(outcome.exit_subreason or "")
+            packet_payload = self._json_object(row["packet_json"])
+            price_plan = self._json_object(row["entry_plan_json"])
+            take_profit_payload = self._json_object(price_plan.get("take_profit_range"))
+            entry_payload = self._json_object(price_plan.get("entry_range"))
+            take_profit_range = PriceRange(
+                float(take_profit_payload.get("low") or outcome.exit_price or 0.0),
+                float(take_profit_payload.get("high") or outcome.exit_price or 0.0),
+            ).normalized()
+            entry_range = PriceRange(
+                float(entry_payload.get("low") or outcome.entry_price or 0.0),
+                float(entry_payload.get("high") or outcome.entry_price or 0.0),
+            ).normalized()
+            invalidation_payload = self._json_object(row["invalidation_json"])
+            invalidation_level = float(
+                price_plan.get("invalidation_level")
+                or invalidation_payload.get("level")
+                or row["entry_price"]
+                or 0.0
+            )
+            reason_summary, positioning_hint = self._exit_pool_reason_text(exit_subreason, take_profit_range)
+            dedup_key = f"exit_pool:{row['decision_id']}:{exit_subreason}"
+            card = OpportunityCard(
+                card_id=hashlib.sha1(f"{run_id}:{dedup_key}".encode("utf-8")).hexdigest(),
+                event_id=f"exit_pool:{row['decision_id']}:{exit_subreason}",
+                symbol=symbol,
+                horizon=str(packet_payload.get("horizon") or "position"),
+                event_type=str(row["event_type"] or "news"),
+                headline_summary=reason_summary,
+                bull_case="",
+                bear_case="",
+                event_score=float(row["event_score"] or 0.0),
+                market_score=float(row["market_score"] or 0.0),
+                final_score=float(row["final_score"] or 0.0),
+                entry_range=entry_range,
+                take_profit_range=take_profit_range,
+                invalidation_level=round(invalidation_level, 2),
+                invalidation_reason="原进攻逻辑已切换到兑现管理。",
+                risk_notes=[
+                    f"兑现池退出：{self._exit_pool_subreason_display(exit_subreason)}",
+                    "这是一张兑现管理卡，不再代表适合新开仓。",
+                ],
+                source_refs=[],
+                created_at=utcnow(),
+                ttl=utcnow() + timedelta(days=2),
+                priority="high" if exit_subreason in {"target_hit", "macro_protection"} else "normal",
+                dedup_key=dedup_key,
+                bias="long",
+                display_name=self._display_name_for(symbol),
+                action_label="进入兑现池",
+                confidence_label="高" if exit_subreason in {"target_hit", "macro_protection"} else "中",
+                confidence_score=min(max(float(row["final_score"] or 0.0), 72.0), 92.0),
+                reason_to_watch=reason_summary,
+                theme_tags=list(json.loads(str(row["theme_ids_json"] or "[]"))),
+                chain_summary=self._chain_summary_for_symbol(symbol, current_action="进入兑现池"),
+                market_regime=str(macro_context.get("market_regime", "")),
+                rate_risk=str(macro_context.get("rate_risk", "")),
+                geopolitical_risk=str(macro_context.get("geopolitical_risk", "")),
+                macro_risk_score=float(macro_context.get("macro_risk_score", 0.0)),
+                market_data_complete=True,
+                positioning_hint=positioning_hint,
+                execution_eligible=False,
+                execution_note=positioning_hint,
+                exit_pool_subreason=exit_subreason,
+                exit_pool_source_decision_id=str(row["decision_id"] or ""),
+            )
+            cards.append(card)
+            records.append(
+                {
+                    "decision_id": hashlib.sha1(
+                        f"{run_id}:exit:{symbol}:{row['decision_id']}:{exit_subreason}".encode("utf-8")
+                    ).hexdigest(),
+                    "event_id": card.event_id,
+                    "symbol": symbol,
+                    "event_type": card.event_type,
+                    "priority": card.priority,
+                    "confidence": card.confidence_label,
+                    "event_score": card.event_score,
+                    "market_score": card.market_score,
+                    "theme_score": float(row["theme_score"] or 0.0),
+                    "final_score": card.final_score,
+                    "trigger_mode": exit_subreason,
+                    "theme_ids": list(card.theme_tags),
+                    "entry_plan": {
+                        "entry_range": {"low": entry_range.low, "high": entry_range.high},
+                        "take_profit_range": {"low": take_profit_range.low, "high": take_profit_range.high},
+                        "invalidation_level": invalidation_level,
+                    },
+                    "invalidation": {
+                        "level": invalidation_level,
+                        "reason": "原进攻逻辑已切换到兑现管理。",
+                    },
+                    "packet": {
+                        "pool": "exit",
+                        "action": "进入兑现池",
+                        "source_decision_id": row["decision_id"],
+                        "exit_subreason": exit_subreason,
+                        "close_reason": outcome.close_reason,
+                        "realized_return": outcome.realized_return,
+                    },
+                }
+            )
+            logger.info(
+                "exit_pool_selected",
+                "Position moved into the exit pool.",
+                stage="exit_pool",
+                symbol=symbol,
+                event_id=card.event_id,
+                context={"subreason": exit_subreason, "source_decision_id": row["decision_id"]},
+            )
+        return cards, records
+
+    def _record_exit_pool_decisions(self, records: list[dict[str, Any]], *, run_id: str) -> None:
+        for record in records:
+            self.store.save_decision_record(
+                decision_id=record["decision_id"],
+                run_id=run_id,
+                event_id=record["event_id"],
+                symbol=record["symbol"],
+                event_type=record["event_type"],
+                pool="exit",
+                action="进入兑现池",
+                priority=record["priority"],
+                confidence=record["confidence"],
+                event_score=record["event_score"],
+                market_score=record["market_score"],
+                theme_score=record["theme_score"],
+                final_score=record["final_score"],
+                trigger_mode=record["trigger_mode"],
+                llm_used=False,
+                theme_ids=record["theme_ids"],
+                entry_plan=record["entry_plan"],
+                invalidation=record["invalidation"],
+                ttl="",
+                packet=record["packet"],
+                created_at=utcnow().isoformat(),
+            )
 
     def _decorate_card_with_runtime_context(
         self,
@@ -540,6 +767,8 @@ class SatelliteAgentService:
         saved_snapshot_keys: set[tuple[str, str]] = set()
         prewatch_candidates = []
         prewatch_alert_symbols: list[str] = []
+        exit_pool_cards: list[OpportunityCard] = []
+        exit_pool_symbols: list[str] = []
         llm_requests_used = 0
         llm_daily_requests_used = self._llm_daily_usage_count(now)
         card_contexts: dict[str, dict] = {}
@@ -756,6 +985,18 @@ class SatelliteAgentService:
                 self.store.save_opportunity_card(card, run_id=run_context.run_id)
             self._record_decision_packets(confirmation_packets, run_id=run_context.run_id)
             self._dispatch_notifications(notification_candidates, run_context, logger)
+            exit_pool_cards, exit_pool_records = self._build_exit_pool_cards(
+                macro_context=macro_context,
+                run_id=run_context.run_id,
+                logger=logger,
+            )
+            if exit_pool_cards:
+                for card in exit_pool_cards:
+                    self.store.save_opportunity_card(card, run_id=run_context.run_id)
+                self._record_exit_pool_decisions(exit_pool_records, run_id=run_context.run_id)
+                self._dispatch_notifications(exit_pool_cards, run_context, logger)
+                exit_pool_symbols = [card.symbol for card in exit_pool_cards]
+                run_context.metrics.cards_generated += len(exit_pool_cards)
             prewatch_candidates = self._build_prewatch_candidates(
                 watchlist,
                 confirmation_cards=notification_candidates,
@@ -793,6 +1034,18 @@ class SatelliteAgentService:
             summary["prewatch_candidates"] = [candidate.to_record() for candidate in prewatch_candidates]
             summary["prewatch_alerts_sent_count"] = run_context.metrics.prewatch_alerts_sent
             summary["prewatch_alert_symbols"] = list(prewatch_alert_symbols)
+            summary["exit_pool_cards_count"] = len(exit_pool_cards)
+            summary["exit_pool_symbols"] = list(exit_pool_symbols)
+            summary["exit_pool_cards"] = [
+                {
+                    "symbol": card.symbol,
+                    "display_name": card.display_name,
+                    "horizon": card.horizon,
+                    "subreason": card.exit_pool_subreason,
+                    "reason_to_watch": card.reason_to_watch,
+                }
+                for card in exit_pool_cards
+            ]
             if status == "success":
                 self.theme_engine.persist_theme_memory(notification_candidates, prewatch_candidates)
             self.store.record_run(
@@ -1693,6 +1946,8 @@ class SatelliteAgentService:
                 normalized = symbol.upper()
                 if normalized not in watchlist:
                     continue
+                if normalized in seed["trigger_symbols"]:
+                    continue
                 if normalized in existing_symbols or normalized in confirmed_symbols:
                     continue
                 if not self._is_prewatch_symbol_eligible(normalized):
@@ -1780,7 +2035,7 @@ class SatelliteAgentService:
         seeds: dict[str, dict] = {}
         min_event_score = self.settings.prewatch_event_trigger_min_event_score
         for card in confirmation_cards:
-            if card.priority == "suppressed":
+            if card.priority == "suppressed" and getattr(card, "execution_eligible", True):
                 continue
             if card.event_score < min_event_score:
                 continue
@@ -2250,6 +2505,8 @@ class SatelliteAgentService:
             event_assessment = context.get("event_assessment")
             market_assessment = context.get("market_assessment")
             if event_assessment is None or market_assessment is None:
+                continue
+            if not getattr(card, "execution_eligible", True):
                 continue
             market_confirmation_score = market_assessment.market_confirmation_score
             if market_confirmation_score is None:

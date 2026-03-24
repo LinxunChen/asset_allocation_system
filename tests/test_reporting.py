@@ -114,6 +114,9 @@ class ReportingTests(unittest.TestCase):
             self.assertIn("真实调用数：2", report_text)
             self.assertIn("失败回退数：1", report_text)
             self.assertIn("跳过调用数：1", report_text)
+            self.assertIn("输入 token：200", report_text)
+            self.assertIn("输出 token：36", report_text)
+            self.assertIn("预估成本：¥0.000195", report_text)
             self.assertIn("按环节：", report_text)
             self.assertIn("事件抽取：调用 1", report_text)
             self.assertIn("卡片叙事：调用 1", report_text)
@@ -386,6 +389,9 @@ class ReportingTests(unittest.TestCase):
             output = stdout.getvalue()
             self.assertIn("LLM 用量报告", output)
             self.assertIn("卡片叙事：调用 1", output)
+            self.assertIn("输入 token：64", output)
+            self.assertIn("输出 token：18", output)
+            self.assertIn("预估成本：¥0.000083", output)
             self.assertIn("Qwen/Test", output)
 
     def test_theme_snapshot_prefers_independent_theme_display_names(self) -> None:

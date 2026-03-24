@@ -165,6 +165,10 @@ class OpportunityCard:
     prewatch_score: float = 0.0
     prewatch_setup_type: str = ""
     positioning_hint: str = ""
+    execution_eligible: bool = True
+    execution_note: str = ""
+    exit_pool_subreason: str = ""
+    exit_pool_source_decision_id: str = ""
 
     def ttl_delta(self) -> timedelta:
         return self.ttl - self.created_at

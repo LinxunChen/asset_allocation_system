@@ -1,331 +1,389 @@
 # Satellite Agent Handoff
 
-Last updated: 2026-03-20 (Asia/Shanghai)
+Last updated: 2026-03-24 (Asia/Shanghai)
 
-## Current State
+## 当前目标
 
-`satellite_agent` has moved past a single-chain prototype and is now in the first phase of a modular decision-system refactor.
+当前卫星仓位 agent 的主线目标已经从“基础跑通”切换到“交易闭环完善”。  
+这条线当前最重要的事情是：
 
-The execution framework is still:
+- 把 `预备池 -> 确认池 -> 兑现池 -> 后验复盘` 真正串成一套一致口径
+- 把卡片内容和 LLM 表达继续打磨成可日常使用的交易助手
+- 在不引入组合级仓位账本的前提下，让真实执行和后验回测尽量一致
 
-- `预备池 -> 确认池 -> 兑现池 -> 飞书推送`
+当前默认目录与入口：
 
-But the underlying decision layer is no longer only ad-hoc logic inside `service.py`.  
-We now have a first version of an internal decision-engine layer:
+- 代码：[src/satellite_agent](/Users/linxun/CodeSpace/asset_allocation_system/src/satellite_agent)
+- 配置：[config/satellite_agent](/Users/linxun/CodeSpace/asset_allocation_system/config/satellite_agent)
+- 数据：[data/satellite_agent](/Users/linxun/CodeSpace/asset_allocation_system/data/satellite_agent)
 
-- `资讯事件理解引擎`
-- `股市行情理解引擎`
-- `产业题材理解引擎`
+## 已完成
 
-These live under:
+### 1. 目录、配置、文档已按 satellite_agent 隔离
 
-- [src/satellite_agent/decision_engines/__init__.py](/Users/linxun/CodeSpace/asset_allocation_system/src/satellite_agent/decision_engines/__init__.py)
-- [src/satellite_agent/decision_engines/types.py](/Users/linxun/CodeSpace/asset_allocation_system/src/satellite_agent/decision_engines/types.py)
-- [src/satellite_agent/decision_engines/event.py](/Users/linxun/CodeSpace/asset_allocation_system/src/satellite_agent/decision_engines/event.py)
-- [src/satellite_agent/decision_engines/market.py](/Users/linxun/CodeSpace/asset_allocation_system/src/satellite_agent/decision_engines/market.py)
-- [src/satellite_agent/decision_engines/theme.py](/Users/linxun/CodeSpace/asset_allocation_system/src/satellite_agent/decision_engines/theme.py)
-- [src/satellite_agent/decision_engines/mappers.py](/Users/linxun/CodeSpace/asset_allocation_system/src/satellite_agent/decision_engines/mappers.py)
+- 运行、配置、实验、文档都已经收进 `satellite_agent` 命名空间
+- 用户配置已经收成 `watchlist-only`
+  - 你只维护 `watchlist.stock_items / etf_items`
+  - `theme` 由系统内部托管
+  - `group` 已从用户配置淡出
+- 题材映射已支持导出为只读参考文件：
+  - [config/satellite_agent/theme_reference.json](/Users/linxun/CodeSpace/asset_allocation_system/config/satellite_agent/theme_reference.json)
 
-The current refactor status is:
+### 2. 推送卡片已经完成第一轮重构
 
-- `service.py` now orchestrates the engines instead of directly doing all low-level reasoning itself.
-- `DecisionPacket` is now part of the real flow.
-- `DecisionPacket -> OpportunityCard` mapping exists.
-- `DecisionPacket -> delivery view` mapping now exists and is reused by notifier + live diagnostics.
-- `decision_records` are now persisted.
-- `decision_outcomes` schema exists and is usable.
-- A first outcome backfill command now exists.
+当前卡片已经区分为：
 
-## New Decision-Layer Persistence
+- 预备池观察卡
+- 正式操作卡
+- 兑现池卡
 
-SQLite now includes:
+并且已经做了这些收敛：
 
-- `decision_records`
-- `decision_outcomes`
+- 标题统一为 `名称（代码） | 动作建议 | 事件类型`
+- `trend_state` 对外显示为 `结构状态`
+- `bias` 对外显示为 `事件倾向`
+- `事件 / 市场 / 结构 / 信号评分 / 决策结论 / 执行计划` 已做基本分区
+- 预备池轻推已经接入 lite 版 LLM narration
+- 预备池重复轻推已做抑制：
+  - `4h` 硬冷却
+  - `12h` 内内容不变且分数变化小于 `4` 时不重复发
 
-Implemented in:
-
-- [src/satellite_agent/store.py](/Users/linxun/CodeSpace/asset_allocation_system/src/satellite_agent/store.py)
-- [src/satellite_agent/outcomes.py](/Users/linxun/CodeSpace/asset_allocation_system/src/satellite_agent/outcomes.py)
-
-What is already working:
-
-- Each `DecisionPacket` can be written into `decision_records`
-- `decision_diagnostics` are now included in replay/live payloads
-- Markdown review now includes a `决策记录` section
-- A CLI command can backfill outcomes from stored daily bars
-- `card_diagnostics` now carry normalized display fields generated from a shared delivery-view mapper
-
-Backfill command:
+本地预览命令可用：
 
 ```bash
-PYTHONPATH=src .venv/bin/python -m satellite_agent.main backfill-decision-outcomes --run-id <run_id>
+cd /Users/linxun/CodeSpace/asset_allocation_system
+PYTHONPATH=src .venv/bin/python -m satellite_agent.main preview-alert-render --symbol NVDA
+PYTHONPATH=src .venv/bin/python -m satellite_agent.main preview-alert-render --symbol NVDA --watch
+PYTHONPATH=src .venv/bin/python -m satellite_agent.main preview-alert-render --symbol NBIS --prewatch-light
 ```
 
-## Most Recent Validation
+### 3. Qwen narration 已接入并可本地持久化
 
-### Test status
+当前模型配置：
 
-Full suite:
+- `model = Qwen/Qwen3.5-35B-A3B`
+- `base_url = https://api.siliconflow.cn/v1/chat/completions`
 
-```bash
-PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
-```
+配置边界：
 
-Result:
-
-- `88/88 OK`
-
-Targeted new tests added:
-
-- [tests/test_outcomes.py](/Users/linxun/CodeSpace/asset_allocation_system/tests/test_outcomes.py)
-- updated [tests/test_reporting.py](/Users/linxun/CodeSpace/asset_allocation_system/tests/test_reporting.py)
-
-### Latest real run
-
-Command used:
-
-```bash
-SATELLITE_USE_SEC_FILINGS_SOURCE=1 SATELLITE_USE_GOOGLE_NEWS_SOURCE=1 PYTHONPATH=src .venv/bin/python -m satellite_agent.main run-once --limit 10
-```
-
-Latest run:
-
-- run id: `e403bf124dc1798b`
-- elapsed: `96.6s`
-- events processed: `32`
-- cards generated: `64`
-- alerts sent: `4`
-- prewatch light alerts sent: `1`
-- run-once review: [data/satellite_agent/run_once/run_once_review.md](/Users/linxun/CodeSpace/asset_allocation_system/data/satellite_agent/run_once/run_once_review.md)
-- run-once payload: [data/satellite_agent/run_once/run_once_payload.json](/Users/linxun/CodeSpace/asset_allocation_system/data/satellite_agent/run_once/run_once_payload.json)
-- serve review: [data/satellite_agent/serve/serve_review.md](/Users/linxun/CodeSpace/asset_allocation_system/data/satellite_agent/serve/serve_review.md)
-- serve payload: [data/satellite_agent/serve/serve_payload.json](/Users/linxun/CodeSpace/asset_allocation_system/data/satellite_agent/serve/serve_payload.json)
-- serve llm usage report: [data/satellite_agent/serve/llm_usage/report.md](/Users/linxun/CodeSpace/asset_allocation_system/data/satellite_agent/serve/llm_usage/report.md)
-
-That payload now contains:
-
-- `card_diagnostics`
-- `decision_diagnostics`
-- `prewatch_candidates`
-- normalized delivery-view fields inside `card_diagnostics`, including:
-  - `identity`
-  - `event_type_display`
-  - `priority_display`
-  - `horizon_display`
-  - `action_label_effective`
-  - `confidence_label_effective`
-  - `source_summary`
-  - `event_reason_line`
-  - `market_reason_line`
-  - `theme_reason_line`
-  - `valid_until_text`
-
-Payload sanity check completed:
-
-- `decision_diagnostics` count for latest run: `67`
-
-### Latest outcome backfill
-
-Most recently verified backfill command:
-
-```bash
-PYTHONPATH=src .venv/bin/python -m satellite_agent.main backfill-decision-outcomes --run-id 82cc976bda5c75c8
-```
-
-Result:
-
-- scanned: `6`
-- updated: `0`
-- skipped: `6`
-
-Important interpretation:
-
-- The outcome pipeline itself is working
-- This specific run had insufficient usable local `1d` bars for those decisions, so all were skipped safely
-- No crash, no corrupted state
-
-## What Has Been Improved Recently
-
-Recent major milestones already in the codebase:
-
-- Chinese-first review and card copy
-- formalized config/template structure:
+- 非敏感行为配置放在：
   - [config/satellite_agent/agent.json](/Users/linxun/CodeSpace/asset_allocation_system/config/satellite_agent/agent.json)
-  - [config/satellite_agent/agent.template.json](/Users/linxun/CodeSpace/asset_allocation_system/config/satellite_agent/agent.template.json)
-- configuration direction now favors `watchlist-only` maintenance:
-  - user maintains `stock_items / etf_items`
-  - system hosts theme mapping internally
-  - legacy `groups` remain compatible but are no longer the preferred user-facing model
-- auto watchlist sync during runtime
-- prewatch pool with:
-  - structural prewatch
-  - event-driven prewatch
-  - theme memory support
-- confirmation-pool theme linkage
-- Feishu notification chain fully working
-- LLM budget accounting and usage persistence
-- `report-llm-usage / write-llm-usage-report` 已可用，且 `run-once / daily-run / serve` 会自动产出 LLM 用量报告
-- Yahoo + Stooq + stale-cache market-data fallback
-- source-fetch probe / degraded-fetch resilience
-- notifier now reads unified delivery-view fields instead of hand-assembling most display semantics
-- live card diagnostics now expose the same delivery-view semantics used by notifier
+- API key 放在：
+  - `config/satellite_agent/.env.local`
+  - 已被 `.gitignore` 忽略
 
-## Known Limits / Open Work
+当前默认口径：
 
-### 1. `DecisionPacket` is not yet the sole source of truth
+- `LLM narration = on`
+- `LLM event extraction = off`
+- `LLM ranking assist = off`
 
-Current state:
+也就是说，LLM 现在主要只影响：
 
-- `DecisionPacket` exists
-- `decision_records` exist
-- `OpportunityCard` is still the dominant delivery object
-- notifier and live diagnostics now reuse shared delivery-view mapping
+- 事实摘要
+- 影响推理
+- 决策理由
+- 风险提示
 
-What remains:
+不会改变：
 
-- reporting still mostly formats raw card-shaped data directly
-- `DecisionPacket` is not yet the single input for md/feishu/review generation
-- the system is not yet fully `DecisionPacket-first`
+- 打分
+- 动作建议
+- 价格计划
 
-### 2. `decision_outcomes` need better bar coverage
+### 4. LLM 用量报告已落地
 
-Current state:
+已支持：
 
-- outcome backfill works
-- but result quality depends on local `1d` bars already being in SQLite
+- 每次调用落库
+- 统计调用次数、成功/失败、token、延迟
+- 生成中文报告
+- 自动写入运行产物
 
-What remains:
+可用命令：
 
-- either improve historical bar availability
-- or add a safe bar-sync/backfill helper before outcome calculation
+```bash
+cd /Users/linxun/CodeSpace/asset_allocation_system
+PYTHONPATH=src .venv/bin/python -m satellite_agent.main report-llm-usage --days 7
+PYTHONPATH=src .venv/bin/python -m satellite_agent.main write-llm-usage-report --workspace-dir ./data/satellite_agent/serve --days 7
+```
 
-### 3. LLM is still limited
+产物路径：
 
-Current state:
+- [data/satellite_agent/serve/llm_usage/report.md](/Users/linxun/CodeSpace/asset_allocation_system/data/satellite_agent/serve/llm_usage/report.md)
+- [data/satellite_agent/serve/llm_usage/report_payload.json](/Users/linxun/CodeSpace/asset_allocation_system/data/satellite_agent/serve/llm_usage/report_payload.json)
 
-- LLM budgets, fallback, and usage persistence are in place
-- event extraction can already use LLM conditionally
+运行复盘里也已经嵌入 `LLM 用量摘要`。
 
-What remains:
+### 5. 历史效果复盘体系已成型
 
-- formalize `LLM v1` around:
-  - event understanding
-  - theme reasoning
-  - decision-reason generation
-- keep pricing/risk plans rule-based
+当前已经有：
 
-### 4. Dynamic theme discovery is still partial
+- 运行过程复盘
+- 历史效果复盘
+- 程序抽检
+- AI 复核
+- LLM 用量报告
 
-Current state:
+并且：
 
-- theme decisions use static config + recent theme memory + linkage
+- `serve` 下历史效果复盘按小时节流刷新
+- `run-once / daily-run` 会自动更新相关产物
 
-What remains:
+### 6. 兑现池与止盈区重构 v1 已完成
 
-- promote theme understanding from “static group aware” to:
-  - `watchlist + sector/theme ETF driven dynamic state`
+这是本轮最大的新增功能。
 
-### 5. Exit pool is still mostly an interface placeholder
+#### 6.1 新的止盈区逻辑
 
-Current state:
+止盈区不再主要靠 `ATR 静态目标`，而是改成：
 
-- exit-related fields now have a place in the market understanding plan
-- outcomes/backfill groundwork exists
+- `1R = entry_reference - invalidation_level`
+- `swing` 理论目标：
+  - `2.0R ~ 3.0R`
+- `position` 理论目标：
+  - `2.5R ~ 4.0R`
+- 再用结构阻力修正：
+  - `swing -> resistance_20`
+  - `position -> resistance_60`
+- 再做最低赔率保护：
+  - `swing >= 1.5R`
+  - `position >= 2.0R`
 
-What remains:
+如果赔率不合格：
 
-- real `兑现池` decision logic
-- later, likely with holdings awareness
+- 不强推确认池
+- 会降级为观察/预备池处理
 
-## Recommended Next Task
+对应文件：
 
-The most natural next step is:
+- [src/satellite_agent/entry_exit.py](/Users/linxun/CodeSpace/asset_allocation_system/src/satellite_agent/entry_exit.py)
 
-`Push reporting further onto the shared delivery-view / DecisionPacket path, and reduce remaining direct OpportunityCard coupling in markdown generation.`
+#### 6.2 新的兑现池口径
 
-That should include:
+盈利退出底层已经统一到：
 
-1. reuse the shared delivery-view mapper in `reporting.py`
-2. make md review sections rely less on raw card fields and more on normalized delivery fields
-3. continue shrinking ad-hoc display logic in `service.py` / `main.py`
-4. keep `OpportunityCard` as a downstream transport/view model, not a reasoning model
+- `exit_reason = exit_pool`
 
-After that, the next high-value step is:
+并带子原因：
 
-`Improve outcome usefulness by ensuring sufficient daily bars exist for post-decision backfill.`
+- `target_hit`
+  - 达标止盈
+- `weakening_after_tp_zone`
+  - 提前锁盈
+- `macro_protection`
+  - 宏观保护
 
-## Files Most Recently Changed
+兑现池第一版规则：
 
-- [src/satellite_agent/decision_engines/mappers.py](/Users/linxun/CodeSpace/asset_allocation_system/src/satellite_agent/decision_engines/mappers.py)
+- 仅面向已形成正向运行的多头票
+- 达到止盈区中位价：
+  - 记 `target_hit`
+- 已进入止盈区后，连续两天收盘跌回下沿之下：
+  - 记 `weakening_after_tp_zone`
+- 宏观风险高且已有至少 `1 ATR` 浮盈：
+  - 记 `macro_protection`
+
+同 bar 冲突时：
+
+- `失效退出` 仍优先于盈利退出
+
+对应文件：
+
+- [src/satellite_agent/outcomes.py](/Users/linxun/CodeSpace/asset_allocation_system/src/satellite_agent/outcomes.py)
+- [src/satellite_agent/service.py](/Users/linxun/CodeSpace/asset_allocation_system/src/satellite_agent/service.py)
 - [src/satellite_agent/notifier.py](/Users/linxun/CodeSpace/asset_allocation_system/src/satellite_agent/notifier.py)
+- [src/satellite_agent/reporting.py](/Users/linxun/CodeSpace/asset_allocation_system/src/satellite_agent/reporting.py)
+- [src/satellite_agent/store.py](/Users/linxun/CodeSpace/asset_allocation_system/src/satellite_agent/store.py)
 - [src/satellite_agent/main.py](/Users/linxun/CodeSpace/asset_allocation_system/src/satellite_agent/main.py)
 
-## Last Completed Work Item
+#### 6.3 兑现池卡与运行链路
 
-Completed in this thread:
+当前已经支持：
 
-- centralized delivery-view mapping for notifier and live diagnostics
-- validated with:
-  - targeted tests:
-    - `PYTHONPATH=src .venv/bin/python -m unittest tests.test_notifier tests.test_reporting tests.test_outcomes -v`
-  - full suite:
-    - `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v`
-  - real live run:
-    - `SATELLITE_USE_SEC_FILINGS_SOURCE=1 SATELLITE_USE_GOOGLE_NEWS_SOURCE=1 PYTHONPATH=src .venv/bin/python -m satellite_agent.main run-once --limit 10`
+- 运行时识别兑现池退出
+- 生成兑现池卡
+- 落决策记录
+- 进入运行复盘摘要
+- 历史效果复盘展示为：
+  - `兑现池退出（含达标止盈 / 提前锁盈 / 宏观保护）`
 
-## Useful Commands
+## 最近验证
 
-Run all tests:
+本轮我实际补跑并确认通过的核心测试有：
 
 ```bash
-PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
+PYTHONPATH=src .venv/bin/python -m unittest tests.test_outcomes tests.test_scoring_service
+PYTHONPATH=src .venv/bin/python -m unittest tests.test_reporting tests.test_notifier
 ```
 
-Run one live cycle:
+结果：
+
+- `tests.test_outcomes + tests.test_scoring_service`
+  - `40 tests OK`
+- `tests.test_reporting + tests.test_notifier`
+  - `48 tests OK`
+
+说明当前这几条主链路是绿的：
+
+- 兑现池退出与后验重算
+- 新止盈区间与赔率降级
+- 预备池/确认池/兑现池卡片展示
+- 历史效果复盘与运行复盘展示
+
+## 下一步建议
+
+下一阶段优先级我建议这样排：
+
+### 1. 继续打磨兑现池展示
+
+当前兑现池功能已接通，但产品层还可以继续优化：
+
+- 兑现池卡文案再收一轮
+- `serve_review.md` 里的兑现池摘要做得更醒目
+- 让 `达标止盈 / 提前锁盈 / 宏观保护` 三类原因在卡片里更好理解
+
+### 2. 用真实样本审新止盈区是否偏保守/偏激进
+
+新止盈区和兑现池已经能跑，但是否“专业且好用”，还需要用真实历史样本再看：
+
+- 哪些票被过早降级
+- 哪些票的目标区仍偏近
+- 哪些票的 `position` 目标还不够像卫星仓位
+
+这一步建议优先做“样本审查”，不要先急着再改公式。
+
+### 3. 再推进 LLM 特征抽取
+
+当前 LLM 主要还在表达层。  
+后面真正影响策略质量的下一条大线是：
+
+- 让 LLM 作为特征提取器
+- 输出结构化事件特征
+- 再进入 `event_score`
+- 然后用 batch replay 做权重回测
+
+### 4. 宏观风险覆盖层继续回测
+
+当前宏观覆盖层 v1 已接进主链路，但还需要验证：
+
+- 它到底是在帮你避坑
+- 还是只是让系统更保守
+
+建议后面把：
+
+- `纯规则`
+- `纯规则 + 宏观覆盖层`
+
+先稳定赛马比较。
+
+## 风险与阻塞点
+
+### 1. 兑现池逻辑已落地，但仍是 v1
+
+当前是第一版规则化兑现池，优点是：
+
+- 可回测
+- 可解释
+- 和真实执行口径一致
+
+但还没有：
+
+- 分批兑现
+- 组合级仓位账本
+- 更细的持仓管理逻辑
+
+所以这版更适合：
+
+- 单信号级别的盈利管理
+
+还不适合：
+
+- 真实组合仓位调度
+
+### 2. 新止盈区间会改变部分老样本行为
+
+这不是 bug，而是预期内结果。  
+新的 `R multiple + 阻力修正 + 最低赔率` 会让一部分以前能进确认池的票，现在降级为观察。
+
+这会带来：
+
+- 某些旧测试样本行为变化
+- 某些旧策略直觉被纠正
+
+当前已经把核心回归收绿，但后面仍建议多看真实样本。
+
+### 3. LLM 仍未进入正式打分层
+
+当前 LLM 主要解决的是：
+
+- 卡片可读性
+
+还没有真正进入：
+
+- `event_score`
+- `ranking`
+- 策略赛马主比较组
+
+所以当前的“策略质量提升”主要还来自：
+
+- 止盈区
+- 兑现池
+- 宏观覆盖
+
+而不是 LLM 本身。
+
+### 4. 赛马框架已具备，但还不是当前第一优先级
+
+当前 batch replay、模板和中文报告都已具备基础能力。  
+但在兑现池和止盈区刚重构完的阶段，我建议先别急着大规模赛马，而是：
+
+- 先审真实样本
+- 再做下一轮策略比较
+
+## 快速命令
+
+### 运行 serve
 
 ```bash
-SATELLITE_USE_SEC_FILINGS_SOURCE=1 SATELLITE_USE_GOOGLE_NEWS_SOURCE=1 PYTHONPATH=src .venv/bin/python -m satellite_agent.main run-once --limit 10
+cd /Users/linxun/CodeSpace/asset_allocation_system
+PYTHONPATH=src .venv/bin/python -m satellite_agent.main serve --workspace-dir ./data/satellite_agent/serve
 ```
 
-Run continuous monitoring:
+### 预览正式卡 / 观察卡 / 预备池轻推
 
 ```bash
-SATELLITE_USE_SEC_FILINGS_SOURCE=1 SATELLITE_USE_GOOGLE_NEWS_SOURCE=1 PYTHONPATH=src .venv/bin/python -m satellite_agent.main serve --limit 10
+cd /Users/linxun/CodeSpace/asset_allocation_system
+PYTHONPATH=src .venv/bin/python -m satellite_agent.main preview-alert-render --symbol NVDA
+PYTHONPATH=src .venv/bin/python -m satellite_agent.main preview-alert-render --symbol NVDA --watch
+PYTHONPATH=src .venv/bin/python -m satellite_agent.main preview-alert-render --symbol NBIS --prewatch-light
 ```
 
-Backfill outcomes for a run:
+### 生成 LLM 用量报告
 
 ```bash
-PYTHONPATH=src .venv/bin/python -m satellite_agent.main backfill-decision-outcomes --run-id <run_id>
+cd /Users/linxun/CodeSpace/asset_allocation_system
+PYTHONPATH=src .venv/bin/python -m satellite_agent.main write-llm-usage-report --workspace-dir ./data/satellite_agent/serve --days 7
 ```
 
-Open latest review:
+### 同步 watchlist 与导出题材参考
 
 ```bash
-sed -n '1,220p' data/satellite_agent/run_once/run_once_review.md
+cd /Users/linxun/CodeSpace/asset_allocation_system
+PYTHONPATH=src .venv/bin/python -m satellite_agent.main sync-watchlist
+PYTHONPATH=src .venv/bin/python -m satellite_agent.main write-theme-reference --path ./config/satellite_agent/theme_reference.json
 ```
 
-Inspect latest payload keys:
+## 本次涉及的主要文件
 
-```bash
-python3 - <<'PY'
-import json
-from pathlib import Path
-obj = json.loads(Path('data/satellite_agent/run_once/run_once_payload.json').read_text())
-print(sorted(obj.keys()))
-PY
-```
-
-## Environment Notes
-
-- Use only the project-local environment: `.venv`
-- Do not install dependencies globally
-- `rg` is not usable in this environment (`bad CPU type`); prefer `grep`, `find`, `sed`, or short Python one-liners
-- Network-requiring validations still depend on runtime environment; sandboxed runs may behave differently
-
-## Resume Instruction
-
-When resuming, read this file first, then continue with:
-
-`Refactor notifier/reporting to consume DecisionPacket-derived diagnostics more directly, and reduce remaining direct OpportunityCard coupling in the decision path.`
+- [src/satellite_agent/entry_exit.py](/Users/linxun/CodeSpace/asset_allocation_system/src/satellite_agent/entry_exit.py)
+- [src/satellite_agent/main.py](/Users/linxun/CodeSpace/asset_allocation_system/src/satellite_agent/main.py)
+- [src/satellite_agent/models.py](/Users/linxun/CodeSpace/asset_allocation_system/src/satellite_agent/models.py)
+- [src/satellite_agent/notifier.py](/Users/linxun/CodeSpace/asset_allocation_system/src/satellite_agent/notifier.py)
+- [src/satellite_agent/outcomes.py](/Users/linxun/CodeSpace/asset_allocation_system/src/satellite_agent/outcomes.py)
+- [src/satellite_agent/reporting.py](/Users/linxun/CodeSpace/asset_allocation_system/src/satellite_agent/reporting.py)
+- [src/satellite_agent/service.py](/Users/linxun/CodeSpace/asset_allocation_system/src/satellite_agent/service.py)
+- [src/satellite_agent/store.py](/Users/linxun/CodeSpace/asset_allocation_system/src/satellite_agent/store.py)
+- [tests/test_outcomes.py](/Users/linxun/CodeSpace/asset_allocation_system/tests/test_outcomes.py)
+- [tests/test_reporting.py](/Users/linxun/CodeSpace/asset_allocation_system/tests/test_reporting.py)
+- [tests/test_scoring_service.py](/Users/linxun/CodeSpace/asset_allocation_system/tests/test_scoring_service.py)

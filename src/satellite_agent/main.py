@@ -177,7 +177,8 @@ def _historical_effect_priority_label(priority: str) -> str:
 
 def _historical_effect_exit_reason_label(reason: str) -> str:
     return {
-        "hit_take_profit": "止盈退出",
+        "exit_pool": "兑现池退出（含达标止盈 / 提前锁盈 / 宏观保护）",
+        "hit_take_profit": "兑现池退出（含达标止盈 / 提前锁盈 / 宏观保护）",
         "hit_invalidation": "失效退出",
         "window_complete": "复盘窗口结算",
         "insufficient_lookahead": "观察中",
@@ -189,6 +190,57 @@ def _historical_effect_status_label(*, entered: bool, close_reason: str) -> str:
     if not entered:
         return "未进场"
     return _historical_effect_exit_reason_label(close_reason)
+
+
+def _is_profit_exit_reason(reason: str) -> bool:
+    return str(reason or "").strip() in {"exit_pool", "hit_take_profit"}
+
+
+def _close_reason_equivalent_for_audit(
+    stored_reason: str,
+    recomputed_reason: str,
+    *,
+    recomputed_subreason: str = "",
+    legacy_take_profit_triggered: bool = False,
+) -> bool:
+    stored = str(stored_reason or "").strip()
+    recomputed = str(recomputed_reason or "").strip()
+    if stored == recomputed:
+        return True
+    return (
+        stored == "hit_take_profit"
+        and (
+            (
+                recomputed == "exit_pool"
+                and str(recomputed_subreason or "").strip() == "target_hit"
+            )
+            or (recomputed == "insufficient_lookahead" and legacy_take_profit_triggered)
+        )
+    )
+
+
+def _should_tolerate_legacy_take_profit_prices(
+    row: dict[str, Any],
+    recomputed: Any,
+    *,
+    legacy_take_profit_triggered: bool = False,
+) -> bool:
+    if not _close_reason_equivalent_for_audit(
+        str(row.get("close_reason") or ""),
+        str(getattr(recomputed, "close_reason", "") or ""),
+        recomputed_subreason=str(getattr(recomputed, "exit_subreason", "") or ""),
+        legacy_take_profit_triggered=legacy_take_profit_triggered,
+    ):
+        return False
+    take_profit_range = (_extract_sample_price_context(dict(row)).get("take_profit_range") or {})
+    take_profit_low = take_profit_range.get("low")
+    stored_exit = row.get("exit_price")
+    if take_profit_low is None or stored_exit is None:
+        return False
+    try:
+        return abs(float(stored_exit) - float(take_profit_low)) <= 0.01
+    except (TypeError, ValueError):
+        return False
 
 
 def _serialize_ranked_decision_rows(
@@ -212,7 +264,7 @@ def _serialize_ranked_decision_rows(
                 ),
                 "real_exit_label": (
                     "已真实退出"
-                    if str(row.get("close_reason") or "") in {"hit_take_profit", "hit_invalidation", "window_complete"}
+                if str(row.get("close_reason") or "") in {"exit_pool", "hit_take_profit", "hit_invalidation", "window_complete"}
                     and row.get("realized_return") is not None
                     else "未真实退出"
                 ),
@@ -620,11 +672,11 @@ def _aggregate_historical_effect_rows(
         exited_rows = [
             row
             for row in entered_rows
-            if str(row.get("close_reason") or "") in {"hit_take_profit", "hit_invalidation", "window_complete"}
+            if str(row.get("close_reason") or "") in {"exit_pool", "hit_invalidation", "window_complete"}
             and row.get("realized_return") is not None
         ]
         realized_values = [float(row["realized_return"]) for row in exited_rows]
-        take_profit_count = sum(1 for row in entered_rows if str(row.get("close_reason") or "") == "hit_take_profit")
+        take_profit_count = sum(1 for row in entered_rows if _is_profit_exit_reason(str(row.get("close_reason") or "")))
         invalidation_count = sum(1 for row in entered_rows if str(row.get("close_reason") or "") == "hit_invalidation")
         window_complete_count = sum(1 for row in entered_rows if str(row.get("close_reason") or "") == "window_complete")
         items.append(
@@ -723,7 +775,7 @@ def _build_historical_effect_review_data(
     observation_rows_merged = _merge_decision_rows(list(observation_rows), list(archive_observation_rows))
     entered_rows = [row for row in rows if bool(row.get("entered"))]
     not_entered_rows = [row for row in rows if not bool(row.get("entered"))]
-    take_profit_rows = [row for row in entered_rows if str(row.get("close_reason") or "") == "hit_take_profit"]
+    take_profit_rows = [row for row in entered_rows if _is_profit_exit_reason(str(row.get("close_reason") or ""))]
     invalidation_rows = [row for row in entered_rows if str(row.get("close_reason") or "") == "hit_invalidation"]
     window_complete_rows = [row for row in entered_rows if str(row.get("close_reason") or "") == "window_complete"]
     exited_rows = take_profit_rows + invalidation_rows + window_complete_rows
@@ -1141,9 +1193,29 @@ def _build_sample_recompute_check(store: Store, row: dict[str, Any]) -> dict[str
             "issues": [computation.skip_reason or "当前口径无法从样本 bars 重算结果"],
         }
     issues: list[str] = []
+    price_context = _extract_sample_price_context(dict(row))
+    take_profit_range = price_context.get("take_profit_range") or {}
+    take_profit_low = take_profit_range.get("low")
+    legacy_take_profit_triggered = False
+    if str(row.get("close_reason") or "").strip() == "hit_take_profit" and take_profit_low is not None:
+        try:
+            tp_low_value = float(take_profit_low)
+            legacy_take_profit_triggered = any(float(bar.high) >= tp_low_value for bar in bars)
+        except (TypeError, ValueError):
+            legacy_take_profit_triggered = False
+    legacy_take_profit_equivalent = _should_tolerate_legacy_take_profit_prices(
+        row,
+        recomputed,
+        legacy_take_profit_triggered=legacy_take_profit_triggered,
+    )
     if bool(row.get("entered")) != bool(recomputed.entered):
         issues.append(f"entered: 存量={bool(row.get('entered'))} / 重算={bool(recomputed.entered)}")
-    if str(row.get("close_reason") or "") != str(recomputed.close_reason or ""):
+    if not _close_reason_equivalent_for_audit(
+        str(row.get("close_reason") or ""),
+        str(recomputed.close_reason or ""),
+        recomputed_subreason=str(recomputed.exit_subreason or ""),
+        legacy_take_profit_triggered=legacy_take_profit_triggered,
+    ):
         issues.append(
             f"close_reason: 存量={str(row.get('close_reason') or '-') } / 重算={str(recomputed.close_reason or '-')}"
         )
@@ -1152,6 +1224,8 @@ def _build_sample_recompute_check(store: Store, row: dict[str, Any]) -> dict[str
         ("exit_price", "exit_price"),
         ("realized_return", "realized_return"),
     ):
+        if legacy_take_profit_equivalent and field in {"exit_price", "realized_return"}:
+            continue
         stored_value = row.get(field)
         recomputed_value = getattr(recomputed, field)
         if stored_value is None and recomputed_value is None:
@@ -1205,6 +1279,7 @@ def _summarize_adjusted_price_readiness(store: Store, rows: list[dict[str, Any]]
 def _sample_status_label(row: dict[str, Any]) -> str:
     mapping = {
         "hit_take_profit": "止盈退出",
+        "exit_pool": "止盈退出",
         "hit_invalidation": "失效退出",
         "window_complete": "复盘窗口结算",
         "insufficient_lookahead": "观察中",
@@ -1247,7 +1322,7 @@ def build_outcome_sample_payload(
         merged_rows,
         key=lambda row: (
             0
-            if str(row.get("close_reason") or "") in {"hit_take_profit", "hit_invalidation", "window_complete"}
+            if str(row.get("close_reason") or "") in {"hit_take_profit", "exit_pool", "hit_invalidation", "window_complete"}
             else 1,
             str(row.get("created_at") or ""),
             str(row.get("symbol") or ""),

@@ -218,6 +218,7 @@ class Store:
             hit_take_profit INTEGER NOT NULL DEFAULT 0,
             hit_invalidation INTEGER NOT NULL DEFAULT 0,
             close_reason TEXT NOT NULL DEFAULT '',
+            exit_subreason TEXT NOT NULL DEFAULT '',
             updated_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS agent_state (
@@ -735,6 +736,7 @@ class Store:
                 do.hit_take_profit,
                 do.hit_invalidation,
                 do.close_reason,
+                do.exit_subreason,
                 do.updated_at AS outcome_updated_at
             FROM decision_records dr
             LEFT JOIN event_insights ei ON dr.event_id = ei.event_id AND dr.run_id = ei.run_id
@@ -778,7 +780,7 @@ class Store:
                     OR do.entered IS NULL
                     OR (do.entered = 1 AND do.entry_price IS NULL)
                     OR (
-                        do.close_reason IN ('hit_take_profit', 'hit_invalidation', 'window_complete')
+                        do.close_reason IN ('exit_pool', 'hit_invalidation', 'window_complete')
                         AND (
                             do.exit_price IS NULL
                             OR do.realized_return IS NULL
@@ -846,6 +848,7 @@ class Store:
                 do.hit_take_profit,
                 do.hit_invalidation,
                 do.close_reason,
+                do.exit_subreason,
                 do.updated_at AS outcome_updated_at
             FROM decision_records dr
             LEFT JOIN event_insights ei ON dr.event_id = ei.event_id AND dr.run_id = ei.run_id
@@ -908,6 +911,7 @@ class Store:
                 do.hit_take_profit,
                 do.hit_invalidation,
                 do.close_reason,
+                do.exit_subreason,
                 do.updated_at AS outcome_updated_at
             FROM decision_records dr
             LEFT JOIN event_insights ei ON dr.event_id = ei.event_id AND dr.run_id = ei.run_id
@@ -1086,7 +1090,11 @@ class Store:
                 SUM(CASE WHEN do.close_reason = 'insufficient_lookahead' THEN 1 ELSE 0 END) AS pending_count,
                 SUM(CASE WHEN do.entered = 1 THEN 1 ELSE 0 END) AS entered_count,
                 SUM(CASE WHEN do.close_reason = 'not_entered' THEN 1 ELSE 0 END) AS not_entered_count,
-                SUM(CASE WHEN do.hit_take_profit = 1 THEN 1 ELSE 0 END) AS take_profit_hits,
+                SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') THEN 1 ELSE 0 END) AS exit_pool_hits,
+                SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') OR do.hit_take_profit = 1 THEN 1 ELSE 0 END) AS take_profit_hits,
+                SUM(CASE WHEN do.exit_subreason = 'target_hit' THEN 1 ELSE 0 END) AS target_hit_count,
+                SUM(CASE WHEN do.exit_subreason = 'weakening_after_tp_zone' THEN 1 ELSE 0 END) AS weakening_exit_count,
+                SUM(CASE WHEN do.exit_subreason = 'macro_protection' THEN 1 ELSE 0 END) AS macro_protection_count,
                 SUM(CASE WHEN do.hit_invalidation = 1 THEN 1 ELSE 0 END) AS invalidation_hits,
                 SUM(CASE WHEN do.close_reason = 'window_complete' THEN 1 ELSE 0 END) AS window_complete_count,
                 SUM(CASE WHEN do.t_plus_3_return > 0 THEN 1 ELSE 0 END) AS positive_t3_count,
@@ -1122,7 +1130,11 @@ class Store:
                 COUNT(dr.decision_id) AS decision_count,
                 SUM(CASE WHEN do.decision_id IS NOT NULL THEN 1 ELSE 0 END) AS outcome_count,
                 SUM(CASE WHEN do.close_reason = 'insufficient_lookahead' THEN 1 ELSE 0 END) AS pending_count,
-                SUM(CASE WHEN do.hit_take_profit = 1 THEN 1 ELSE 0 END) AS take_profit_hits,
+                SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') THEN 1 ELSE 0 END) AS exit_pool_hits,
+                SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') OR do.hit_take_profit = 1 THEN 1 ELSE 0 END) AS take_profit_hits,
+                SUM(CASE WHEN do.exit_subreason = 'target_hit' THEN 1 ELSE 0 END) AS target_hit_count,
+                SUM(CASE WHEN do.exit_subreason = 'weakening_after_tp_zone' THEN 1 ELSE 0 END) AS weakening_exit_count,
+                SUM(CASE WHEN do.exit_subreason = 'macro_protection' THEN 1 ELSE 0 END) AS macro_protection_count,
                 SUM(CASE WHEN do.hit_invalidation = 1 THEN 1 ELSE 0 END) AS invalidation_hits,
                 SUM(CASE WHEN do.t_plus_3_return > 0 THEN 1 ELSE 0 END) AS positive_t3_count,
                 SUM(CASE WHEN do.t_plus_3_return IS NOT NULL THEN 1 ELSE 0 END) AS t_plus_3_sample_count,
@@ -1151,7 +1163,11 @@ class Store:
                 SUM(CASE WHEN do.close_reason = 'insufficient_lookahead' THEN 1 ELSE 0 END) AS pending_count,
                 SUM(CASE WHEN do.entered = 1 THEN 1 ELSE 0 END) AS entered_count,
                 SUM(CASE WHEN do.close_reason = 'not_entered' THEN 1 ELSE 0 END) AS not_entered_count,
-                SUM(CASE WHEN do.hit_take_profit = 1 THEN 1 ELSE 0 END) AS take_profit_hits,
+                SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') THEN 1 ELSE 0 END) AS exit_pool_hits,
+                SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') OR do.hit_take_profit = 1 THEN 1 ELSE 0 END) AS take_profit_hits,
+                SUM(CASE WHEN do.exit_subreason = 'target_hit' THEN 1 ELSE 0 END) AS target_hit_count,
+                SUM(CASE WHEN do.exit_subreason = 'weakening_after_tp_zone' THEN 1 ELSE 0 END) AS weakening_exit_count,
+                SUM(CASE WHEN do.exit_subreason = 'macro_protection' THEN 1 ELSE 0 END) AS macro_protection_count,
                 SUM(CASE WHEN do.hit_invalidation = 1 THEN 1 ELSE 0 END) AS invalidation_hits,
                 SUM(CASE WHEN do.close_reason = 'window_complete' THEN 1 ELSE 0 END) AS window_complete_count,
                 SUM(CASE WHEN do.t_plus_3_return > 0 THEN 1 ELSE 0 END) AS positive_t3_count,
@@ -1187,7 +1203,11 @@ class Store:
                 COUNT(dr.decision_id) AS decision_count,
                 SUM(CASE WHEN do.decision_id IS NOT NULL THEN 1 ELSE 0 END) AS outcome_count,
                 SUM(CASE WHEN do.close_reason = 'insufficient_lookahead' THEN 1 ELSE 0 END) AS pending_count,
-                SUM(CASE WHEN do.hit_take_profit = 1 THEN 1 ELSE 0 END) AS take_profit_hits,
+                SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') THEN 1 ELSE 0 END) AS exit_pool_hits,
+                SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') OR do.hit_take_profit = 1 THEN 1 ELSE 0 END) AS take_profit_hits,
+                SUM(CASE WHEN do.exit_subreason = 'target_hit' THEN 1 ELSE 0 END) AS target_hit_count,
+                SUM(CASE WHEN do.exit_subreason = 'weakening_after_tp_zone' THEN 1 ELSE 0 END) AS weakening_exit_count,
+                SUM(CASE WHEN do.exit_subreason = 'macro_protection' THEN 1 ELSE 0 END) AS macro_protection_count,
                 SUM(CASE WHEN do.hit_invalidation = 1 THEN 1 ELSE 0 END) AS invalidation_hits,
                 SUM(CASE WHEN do.t_plus_3_return > 0 THEN 1 ELSE 0 END) AS positive_t3_count,
                 SUM(CASE WHEN do.t_plus_3_return IS NOT NULL THEN 1 ELSE 0 END) AS t_plus_3_sample_count,
@@ -1215,7 +1235,11 @@ class Store:
                 SUM(CASE WHEN do.close_reason = 'insufficient_lookahead' THEN 1 ELSE 0 END) AS pending_count,
                 SUM(CASE WHEN do.entered = 1 THEN 1 ELSE 0 END) AS entered_count,
                 SUM(CASE WHEN do.close_reason = 'not_entered' THEN 1 ELSE 0 END) AS not_entered_count,
-                SUM(CASE WHEN do.close_reason = 'hit_take_profit' THEN 1 ELSE 0 END) AS take_profit_exit_count,
+                SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') THEN 1 ELSE 0 END) AS exit_pool_count,
+                SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') THEN 1 ELSE 0 END) AS take_profit_exit_count,
+                SUM(CASE WHEN do.exit_subreason = 'target_hit' THEN 1 ELSE 0 END) AS target_hit_count,
+                SUM(CASE WHEN do.exit_subreason = 'weakening_after_tp_zone' THEN 1 ELSE 0 END) AS weakening_exit_count,
+                SUM(CASE WHEN do.exit_subreason = 'macro_protection' THEN 1 ELSE 0 END) AS macro_protection_count,
                 SUM(CASE WHEN do.close_reason = 'hit_invalidation' THEN 1 ELSE 0 END) AS invalidation_exit_count,
                 SUM(CASE WHEN do.close_reason = 'window_complete' THEN 1 ELSE 0 END) AS window_complete_count,
                 ROUND(AVG(do.realized_return), 2) AS avg_realized_return,
@@ -1246,7 +1270,11 @@ class Store:
                     0 AS pending_count,
                     0 AS entered_count,
                     0 AS not_entered_count,
+                    0 AS exit_pool_count,
                     0 AS take_profit_exit_count,
+                    0 AS target_hit_count,
+                    0 AS weakening_exit_count,
+                    0 AS macro_protection_count,
                     0 AS invalidation_exit_count,
                     0 AS window_complete_count,
                     NULL AS avg_realized_return,
@@ -1587,6 +1615,7 @@ class Store:
         hit_take_profit: bool = False,
         hit_invalidation: bool = False,
         close_reason: str = "",
+        exit_subreason: str = "",
         updated_at: str,
     ) -> None:
         self.connection.execute(
@@ -1595,8 +1624,8 @@ class Store:
             (decision_id, entered, entered_at, entry_price, exit_price, realized_return, holding_days,
              gross_realized_return, net_realized_return, slippage_bps,
              t_plus_1_return, t_plus_3_return, t_plus_5_return, t_plus_7_return, t_plus_10_return, t_plus_14_return, t_plus_30_return,
-             max_runup, max_drawdown, hit_take_profit, hit_invalidation, close_reason, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             max_runup, max_drawdown, hit_take_profit, hit_invalidation, close_reason, exit_subreason, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 decision_id,
@@ -1621,6 +1650,7 @@ class Store:
                 1 if hit_take_profit else 0,
                 1 if hit_invalidation else 0,
                 close_reason,
+                exit_subreason,
                 updated_at,
             ),
         )
@@ -1655,6 +1685,7 @@ class Store:
         self._ensure_table_column("decision_outcomes", "t_plus_7_return", "REAL")
         self._ensure_table_column("decision_outcomes", "t_plus_14_return", "REAL")
         self._ensure_table_column("decision_outcomes", "t_plus_30_return", "REAL")
+        self._ensure_table_column("decision_outcomes", "exit_subreason", "TEXT NOT NULL DEFAULT ''")
         self._ensure_table_column("price_bars_5m", "adjusted", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_table_column("price_bars_1d", "adjusted", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_table_column("llm_usage", "component", "TEXT NOT NULL DEFAULT 'event_extraction'")

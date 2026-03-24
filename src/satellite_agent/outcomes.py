@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
+from .indicators import simple_moving_average
 from .models import Bar, ensure_utc, utcnow
 from .market_data import MultiSourceMarketDataError
 from .store import Store
@@ -13,6 +14,7 @@ from .store import Store
 MAX_OUTCOME_LOOKAHEAD_DAYS = 10
 DEFAULT_INCREMENTAL_OUTCOME_BACKFILL_DAYS = 45
 US_MARKET_TZ = ZoneInfo("America/New_York")
+MACRO_PROXY_SYMBOLS = ("SPY", "QQQ", "SMH", "TLT")
 
 
 @dataclass
@@ -39,6 +41,7 @@ class DecisionOutcomeResult:
     hit_take_profit: bool
     hit_invalidation: bool
     close_reason: str
+    exit_subreason: str = ""
 
 
 @dataclass
@@ -132,7 +135,7 @@ def _coerce_float(value: Any) -> float | None:
         return None
 
 
-def _extract_price_levels(row: Any) -> tuple[float | None, float | None]:
+def _extract_price_levels(row: Any) -> tuple[float | None, float | None, float | None]:
     packet = _load_packet_payload(row)
     packet_price_plan = packet.get("price_plan") or {}
     entry_plan = _load_json_payload(row["entry_plan_json"] if "entry_plan_json" in row.keys() else None)
@@ -143,13 +146,20 @@ def _extract_price_levels(row: Any) -> tuple[float | None, float | None]:
         or entry_plan.get("take_profit_range")
         or {}
     )
-    take_profit_level = _coerce_float(
+    take_profit_low = _coerce_float(
         take_profit_range.get("low")
         if isinstance(take_profit_range, dict)
         else None
     )
-    if take_profit_level is None and isinstance(take_profit_range, dict):
-        take_profit_level = _coerce_float(take_profit_range.get("high"))
+    take_profit_high = _coerce_float(
+        take_profit_range.get("high")
+        if isinstance(take_profit_range, dict)
+        else None
+    )
+    if take_profit_low is None and take_profit_high is not None:
+        take_profit_low = take_profit_high
+    if take_profit_high is None and take_profit_low is not None:
+        take_profit_high = take_profit_low
 
     invalidation_level = _coerce_float(packet_price_plan.get("invalidation_level"))
     if invalidation_level is None:
@@ -157,7 +167,17 @@ def _extract_price_levels(row: Any) -> tuple[float | None, float | None]:
     if invalidation_level is None:
         invalidation_level = _coerce_float(invalidation.get("level"))
 
-    return take_profit_level, invalidation_level
+    return take_profit_low, take_profit_high, invalidation_level
+
+
+def _take_profit_midpoint(low: float | None, high: float | None) -> float | None:
+    if low is None and high is None:
+        return None
+    if low is None:
+        return high
+    if high is None:
+        return low
+    return round((low + high) / 2.0, 4)
 
 
 def _extract_entry_range(row: Any) -> tuple[float | None, float | None]:
@@ -191,52 +211,138 @@ def _bar_overlaps_entry(bar: Bar, *, entry_low: float, entry_high: float) -> boo
 def _resolve_long_exit(
     bar: Bar,
     *,
-    take_profit_level: float | None,
+    take_profit_mid: float | None,
     invalidation_level: float | None,
-) -> tuple[str, float | None]:
+) -> tuple[str, float | None, str]:
     hit_invalidation = invalidation_level is not None and bar.low <= invalidation_level
-    hit_take_profit = take_profit_level is not None and bar.high >= take_profit_level
+    hit_take_profit = take_profit_mid is not None and bar.high >= take_profit_mid
     if hit_invalidation and hit_take_profit:
         exit_price = float(bar.open) if invalidation_level is not None and float(bar.open) <= invalidation_level else invalidation_level
-        return "hit_invalidation", round(float(exit_price), 4) if exit_price is not None else None
+        return "hit_invalidation", round(float(exit_price), 4) if exit_price is not None else None, ""
     if hit_invalidation:
         exit_price = float(bar.open) if invalidation_level is not None and float(bar.open) <= invalidation_level else invalidation_level
-        return "hit_invalidation", round(float(exit_price), 4) if exit_price is not None else None
+        return "hit_invalidation", round(float(exit_price), 4) if exit_price is not None else None, ""
     if hit_take_profit:
-        exit_price = float(bar.open) if take_profit_level is not None and float(bar.open) >= take_profit_level else take_profit_level
-        return "hit_take_profit", round(float(exit_price), 4) if exit_price is not None else None
-    return "", None
+        exit_price = float(bar.open) if take_profit_mid is not None and float(bar.open) >= take_profit_mid else take_profit_mid
+        return "exit_pool", round(float(exit_price), 4) if exit_price is not None else None, "target_hit"
+    return "", None, ""
 
 
 def _close_reason_for_window(
     bars: list[Bar],
     *,
-    take_profit_level: float | None,
+    take_profit_mid: float | None,
     invalidation_level: float | None,
 ) -> str:
     for bar in bars:
         hit_invalidation = invalidation_level is not None and bar.low <= invalidation_level
-        hit_take_profit = take_profit_level is not None and bar.high >= take_profit_level
+        hit_take_profit = take_profit_mid is not None and bar.high >= take_profit_mid
         if hit_invalidation and hit_take_profit:
             return "hit_invalidation"
         if hit_invalidation:
             return "hit_invalidation"
         if hit_take_profit:
-            return "hit_take_profit"
+            return "exit_pool"
     if len(bars) < MAX_OUTCOME_LOOKAHEAD_DAYS + 1:
         return "insufficient_lookahead"
     return "window_complete"
 
+def _atr_slice(bars: list[Bar], end_index: int, period: int = 14) -> float:
+    start_index = max(1, end_index - period + 1)
+    true_ranges: list[float] = []
+    for index in range(start_index, end_index + 1):
+        current = bars[index]
+        previous_close = float(bars[index - 1].close) if index > 0 else float(current.close)
+        true_ranges.append(
+            max(
+                float(current.high) - float(current.low),
+                abs(float(current.high) - previous_close),
+                abs(float(current.low) - previous_close),
+            )
+        )
+    if not true_ranges:
+        return max(float(bars[end_index].high) - float(bars[end_index].low), 0.01)
+    return max(sum(true_ranges) / len(true_ranges), 0.01)
 
-def compute_decision_outcome(row: Any, bars: list[Bar]) -> DecisionOutcomeResult | None:
-    return _compute_decision_outcome(row, bars).outcome
+
+def _trend_state_for_bars(bars: list[Bar], *, up_to_session: date) -> str:
+    eligible = [float(bar.close) for bar in bars if _market_session_date(bar.timestamp) <= up_to_session]
+    if len(eligible) < 60:
+        return "neutral"
+    last_price = eligible[-1]
+    sma20 = simple_moving_average(eligible, 20)
+    sma60 = simple_moving_average(eligible, 60)
+    if last_price >= sma20 >= sma60:
+        return "bullish"
+    if last_price <= sma20 <= sma60:
+        return "bearish"
+    return "neutral"
 
 
-def explain_decision_outcome(row: Any, bars: list[Bar]) -> DecisionOutcomeComputation:
-    return _compute_decision_outcome(row, bars)
+def _macro_risk_score_for_session(session_day: date, proxy_bars_by_symbol: dict[str, list[Bar]]) -> float:
+    scores: list[int] = []
+    trends: dict[str, str] = {}
+    for symbol in MACRO_PROXY_SYMBOLS:
+        proxy_bars = proxy_bars_by_symbol.get(symbol, [])
+        trends[symbol] = _trend_state_for_bars(proxy_bars, up_to_session=session_day) if proxy_bars else "neutral"
+    for symbol in ("SPY", "QQQ", "SMH"):
+        trend_state = trends.get(symbol, "neutral")
+        if trend_state == "bullish":
+            scores.append(1)
+        elif trend_state == "bearish":
+            scores.append(-1)
+        else:
+            scores.append(0)
+    avg_score = sum(scores) / len(scores) if scores else 0.0
+    if avg_score <= -0.6:
+        regime = "risk_off"
+    elif avg_score >= 0.6:
+        regime = "risk_on"
+    else:
+        regime = "neutral"
+    tlt_trend = trends.get("TLT", "neutral")
+    if tlt_trend == "bearish":
+        rate_risk = "high"
+    elif tlt_trend == "neutral":
+        rate_risk = "medium"
+    else:
+        rate_risk = "low"
+    geopolitical_risk = (
+        "high"
+        if regime == "risk_off" and trends.get("SMH") == "bearish" and tlt_trend == "bullish"
+        else "low"
+    )
+    score = 0.0
+    score += {"risk_on": 10.0, "neutral": 35.0, "risk_off": 70.0}[regime]
+    score += {"low": 0.0, "medium": 10.0, "high": 20.0}[rate_risk]
+    score += {"low": 0.0, "high": 10.0}.get(geopolitical_risk, 5.0)
+    return round(min(score, 100.0), 2)
 
 
-def _compute_decision_outcome(row: Any, bars: list[Bar]) -> DecisionOutcomeComputation:
+def compute_decision_outcome(
+    row: Any,
+    bars: list[Bar],
+    *,
+    proxy_bars_by_symbol: dict[str, list[Bar]] | None = None,
+) -> DecisionOutcomeResult | None:
+    return _compute_decision_outcome(row, bars, proxy_bars_by_symbol=proxy_bars_by_symbol).outcome
+
+
+def explain_decision_outcome(
+    row: Any,
+    bars: list[Bar],
+    *,
+    proxy_bars_by_symbol: dict[str, list[Bar]] | None = None,
+) -> DecisionOutcomeComputation:
+    return _compute_decision_outcome(row, bars, proxy_bars_by_symbol=proxy_bars_by_symbol)
+
+
+def _compute_decision_outcome(
+    row: Any,
+    bars: list[Bar],
+    *,
+    proxy_bars_by_symbol: dict[str, list[Bar]] | None = None,
+) -> DecisionOutcomeComputation:
     created_at = _parse_timestamp(row["created_at"])
     if created_at is None:
         return DecisionOutcomeComputation(outcome=None, skip_reason="invalid_created_at")
@@ -257,12 +363,13 @@ def _compute_decision_outcome(row: Any, bars: list[Bar]) -> DecisionOutcomeCompu
     if anchor_price <= 0:
         return DecisionOutcomeComputation(outcome=None, skip_reason="invalid_anchor_price")
 
-    take_profit_level, invalidation_level = _extract_price_levels(row)
+    take_profit_low, take_profit_high, invalidation_level = _extract_price_levels(row)
+    take_profit_mid = _take_profit_midpoint(take_profit_low, take_profit_high)
 
     window = future_bars[: MAX_OUTCOME_LOOKAHEAD_DAYS + 1]
     max_runup = max((_pct_change(bar.high, anchor_price) for bar in window), default=None)
     max_drawdown = min((_pct_change(bar.low, anchor_price) for bar in window), default=None)
-    hit_take_profit = bool(take_profit_level is not None and any(bar.high >= take_profit_level for bar in window))
+    hit_take_profit = bool(take_profit_mid is not None and any(bar.high >= take_profit_mid for bar in window))
     hit_invalidation = bool(invalidation_level is not None and any(bar.low <= invalidation_level for bar in window))
 
     def _close_return(offset: int) -> float | None:
@@ -272,7 +379,7 @@ def _compute_decision_outcome(row: Any, bars: list[Bar]) -> DecisionOutcomeCompu
 
     close_reason = _close_reason_for_window(
         window,
-        take_profit_level=take_profit_level,
+        take_profit_mid=take_profit_mid,
         invalidation_level=invalidation_level,
     )
 
@@ -286,8 +393,11 @@ def _compute_decision_outcome(row: Any, bars: list[Bar]) -> DecisionOutcomeCompu
     gross_realized_return = None
     net_realized_return = None
     exit_reason = close_reason
+    exit_subreason = ""
     if entry_low is not None and entry_high is not None:
         entry_index = None
+        tp_zone_entered = False
+        weakening_close_count = 0
         for index, bar in enumerate(window):
             if invalidation_level is not None and float(bar.open) <= float(invalidation_level):
                 exit_reason = "not_entered"
@@ -303,25 +413,77 @@ def _compute_decision_outcome(row: Any, bars: list[Bar]) -> DecisionOutcomeCompu
             entry_index = index
             entered_at = ensure_utc(bar.timestamp).isoformat()
             entry_price = _entry_price_for_long(bar, entry_high=entry_high)
-            same_bar_exit_reason, same_bar_exit_price = _resolve_long_exit(
+            same_bar_exit_reason, same_bar_exit_price, same_bar_subreason = _resolve_long_exit(
                 bar,
-                take_profit_level=take_profit_level,
+                take_profit_mid=take_profit_mid,
                 invalidation_level=invalidation_level,
             )
             if same_bar_exit_reason:
                 exit_reason = same_bar_exit_reason
                 exit_price = same_bar_exit_price
+                exit_subreason = same_bar_subreason
+                holding_days = 0
+                break
+            tp_zone_entered = bool(take_profit_low is not None and float(bar.high) >= take_profit_low)
+            if (
+                tp_zone_entered
+                and take_profit_low is not None
+                and float(bar.close) < take_profit_low
+            ):
+                weakening_close_count = 1
+            if (
+                proxy_bars_by_symbol
+                and entry_price is not None
+                and float(bar.close) >= (entry_price + _atr_slice(window, index))
+                and _macro_risk_score_for_session(
+                    _market_session_date(bar.timestamp),
+                    proxy_bars_by_symbol,
+                )
+                >= 70.0
+            ):
+                exit_reason = "exit_pool"
+                exit_subreason = "macro_protection"
+                exit_price = round(float(bar.close), 4)
                 holding_days = 0
                 break
             for offset in range(index + 1, len(window)):
-                reason, resolved_exit_price = _resolve_long_exit(
-                    window[offset],
-                    take_profit_level=take_profit_level,
+                current_bar = window[offset]
+                reason, resolved_exit_price, resolved_subreason = _resolve_long_exit(
+                    current_bar,
+                    take_profit_mid=take_profit_mid,
                     invalidation_level=invalidation_level,
                 )
                 if not reason:
+                    if take_profit_low is not None and float(current_bar.high) >= take_profit_low:
+                        tp_zone_entered = True
+                    if tp_zone_entered and take_profit_low is not None and float(current_bar.close) < take_profit_low:
+                        weakening_close_count += 1
+                    elif tp_zone_entered:
+                        weakening_close_count = 0
+                    if tp_zone_entered and weakening_close_count >= 2:
+                        exit_reason = "exit_pool"
+                        exit_subreason = "weakening_after_tp_zone"
+                        exit_price = round(float(current_bar.close), 4)
+                        holding_days = offset - index
+                        break
+                    if (
+                        proxy_bars_by_symbol
+                        and entry_price is not None
+                        and float(current_bar.close) >= (entry_price + _atr_slice(window, offset))
+                        and _macro_risk_score_for_session(
+                            _market_session_date(current_bar.timestamp),
+                            proxy_bars_by_symbol,
+                        )
+                        >= 70.0
+                    ):
+                        exit_reason = "exit_pool"
+                        exit_subreason = "macro_protection"
+                        exit_price = round(float(current_bar.close), 4)
+                        holding_days = offset - index
+                        break
                     continue
                 exit_reason = reason
+                exit_subreason = resolved_subreason
                 exit_price = resolved_exit_price
                 holding_days = offset - index
                 break
@@ -336,29 +498,65 @@ def _compute_decision_outcome(row: Any, bars: list[Bar]) -> DecisionOutcomeCompu
         if not entered and len(window) >= MAX_OUTCOME_LOOKAHEAD_DAYS + 1:
             exit_reason = "not_entered"
     else:
-        if take_profit_level is not None or invalidation_level is not None:
+        if take_profit_mid is not None or invalidation_level is not None:
             entered = True
             entered_at = ensure_utc(anchor_bar.timestamp).isoformat()
             entry_price = round(float(anchor_bar.close), 4)
-            same_bar_exit_reason, same_bar_exit_price = _resolve_long_exit(
+            same_bar_exit_reason, same_bar_exit_price, same_bar_subreason = _resolve_long_exit(
                 anchor_bar,
-                take_profit_level=take_profit_level,
+                take_profit_mid=take_profit_mid,
                 invalidation_level=invalidation_level,
             )
             if same_bar_exit_reason:
                 exit_reason = same_bar_exit_reason
                 exit_price = same_bar_exit_price
+                exit_subreason = same_bar_subreason
                 holding_days = 0
             else:
+                tp_zone_entered = bool(take_profit_low is not None and float(anchor_bar.high) >= take_profit_low)
+                weakening_close_count = (
+                    1
+                    if tp_zone_entered and take_profit_low is not None and float(anchor_bar.close) < take_profit_low
+                    else 0
+                )
                 for offset in range(1, len(window)):
-                    reason, resolved_exit_price = _resolve_long_exit(
+                    current_bar = window[offset]
+                    reason, resolved_exit_price, resolved_subreason = _resolve_long_exit(
                         window[offset],
-                        take_profit_level=take_profit_level,
+                        take_profit_mid=take_profit_mid,
                         invalidation_level=invalidation_level,
                     )
                     if not reason:
+                        if take_profit_low is not None and float(current_bar.high) >= take_profit_low:
+                            tp_zone_entered = True
+                        if tp_zone_entered and take_profit_low is not None and float(current_bar.close) < take_profit_low:
+                            weakening_close_count += 1
+                        elif tp_zone_entered:
+                            weakening_close_count = 0
+                        if tp_zone_entered and weakening_close_count >= 2:
+                            exit_reason = "exit_pool"
+                            exit_subreason = "weakening_after_tp_zone"
+                            exit_price = round(float(current_bar.close), 4)
+                            holding_days = offset
+                            break
+                        if (
+                            proxy_bars_by_symbol
+                            and entry_price is not None
+                            and float(current_bar.close) >= (entry_price + _atr_slice(window, offset))
+                            and _macro_risk_score_for_session(
+                                _market_session_date(current_bar.timestamp),
+                                proxy_bars_by_symbol,
+                            )
+                            >= 70.0
+                        ):
+                            exit_reason = "exit_pool"
+                            exit_subreason = "macro_protection"
+                            exit_price = round(float(current_bar.close), 4)
+                            holding_days = offset
+                            break
                         continue
                     exit_reason = reason
+                    exit_subreason = resolved_subreason
                     exit_price = resolved_exit_price
                     holding_days = offset
                     break
@@ -378,7 +576,7 @@ def _compute_decision_outcome(row: Any, bars: list[Bar]) -> DecisionOutcomeCompu
             exit_reason = close_reason
 
     if entered and entry_price is not None and exit_price is not None and exit_reason in {
-        "hit_take_profit",
+        "exit_pool",
         "hit_invalidation",
         "window_complete",
     }:
@@ -407,9 +605,10 @@ def _compute_decision_outcome(row: Any, bars: list[Bar]) -> DecisionOutcomeCompu
             t_plus_30_return=_close_return(30),
             max_runup=max_runup,
             max_drawdown=max_drawdown,
-            hit_take_profit=exit_reason == "hit_take_profit",
+            hit_take_profit=exit_reason == "exit_pool" and exit_subreason == "target_hit",
             hit_invalidation=exit_reason == "hit_invalidation",
             close_reason=exit_reason,
+            exit_subreason=exit_subreason,
         )
     )
 
@@ -433,7 +632,7 @@ def backfill_decision_outcomes(
     skipped = 0
     pending_lookahead = 0
     completed_window = 0
-    take_profit_hits = 0
+    exit_pool_hits = 0
     invalidation_hits = 0
     skip_reasons = {
         "missing_bars": 0,
@@ -449,6 +648,16 @@ def backfill_decision_outcomes(
     fetch_failure_reasons: dict[str, str] = {}
     stale_symbol_details: dict[str, dict[str, str]] = {}
     bar_cache: dict[str, list[Bar]] = {}
+    proxy_bar_cache: dict[str, list[Bar]] = {}
+
+    def _load_proxy_bars(symbol: str) -> list[Bar]:
+        cached = proxy_bar_cache.get(symbol)
+        if cached is not None:
+            return cached
+        bars = store.load_price_bars(symbol, "1d", 400)
+        proxy_bar_cache[symbol] = bars
+        return bars
+
     for row in rows:
         symbol = row["symbol"]
         normalized_symbol = str(symbol).strip().upper()
@@ -513,7 +722,15 @@ def backfill_decision_outcomes(
                             "latest_remote_session": "",
                         }
             bar_cache[symbol] = bars
-        computation = _compute_decision_outcome(row, bars)
+        proxy_bars_by_symbol = {
+            proxy_symbol: _load_proxy_bars(proxy_symbol)
+            for proxy_symbol in MACRO_PROXY_SYMBOLS
+        }
+        computation = _compute_decision_outcome(
+            row,
+            bars,
+            proxy_bars_by_symbol=proxy_bars_by_symbol,
+        )
         outcome = computation.outcome
         if outcome is None:
             skipped += 1
@@ -556,14 +773,15 @@ def backfill_decision_outcomes(
             hit_take_profit=outcome.hit_take_profit,
             hit_invalidation=outcome.hit_invalidation,
             close_reason=outcome.close_reason,
+            exit_subreason=outcome.exit_subreason,
             updated_at=utcnow().isoformat(),
         )
         if outcome.close_reason == "insufficient_lookahead":
             pending_lookahead += 1
         else:
             completed_window += 1
-        if outcome.hit_take_profit:
-            take_profit_hits += 1
+        if outcome.close_reason == "exit_pool":
+            exit_pool_hits += 1
         if outcome.hit_invalidation:
             invalidation_hits += 1
         updated += 1
@@ -573,7 +791,8 @@ def backfill_decision_outcomes(
         "scanned": len(rows),
         "pending_lookahead": pending_lookahead,
         "completed_window": completed_window,
-        "take_profit_hits": take_profit_hits,
+        "exit_pool_hits": exit_pool_hits,
+        "take_profit_hits": exit_pool_hits,
         "invalidation_hits": invalidation_hits,
         "fetched_symbols": fetched_symbols,
         "fetch_attempted_symbols": fetch_attempted_symbols,
