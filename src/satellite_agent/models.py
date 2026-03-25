@@ -169,6 +169,13 @@ class OpportunityCard:
     execution_note: str = ""
     exit_pool_subreason: str = ""
     exit_pool_source_decision_id: str = ""
+    prewatch_observation_count: int = 0
+    prewatch_alert_sent_count: int = 0
+    prewatch_first_seen_at: str = ""
+    prewatch_last_seen_at: str = ""
+    prewatch_last_alert_sent_at: str = ""
+    prewatch_source_decision_id: str = ""
+    prewatch_promotion_reason: str = ""
 
     def ttl_delta(self) -> timedelta:
         return self.ttl - self.created_at

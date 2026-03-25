@@ -48,6 +48,48 @@ def _display_priority(priority: str) -> str:
     return {"high": "高优先级", "normal": "普通", "suppressed": "压制"}.get(priority, priority)
 
 
+def _display_alert_skip_reason(reason: str) -> str:
+    normalized = str(reason or "").strip()
+    mapping = {
+        "threshold_not_met": "停留在观察级别",
+        "quality_cutoff": "低于普通提醒门槛",
+        "run_alert_budget_exhausted": "超出本轮提醒上限",
+        "symbol_alert_budget_exhausted": "超出单标的提醒上限",
+        "deduplicated": "命中去重",
+        "sent": "已发送",
+        "dry_run": "演练发送",
+        "no_transport_configured": "未配置发送通道",
+    }
+    if normalized in mapping:
+        return mapping[normalized]
+    if normalized.startswith("transport_error:"):
+        return f"发送失败（{normalized.split(':', 1)[1] or 'Unknown'}）"
+    return normalized or "未说明"
+
+
+def _display_parameter_label(parameter_key: str) -> str:
+    return {
+        "event_score_threshold": "确认阈值",
+        "confirmation_bonus": "确认加分项",
+        "execution_entry_buffer_pct": "入场缓冲",
+        "execution_invalidation_buffer_pct": "失效缓冲",
+        "normal_alert_min_final_score": "普通提醒门槛",
+        "max_alerts_per_run": "单轮提醒上限",
+        "max_alerts_per_symbol_per_run": "单标的提醒上限",
+        "cross_source_dedup_hours": "跨源去重窗口",
+        "swing.priority_threshold": "短线优先级阈值",
+        "position.priority_threshold": "波段优先级阈值",
+    }.get(parameter_key, parameter_key)
+
+
+def _display_parameter_direction(direction: str) -> str:
+    return {
+        "high": "更可能偏高",
+        "low": "更可能偏低",
+        "inspect": "先排查",
+    }.get(direction, direction or "先排查")
+
+
 def _display_prewatch_setup(setup_type: str) -> str:
     return {
         "breakout_watch": "突破预热",
@@ -69,6 +111,151 @@ def _display_pool(pool: str) -> str:
         "confirmation": "确认池",
         "exit": "兑现池",
     }.get(pool, pool)
+
+
+def _format_alert_suppression_lines(
+    card_diagnostics: list[dict[str, Any]],
+    candidate_evaluation_summary: dict[str, Any] | None,
+) -> list[str]:
+    summary = _build_alert_suppression_summary(card_diagnostics, candidate_evaluation_summary)
+    if int(summary.get("total_cards", 0) or 0) <= 0:
+        return ["  本轮没有可诊断的提醒压制数据。"]
+
+    lines = [
+        "  "
+        f"共 {summary.get('total_cards', 0)} 张卡片，其中 {summary.get('observation_level_count', 0)} 张停留在观察级别，"
+        f"{summary.get('delivery_candidate_count', 0)} 张进入正式提醒候选，实际发送 {summary.get('sent_count', 0)} 张。"
+    ]
+    confirmation_blocked = summary.get("confirmation_blocked_reasons") or []
+    if confirmation_blocked:
+        parts = [
+            f"{item.get('label', item.get('reason', '-'))} {int(item.get('count', 0) or 0)} 条"
+            for item in confirmation_blocked
+        ]
+        lines.append(f"  确认机会候选被挡主因：{' / '.join(parts)}")
+    delivery_blocked = summary.get("delivery_blocked_reasons") or []
+    if delivery_blocked:
+        parts = [
+            f"{item.get('label', item.get('reason', '-'))} {int(item.get('count', 0) or 0)} 张"
+            for item in delivery_blocked[:3]
+        ]
+        lines.append(f"  提醒阶段被拦主因：{' / '.join(parts)}")
+    elif int(summary.get("delivery_candidate_count", 0) or 0) > 0:
+        lines.append("  进入正式提醒候选的卡片本轮都已经发出。")
+    else:
+        lines.append("  本轮没有卡片进入正式提醒候选，优先检查确认机会门槛和优先级门槛。")
+
+    return lines
+
+
+def _build_alert_suppression_summary(
+    card_diagnostics: list[dict[str, Any]] | None,
+    candidate_evaluation_summary: dict[str, Any] | None,
+) -> dict[str, Any]:
+    diagnostics = card_diagnostics or []
+    observation_level_cards = [row for row in diagnostics if str(row.get("priority") or "") == "suppressed"]
+    delivery_candidates = [row for row in diagnostics if str(row.get("priority") or "") != "suppressed"]
+    sent_candidates = [row for row in delivery_candidates if row.get("sent")]
+    blocked_candidates = [row for row in delivery_candidates if not row.get("sent")]
+
+    confirmation_summary = (candidate_evaluation_summary or {}).get("confirmation") or {}
+    confirmation_blocked = [
+        {
+            "reason": str(item.get("reason") or ""),
+            "label": str(item.get("label") or item.get("reason") or ""),
+            "count": int(item.get("count", 0) or 0),
+        }
+        for item in (confirmation_summary.get("top_blocked_reasons") or [])
+    ]
+
+    delivery_reason_counts: dict[str, int] = {}
+    for row in blocked_candidates:
+        reason = str(row.get("alert_reason") or "").strip()
+        if not reason:
+            continue
+        delivery_reason_counts[reason] = delivery_reason_counts.get(reason, 0) + 1
+    delivery_blocked = [
+        {
+            "reason": reason,
+            "label": _display_alert_skip_reason(reason),
+            "count": count,
+        }
+        for reason, count in sorted(delivery_reason_counts.items(), key=lambda item: (-item[1], item[0]))
+    ]
+
+    return {
+        "total_cards": len(diagnostics),
+        "observation_level_count": len(observation_level_cards),
+        "delivery_candidate_count": len(delivery_candidates),
+        "sent_count": len(sent_candidates),
+        "blocked_delivery_count": len(blocked_candidates),
+        "confirmation_blocked_reasons": confirmation_blocked,
+        "delivery_blocked_reasons": delivery_blocked,
+        "parameter_checklist": _build_alert_suppression_parameter_checklist(diagnostics, candidate_evaluation_summary),
+    }
+
+
+def _build_alert_suppression_parameter_checklist(
+    card_diagnostics: list[dict[str, Any]],
+    candidate_evaluation_summary: dict[str, Any] | None,
+    *,
+    limit: int = 5,
+) -> list[str]:
+    hints: list[tuple[str, str]] = []
+    confirmation_summary = (candidate_evaluation_summary or {}).get("confirmation") or {}
+    blocked_reasons = [
+        str(item.get("reason") or "").strip()
+        for item in (confirmation_summary.get("top_blocked_reasons") or [])
+        if str(item.get("reason") or "").strip()
+    ]
+    if "threshold_not_met" in blocked_reasons:
+        hints.extend(
+            [
+                ("event_score_threshold", "high"),
+                ("confirmation_bonus", "low"),
+            ]
+        )
+    if "execution_ineligible" in blocked_reasons:
+        hints.extend(
+            [
+                ("execution_entry_buffer_pct", "inspect"),
+                ("execution_invalidation_buffer_pct", "inspect"),
+            ]
+        )
+
+    observation_level_cards = [row for row in card_diagnostics if str(row.get("priority") or "") == "suppressed"]
+    if observation_level_cards:
+        hints.extend(
+            [
+                ("swing.priority_threshold", "high"),
+                ("position.priority_threshold", "high"),
+            ]
+        )
+
+    alert_reasons = {
+        str(row.get("alert_reason") or "").strip()
+        for row in card_diagnostics
+        if str(row.get("priority") or "") != "suppressed" and not row.get("sent")
+    }
+    if "quality_cutoff" in alert_reasons:
+        hints.append(("normal_alert_min_final_score", "high"))
+    if "run_alert_budget_exhausted" in alert_reasons:
+        hints.append(("max_alerts_per_run", "low"))
+    if "symbol_alert_budget_exhausted" in alert_reasons:
+        hints.append(("max_alerts_per_symbol_per_run", "low"))
+    if "deduplicated" in alert_reasons:
+        hints.append(("cross_source_dedup_hours", "inspect"))
+
+    seen: set[str] = set()
+    items: list[str] = []
+    for key, direction in hints:
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        items.append(f"{_display_parameter_label(key)}（{key}，{_display_parameter_direction(direction)}）")
+        if len(items) >= limit:
+            break
+    return items
 
 
 def _display_outcome_support_title(title: str) -> str:
@@ -616,7 +803,7 @@ def _assess_outcome_row_readiness(
     if completed_count == 1:
         return {
             "readiness_label": "轻度参考",
-            "readiness_note": "完整样本还太少，只适合轻推和观察，不适合直接放大权重。",
+            "readiness_note": "完整样本还太少，只适合观察提醒和观察，不适合直接放大权重。",
         }
     if avg_t3 is not None and avg_t3 <= 0:
         return {
@@ -895,7 +1082,7 @@ def _format_decision_detail_table(rows: list[dict[str, Any]]) -> list[str]:
         status = str(row.get("status_label") or "-")
         status_with_action = f"{status}（{action}）"
         entry_price = _format_metric_value(row.get("entry_price"))
-        exit_price = _format_metric_value(row.get("exit_price"))
+        exit_price = _format_exit_price_cell(row)
         realized_return = _format_metric_value(row.get("realized_return"), suffix="%")
         holding_days = _format_metric_value(row.get("holding_days"), suffix=" 天")
         lines.append(
@@ -926,7 +1113,7 @@ def _format_ranked_decision_table(
         status_with_action = f"{status}（{action}）"
         real_exit = str(row.get("real_exit_label") or "-")
         entry_price = _format_metric_value(row.get("entry_price"))
-        exit_price = _format_metric_value(row.get("exit_price"))
+        exit_price = _format_exit_price_cell(row)
         metric_value = _format_metric_value(row.get(metric_field), suffix="%")
         holding_days = _format_metric_value(row.get("holding_days"), suffix=" 天")
         lines.append(
@@ -987,6 +1174,24 @@ def _summarize_outcome_maturity(
     if not lines:
         lines.append("No completed outcome windows yet.")
     return {"line_items": lines}
+
+
+def _format_exit_price_cell(row: dict[str, Any]) -> str:
+    if row.get("exit_price") is not None:
+        return _format_metric_value(row.get("exit_price"))
+    entered = bool(row.get("entered"))
+    close_reason = str(row.get("close_reason") or "").strip()
+    if not entered:
+        if close_reason == "not_entered":
+            return "未进场"
+        if close_reason == "insufficient_lookahead":
+            return "待更多后验"
+        return "暂无"
+    if close_reason == "insufficient_lookahead":
+        return "仍在持有"
+    if close_reason in {"exit_pool", "hit_take_profit", "hit_invalidation", "window_complete"}:
+        return "待结算"
+    return "暂无"
 
 
 def _summarize_completed_cohorts(
@@ -1277,7 +1482,7 @@ def _recommend_strategy_outcomes(
         lines.insert(0, "Outcome evidence is still building; lean gradually rather than making a full policy rotation.")
     regime_title = (confidence_regime or {}).get("title", "")
     if regime_title == "观察期":
-        lines.insert(0, "当前更适合观察和轻推，而不是把后验结果直接翻译成强执行动作。")
+        lines.insert(0, "当前更适合观察和观察提醒，而不是把后验结果直接翻译成强执行动作。")
     elif regime_title == "积累期":
         lines.insert(0, "当前更适合渐进式加权和小步调整，而不是一次性切换整套策略偏好。")
     elif regime_title == "验证期":
@@ -1407,6 +1612,10 @@ def serialize_replay_evaluation(
         "card_diagnostics": card_diagnostics or [],
         "decision_diagnostics": decision_diagnostics or [],
         "prewatch_candidates": prewatch_candidates,
+        "alert_suppression_summary": _build_alert_suppression_summary(
+            card_diagnostics or [],
+            (run_detail or {}).get("candidate_evaluation_summary") or {},
+        ),
     }
 
 
@@ -2411,6 +2620,11 @@ def format_recent_performance_review(review: dict[str, Any]) -> str:
     window = review.get("review_window") or {}
     overview = review.get("overview") or {}
     quality = review.get("execution_quality") or {}
+    trade_path_summary = review.get("trade_path_summary") or {}
+    pool_funnel_summary = review.get("pool_funnel_summary") or {}
+    simulation_funnel_summary = review.get("simulation_funnel_summary") or {}
+    candidate_evaluation_summary = review.get("candidate_evaluation_summary") or {}
+    candidate_evaluation_trend_summary = review.get("candidate_evaluation_trend_summary") or {}
     appendix = review.get("appendix") or {}
     formal_readiness = review.get("formal_readiness") or {}
     adjusted_status = review.get("adjusted_price_status") or {}
@@ -2462,6 +2676,187 @@ def format_recent_performance_review(review: dict[str, Any]) -> str:
     lines.append(f"  已完成复盘样本数（已走出最终结果）：{quality.get('completed_outcome_count', 0)}")
     lines.append(f"  观察中样本数（含未进场与已进场未结束）：{quality.get('pending_outcome_count', 0)}")
 
+    lines.append("三池漏斗：")
+    if (
+        int(pool_funnel_summary.get("prewatch_candidate_count", 0) or 0) <= 0
+        and int(pool_funnel_summary.get("prewatch_light_push_count", 0) or 0) <= 0
+        and int(pool_funnel_summary.get("promoted_confirmation_count", 0) or 0) <= 0
+    ):
+        lines.append("  当前窗口内还没有形成可计算的观察 -> 观察提醒 -> 确认机会漏斗。")
+    else:
+        lines.append(f"  预备池候选：{pool_funnel_summary.get('prewatch_candidate_count', 0)} 条")
+        lines.append(
+            "  "
+            f"观察提醒：{pool_funnel_summary.get('prewatch_light_push_count', 0)} 条"
+            f"（观察 -> 观察提醒转化率：{_format_rate_value(pool_funnel_summary.get('observation_to_light_push_rate'))}）"
+        )
+        lines.append(
+            "  "
+            f"确认机会：{pool_funnel_summary.get('promoted_confirmation_count', 0)} 条"
+            f"（观察 -> 确认机会转化率：{_format_rate_value(pool_funnel_summary.get('observation_to_confirmation_rate'))}）"
+        )
+        lines.append(
+            "  "
+            f"观察提醒后确认机会：{pool_funnel_summary.get('promoted_after_light_push_count', 0)} 条"
+            f"（观察提醒 -> 确认机会转化率：{_format_rate_value(pool_funnel_summary.get('light_push_to_confirmation_rate'))}）"
+        )
+        if int(pool_funnel_summary.get("promoted_without_light_push_count", 0) or 0) > 0:
+            lines.append(
+                f"  另有 {pool_funnel_summary.get('promoted_without_light_push_count', 0)} 条未经过观察提醒，直接从观察进入确认机会。"
+            )
+        lines.append(
+            "  "
+            f"进入兑现池：{pool_funnel_summary.get('exit_from_promoted_count', 0)} 条"
+            f"（确认机会 -> 兑现转化率：{_format_rate_value(pool_funnel_summary.get('confirmation_to_exit_rate'))}）"
+        )
+
+    lines.append("最近新增观察样本：")
+    lines.extend(_format_recent_observation_sample_lines(review.get("recent_observation_samples") or []))
+
+    lines.append("完整模拟闭环：")
+    if (
+        int(simulation_funnel_summary.get("prewatch_candidate_count", 0) or 0) <= 0
+        and int(simulation_funnel_summary.get("prewatch_light_push_count", 0) or 0) <= 0
+        and int(simulation_funnel_summary.get("promoted_confirmation_count", 0) or 0) <= 0
+    ):
+        lines.append("  当前窗口内还没有形成可计算的完整模拟闭环。")
+    else:
+        lines.append(f"  观察：{simulation_funnel_summary.get('prewatch_candidate_count', 0)} 条")
+        lines.append(
+            "  "
+            f"观察提醒：{simulation_funnel_summary.get('prewatch_light_push_count', 0)} 条"
+            f"（观察 -> 观察提醒转化率：{_format_rate_value(simulation_funnel_summary.get('observation_to_light_push_rate'))}）"
+        )
+        lines.append(
+            "  "
+            f"确认机会：{simulation_funnel_summary.get('promoted_confirmation_count', 0)} 条"
+            f"（观察 -> 确认机会转化率：{_format_rate_value(simulation_funnel_summary.get('observation_to_confirmation_rate'))}）"
+        )
+        lines.append(
+            "  "
+            f"模拟进场：{simulation_funnel_summary.get('simulated_entry_count', 0)} 条"
+            f"（确认机会 -> 模拟进场转化率：{_format_rate_value(simulation_funnel_summary.get('confirmation_to_entry_rate'))}）"
+        )
+        lines.append(
+            "  "
+            f"进入兑现池：{simulation_funnel_summary.get('exit_pool_transition_count', 0)} 条"
+            f"（模拟进场 -> 进入兑现池转化率：{_format_rate_value(simulation_funnel_summary.get('entry_to_exit_pool_rate'))}）"
+        )
+        lines.append(
+            "  "
+            f"模拟退出完成：{simulation_funnel_summary.get('simulated_completed_exit_count', 0)} 条"
+            f"（模拟进场 -> 模拟退出完成率：{_format_rate_value(simulation_funnel_summary.get('entry_to_completed_exit_rate'))}）"
+        )
+        if simulation_funnel_summary.get("avg_confirmation_to_entry_days") is not None:
+            lines.append(
+                "  "
+                f"确认机会 -> 模拟进场：平均等待 "
+                f"{_format_metric_value(simulation_funnel_summary.get('avg_confirmation_to_entry_days'), suffix=' 天')}"
+                f"，中位数 "
+                f"{_format_metric_value(simulation_funnel_summary.get('median_confirmation_to_entry_days'), suffix=' 天')}"
+            )
+        if simulation_funnel_summary.get("avg_entry_to_completed_exit_days") is not None:
+            lines.append(
+                "  "
+                f"模拟进场 -> 模拟退出完成：平均持有 "
+                f"{_format_metric_value(simulation_funnel_summary.get('avg_entry_to_completed_exit_days'), suffix=' 天')}"
+                f"，中位数 "
+                f"{_format_metric_value(simulation_funnel_summary.get('median_entry_to_completed_exit_days'), suffix=' 天')}"
+            )
+        for row in simulation_funnel_summary.get("entry_timing_by_action") or []:
+            lines.append(
+                "  "
+                f"按动作看成交等待：{row.get('action_display', row.get('action', '-'))}"
+                f"：样本 {row.get('sample_count', 0)} 条，平均等待 "
+                f"{_format_metric_value(row.get('avg_days_to_entry'), suffix=' 天')}"
+                f"，中位数 "
+                f"{_format_metric_value(row.get('median_days_to_entry'), suffix=' 天')}"
+            )
+        for row in simulation_funnel_summary.get("completed_exit_timing_by_action") or []:
+            lines.append(
+                "  "
+                f"按动作看持有时长：{row.get('action_display', row.get('action', '-'))}"
+                f"：样本 {row.get('sample_count', 0)} 条，平均持有 "
+                f"{_format_metric_value(row.get('avg_holding_days'), suffix=' 天')}"
+                f"，中位数 "
+                f"{_format_metric_value(row.get('median_holding_days'), suffix=' 天')}"
+            )
+        if int(simulation_funnel_summary.get("simulated_pending_entry_count", 0) or 0) > 0:
+            lines.append(
+                f"  另有 {simulation_funnel_summary.get('simulated_pending_entry_count', 0)} 条确认机会尚未形成模拟进场。"
+            )
+        if int(simulation_funnel_summary.get("simulated_open_count", 0) or 0) > 0:
+            lines.append(
+                f"  另有 {simulation_funnel_summary.get('simulated_open_count', 0)} 条已模拟进场，但当前仍在持有观察中。"
+            )
+        completed_exit_breakdown = simulation_funnel_summary.get("completed_exit_breakdown") or {}
+        parts = []
+        if int(completed_exit_breakdown.get("exit_pool", 0) or 0) > 0:
+            parts.append(f"兑现池 {completed_exit_breakdown.get('exit_pool', 0)} 条")
+        if int(completed_exit_breakdown.get("hit_take_profit", 0) or 0) > 0:
+            parts.append(f"止盈位 {completed_exit_breakdown.get('hit_take_profit', 0)} 条")
+        if int(completed_exit_breakdown.get("hit_invalidation", 0) or 0) > 0:
+            parts.append(f"失效退出 {completed_exit_breakdown.get('hit_invalidation', 0)} 条")
+        if int(completed_exit_breakdown.get("window_complete", 0) or 0) > 0:
+            parts.append(f"窗口结算 {completed_exit_breakdown.get('window_complete', 0)} 条")
+        if parts:
+            lines.append(f"  其中：{' / '.join(parts)}")
+
+    lines.append("候选诊断：")
+    lines.extend(_format_candidate_evaluation_summary_lines(candidate_evaluation_summary))
+    lines.append("候选诊断趋势：")
+    lines.extend(_format_candidate_evaluation_trend_lines(candidate_evaluation_trend_summary))
+
+    lines.append("交易轨迹摘要：")
+    transition_count = int(trade_path_summary.get("exit_pool_transition_count", 0) or 0)
+    if transition_count <= 0:
+        lines.append("  当前窗口内还没有形成从进攻逻辑走到兑现池的已进场样本。")
+    else:
+        lines.append(f"  确认机会后进入兑现池：{transition_count} 条")
+        lines.append(
+            f"  平均历时：{_format_metric_value(trade_path_summary.get('avg_days_to_exit_pool'), suffix=' 天')}"
+        )
+        lines.append(
+            f"  中位数历时：{_format_metric_value(trade_path_summary.get('median_days_to_exit_pool'), suffix=' 天')}"
+        )
+        for row in trade_path_summary.get("by_action", []):
+            lines.append(
+                "  "
+                f"{row.get('action_display', row.get('action', '-'))} -> 兑现池：样本 {row.get('sample_count', 0)} 条，"
+                f"平均 {_format_metric_value(row.get('avg_holding_days'), suffix=' 天')}"
+            )
+        fastest_sample = trade_path_summary.get("fastest_sample") or {}
+        if fastest_sample:
+            lines.append(
+                "  "
+                f"最快样本：{fastest_sample.get('symbol', '-')}（{fastest_sample.get('action_display', fastest_sample.get('action', '-'))}）"
+                f"，{_format_metric_value(fastest_sample.get('holding_days'), suffix=' 天')}，"
+                f"{format_beijing_minute(fastest_sample.get('created_at'))}"
+            )
+        slowest_sample = trade_path_summary.get("slowest_sample") or {}
+        if slowest_sample:
+            lines.append(
+                "  "
+                f"最慢样本：{slowest_sample.get('symbol', '-')}（{slowest_sample.get('action_display', slowest_sample.get('action', '-'))}）"
+                f"，{_format_metric_value(slowest_sample.get('holding_days'), suffix=' 天')}，"
+                f"{format_beijing_minute(slowest_sample.get('created_at'))}"
+            )
+        recent_samples = list(trade_path_summary.get("recent_samples") or [])
+        if recent_samples:
+            lines.append("  代表样本（最近3条）：")
+            for row in recent_samples:
+                lines.append(f"  {_format_trade_path_sample_line(row)}")
+        best_samples = list(trade_path_summary.get("best_samples") or [])
+        if best_samples:
+            lines.append("  收益最好轨迹样本：")
+            for row in best_samples:
+                lines.append(f"  {_format_trade_path_sample_line(row)}")
+        worst_samples = list(trade_path_summary.get("worst_samples") or [])
+        if worst_samples:
+            lines.append("  收益最差轨迹样本：")
+            for row in worst_samples:
+                lines.append(f"  {_format_trade_path_sample_line(row)}")
+
     lines.extend(_format_breakdown_section("分组效果 - 按事件类型：", list((review.get("breakdowns") or {}).get("event_type") or [])))
     lines.extend(_format_breakdown_section("分组效果 - 按池子：", list((review.get("breakdowns") or {}).get("pool") or [])))
     lines.extend(_format_breakdown_section("分组效果 - 按动作：", list((review.get("breakdowns") or {}).get("action") or [])))
@@ -2476,11 +2871,44 @@ def format_recent_performance_review(review: dict[str, Any]) -> str:
 
     lines.append("下一步建议：")
     recommendations = list(review.get("recommendations") or [])
+    recommendation_details = list(review.get("recommendation_details") or [])
     if not recommendations:
         lines.append("  1. 当前样本还不足以形成明确建议，继续积累完整样本。")
     else:
-        for index, line in enumerate(recommendations, start=1):
-            lines.append(f"  {index}. {line}")
+        grouped_items = {
+            "优先先调": [],
+            "优先先排查": [],
+        }
+        for index, line in enumerate(recommendations):
+            detail = recommendation_details[index] if index < len(recommendation_details) else {}
+            parameter_details = list((detail or {}).get("parameter_details") or [])
+            bucket = "优先先排查"
+            if any(str(item.get("direction") or "").strip() in {"high", "low"} for item in parameter_details):
+                bucket = "优先先调"
+            grouped_items[bucket].append((line, detail))
+
+        adjustment_checklist = _build_recommendation_parameter_checklist(recommendation_details)
+        if adjustment_checklist:
+            lines.append("  参数检查清单：")
+            for index, item in enumerate(adjustment_checklist, start=1):
+                lines.append(f"    {index}. {item}")
+
+        for bucket_label in ("优先先调", "优先先排查"):
+            bucket_items = grouped_items[bucket_label]
+            if not bucket_items:
+                continue
+            lines.append(f"  {bucket_label}：")
+            for index, (line, detail) in enumerate(bucket_items, start=1):
+                lines.append(f"    {index}. {line}")
+                parameter_details = list((detail or {}).get("parameter_details") or [])
+                if parameter_details:
+                    parts = []
+                    for item in parameter_details:
+                        label = str(item.get("label") or item.get("key") or "-")
+                        key = str(item.get("key") or "-")
+                        direction_label = str(item.get("direction_label") or "先排查")
+                        parts.append(f"{label}（{key}，{direction_label}）")
+                    lines.append(f"       对应参数：{' / '.join(parts)}")
 
     lines.extend(
         _format_ranked_decision_table(
@@ -2623,7 +3051,7 @@ def summarize_run_health(
     events_processed = int(summary.get("events_processed", 0))
     prewatch_candidates_count = int(summary.get("prewatch_candidates_count", len(summary.get("prewatch_candidates", []))))
     lines = [
-        f"本轮处理 {events_processed} 个事件，生成 {cards_generated} 张卡片，发送 {alerts_sent} 条提醒，识别 {prewatch_candidates_count} 个预备池候选，并发出 {prewatch_alerts_sent} 条预备池轻推。"
+        f"本轮处理 {events_processed} 个事件，生成 {cards_generated} 张卡片，发送 {alerts_sent} 条提醒，识别 {prewatch_candidates_count} 个预备池候选，并发出 {prewatch_alerts_sent} 条观察提醒。"
     ]
     if diagnostics:
         closest_market = min(
@@ -2740,6 +3168,33 @@ def _format_run_duration(started_at: str | None, finished_at: str | None) -> str
     return f"{(finished - started).total_seconds():.2f} 秒"
 
 
+def _format_trade_path_duration(started_at: str | None, finished_at: str | None) -> str:
+    started = _parse_iso_datetime(started_at)
+    finished = _parse_iso_datetime(finished_at)
+    if started is None or finished is None or finished < started:
+        return "-"
+    total_seconds = int((finished - started).total_seconds())
+    total_minutes = total_seconds // 60
+    total_hours = total_seconds // 3600
+    total_days = total_seconds // 86400
+    if total_days >= 1:
+        if total_hours % 24 == 0:
+            return f"{total_days} 天"
+        return f"{total_days} 天 {total_hours % 24} 小时"
+    if total_hours >= 1:
+        return f"{total_hours} 小时"
+    return f"{max(total_minutes, 1)} 分钟"
+
+
+def _format_trade_path_sample_line(row: dict[str, Any]) -> str:
+    return (
+        f"- {format_beijing_minute(row.get('created_at'))} | {row.get('symbol', '-')} | "
+        f"{row.get('action_display', row.get('action', '-'))} -> {row.get('close_reason_display', row.get('close_reason', '-'))} | "
+        f"历时 {_format_metric_value(row.get('holding_days'), suffix=' 天')} | "
+        f"真实收益 {_format_metric_value(row.get('realized_return'), suffix='%')}"
+    )
+
+
 def _card_takeaway(row: dict[str, Any]) -> str:
     market_margin = row.get("market_margin")
     priority_margin = row.get("priority_margin")
@@ -2823,16 +3278,49 @@ def _format_push_card_lines(rows: list[dict[str, Any]]) -> list[str]:
         lines.extend(_format_card_action_lines(row))
         if row.get("promoted_from_prewatch"):
             lines.append(
-                f"    池位：预备池升级确认池（{_display_prewatch_setup(row.get('prewatch_setup_type', ''))} / 预备池 {row.get('prewatch_score', 0.0):.2f} 分）"
+                f"    阶段：预备池 -> 确认机会（{_display_prewatch_setup(row.get('prewatch_setup_type', ''))} / 预备池 {row.get('prewatch_score', 0.0):.2f} 分）"
             )
+            observation_count = int(row.get("prewatch_observation_count") or 0)
+            alert_sent_count = int(row.get("prewatch_alert_sent_count") or 0)
+            if observation_count > 0:
+                lifecycle_text = f"累计观察 {observation_count} 次"
+                if alert_sent_count > 0:
+                    lifecycle_text += f"，观察提醒 {alert_sent_count} 次"
+                first_seen_at = str(row.get("prewatch_first_seen_at") or "").strip()
+                last_seen_at = str(row.get("prewatch_last_seen_at") or "").strip()
+                if first_seen_at or last_seen_at:
+                    lifecycle_text += (
+                        f"（首次 {format_beijing_minute(first_seen_at)} / 最近 {format_beijing_minute(last_seen_at)}）"
+                    )
+                lines.append(f"    观察轨迹：{lifecycle_text}")
+            if row.get("prewatch_source_decision_id"):
+                lines.append(f"    预备池来源决策：{row['prewatch_source_decision_id']}")
         lines.extend(_format_card_delivery_lines(row))
         lines.append(f"    解读：{_card_takeaway(row)}")
-        lines.append(
-            "    "
-            f"分数：事件 {row['event_score']}/{row['event_threshold']} ({row['event_margin']:+.2f})，"
-            f"市场 {row['market_score']}/{row['market_threshold']} ({row['market_margin']:+.2f})，"
-            f"综合 {row['final_score']}/{row['priority_threshold']} ({row['priority_margin']:+.2f})"
-        )
+        score_parts: list[str] = []
+        if row.get("event_score") is not None:
+            event_text = f"事件 {row.get('event_score')}"
+            if row.get("event_threshold") is not None:
+                event_text += f"/{row.get('event_threshold')}"
+            if row.get("event_margin") is not None:
+                event_text += f" ({float(row.get('event_margin')):+.2f})"
+            score_parts.append(event_text)
+        if row.get("market_score") is not None:
+            market_text = f"市场 {row.get('market_score')}"
+            if row.get("market_threshold") is not None:
+                market_text += f"/{row.get('market_threshold')}"
+            if row.get("market_margin") is not None:
+                market_text += f" ({float(row.get('market_margin')):+.2f})"
+            score_parts.append(market_text)
+        if row.get("final_score") is not None:
+            final_text = f"综合 {row.get('final_score')}"
+            if row.get("priority_threshold") is not None:
+                final_text += f"/{row.get('priority_threshold')}"
+            if row.get("priority_margin") is not None:
+                final_text += f" ({float(row.get('priority_margin')):+.2f})"
+            score_parts.append(final_text)
+        if score_parts:
+            lines.append("    分数：" + "，".join(score_parts))
         if not row.get("market_data_complete", True):
             lines.append(f"    行情状态：{row.get('market_data_note') or '行情快照暂不可用，未自动生成价格计划。'}")
         elif row.get("entry_range") and row.get("take_profit_range"):
@@ -2863,7 +3351,7 @@ def _format_push_card_lines(rows: list[dict[str, Any]]) -> list[str]:
 def _format_promoted_confirmation_lines(rows: list[dict[str, Any]]) -> list[str]:
     promoted = [row for row in rows if row.get("promoted_from_prewatch")]
     if not promoted:
-        return ["  本轮没有出现从预备池升级到确认池的标的。"]
+        return ["  本轮没有出现从预备池进入确认机会的标的。"]
     ranked = sorted(
         promoted,
         key=lambda row: (
@@ -2877,8 +3365,25 @@ def _format_promoted_confirmation_lines(rows: list[dict[str, Any]]) -> list[str]
     for row in ranked:
         lines.append(_format_card_header(row))
         lines.append(
-            f"    升池原因：此前处于{_display_prewatch_setup(row.get('prewatch_setup_type', ''))}预备状态（{row.get('prewatch_score', 0.0):.2f} 分），本轮事件达到确认条件。"
+            f"    形成原因：此前处于{_display_prewatch_setup(row.get('prewatch_setup_type', ''))}预备状态（{row.get('prewatch_score', 0.0):.2f} 分），本轮事件达到确认条件。"
         )
+        if row.get("prewatch_promotion_reason"):
+            lines.append(f"    确认机会链路：{row['prewatch_promotion_reason']}")
+        observation_count = int(row.get("prewatch_observation_count") or 0)
+        alert_sent_count = int(row.get("prewatch_alert_sent_count") or 0)
+        if observation_count > 0:
+            lifecycle_text = f"累计观察 {observation_count} 次"
+            if alert_sent_count > 0:
+                lifecycle_text += f"，观察提醒 {alert_sent_count} 次"
+            first_seen_at = str(row.get("prewatch_first_seen_at") or "").strip()
+            last_seen_at = str(row.get("prewatch_last_seen_at") or "").strip()
+            if first_seen_at or last_seen_at:
+                lifecycle_text += (
+                    f"（首次 {format_beijing_minute(first_seen_at)} / 最近 {format_beijing_minute(last_seen_at)}）"
+                )
+            lines.append(f"    观察轨迹：{lifecycle_text}")
+        if row.get("prewatch_source_decision_id"):
+            lines.append(f"    预备池来源决策：{row['prewatch_source_decision_id']}")
         lines.extend(_format_card_action_lines(row))
         lines.extend(_format_card_delivery_lines(row))
         if row.get("positioning_hint"):
@@ -2927,7 +3432,7 @@ def _format_theme_linkage_lines(rows: list[dict[str, Any]]) -> list[str]:
         if row["confirmed_symbols"]:
             lines.append(f"    确认池：{', '.join(row['confirmed_symbols'])}")
         if row["promoted_symbols"]:
-            lines.append(f"    升池确认：{', '.join(row['promoted_symbols'])}")
+            lines.append(f"    确认机会：{', '.join(row['promoted_symbols'])}")
         if row["prewatch_only_symbols"]:
             lines.append(f"    预备池：{', '.join(row['prewatch_only_symbols'])}")
         if row["sent_symbols"]:
@@ -2938,13 +3443,13 @@ def _format_theme_linkage_lines(rows: list[dict[str, Any]]) -> list[str]:
 
 def _format_prewatch_push_lines(rows: list[dict[str, Any]], sent_symbols: list[str]) -> list[str]:
     if not sent_symbols:
-        return ["  本轮没有发送预备池轻推。"]
+        return ["  本轮没有发送观察提醒。"]
     by_symbol = {row["symbol"]: row for row in rows}
     lines: list[str] = []
     for symbol in sent_symbols:
         row = by_symbol.get(symbol)
         if row is None:
-            lines.append(f"  {symbol} / 预备池轻推已发送")
+            lines.append(f"  {symbol} / 观察提醒已发送")
             continue
         lines.append(
             f"  {row['symbol']} / {_display_horizon(row['horizon'])} / {_display_prewatch_setup(row['setup_type'])} / {row['score']:.2f} 分"
@@ -2954,6 +3459,98 @@ def _format_prewatch_push_lines(rows: list[dict[str, Any]], sent_symbols: list[s
         lines.append(f"    建议：{row['action_hint']}")
         lines.append(f"    关注理由：{row['reason_to_watch']}")
     return lines
+
+
+def _format_new_observation_lines(rows: list[dict[str, Any]], sent_symbols: list[str]) -> list[str]:
+    if not rows:
+        return ["  本轮没有新增观察标的。"]
+    sent_symbol_set = {str(symbol).strip().upper() for symbol in sent_symbols}
+    background_rows = [
+        row
+        for row in rows
+        if str(row.get("symbol") or "").strip().upper() not in sent_symbol_set
+    ]
+    if not background_rows:
+        return ["  本轮新增观察标的都已触发观察提醒，没有仅后台观察的标的。"]
+    lines = [
+        f"  本轮新增观察标的 {len(rows)} 个，其中 {len(background_rows)} 个当前仍处于后台观察。"
+    ]
+    ranked = sorted(
+        background_rows,
+        key=lambda row: (
+            -float(row.get("score", 0.0)),
+            str(row.get("symbol") or ""),
+        ),
+    )
+    for row in ranked:
+        lines.append(
+            f"  {row['symbol']} / {_display_horizon(row['horizon'])} / "
+            f"{_display_prewatch_setup(row['setup_type'])} / 预备池 {row['score']:.2f} 分"
+        )
+        if row.get("headline_summary"):
+            lines.append(f"    摘要：{row['headline_summary']}")
+        lines.append("    当前状态：仅后台观察，尚未触发观察提醒。")
+        if row.get("reason_to_watch"):
+            lines.append(f"    关注理由：{row['reason_to_watch']}")
+    return lines
+
+
+def _format_recent_observation_sample_lines(rows: list[dict[str, Any]]) -> list[str]:
+    if not rows:
+        return ["  当前窗口内还没有新增观察样本。"]
+    lines: list[str] = []
+    for row in rows:
+        parts = [
+            format_beijing_minute(row.get("created_at")),
+            str(row.get("symbol") or "-"),
+            str(row.get("observation_status") or "仅后台观察"),
+            str(row.get("confirmation_status") or "仍在观察"),
+        ]
+        lines.append(f"  - {' | '.join(parts)}")
+        detail_parts = []
+        if row.get("score") is not None:
+            detail_parts.append(f"预备池 {float(row.get('score') or 0.0):.2f} 分")
+        if row.get("setup_type"):
+            detail_parts.append(_display_prewatch_setup(str(row.get("setup_type") or "")))
+        if row.get("trigger_mode"):
+            detail_parts.append(_display_prewatch_trigger_mode(str(row.get("trigger_mode") or "")))
+        if int(row.get("observation_count") or 0) > 0:
+            detail_parts.append(f"累计观察 {int(row.get('observation_count') or 0)} 次")
+        if int(row.get("alert_sent_count") or 0) > 0:
+            detail_parts.append(f"观察提醒 {int(row.get('alert_sent_count') or 0)} 次")
+        if row.get("theme_ids"):
+            detail_parts.append(f"题材 {' / '.join(row['theme_ids'])}")
+        if detail_parts:
+            lines.append(f"    {' / '.join(detail_parts)}")
+    return lines
+
+
+def _exit_pool_reason_detail(subreason: str) -> str:
+    normalized = str(subreason or "").strip()
+    if normalized == "target_hit":
+        return "价格已进入计划止盈区更深位置，当前更适合按计划兑现利润。"
+    if normalized == "weakening_after_tp_zone":
+        return "进入止盈区后连续走弱，继续持有更容易把浮盈回吐回去。"
+    if normalized == "macro_protection":
+        return "宏观环境转差且已有浮盈，当前更适合先做利润保护。"
+    return "当前这笔交易已从进攻逻辑切换到兑现管理。"
+
+
+def _format_exit_pool_breakdown(rows: list[dict[str, Any]]) -> str:
+    reason_map = {
+        "target_hit": "达标止盈",
+        "weakening_after_tp_zone": "提前锁盈",
+        "macro_protection": "宏观保护",
+    }
+    counts: dict[str, int] = {}
+    for row in rows:
+        key = reason_map.get(str(row.get("subreason") or "").strip(), "兑现管理")
+        counts[key] = counts.get(key, 0) + 1
+    if not counts:
+        return ""
+    ordered = ["达标止盈", "提前锁盈", "宏观保护", "兑现管理"]
+    parts = [f"{label} {counts[label]} 个" for label in ordered if counts.get(label)]
+    return "，".join(parts)
 
 
 def _format_exit_pool_lines(rows: list[dict[str, Any]]) -> list[str]:
@@ -2967,10 +3564,22 @@ def _format_exit_pool_lines(rows: list[dict[str, Any]]) -> list[str]:
     lines: list[str] = []
     for row in rows:
         identity = row.get("display_name") or row.get("symbol")
-        reason = reason_map.get(str(row.get("subreason") or ""), "兑现管理")
+        subreason = str(row.get("subreason") or "")
+        reason = reason_map.get(subreason, "兑现管理")
         lines.append(f"  {identity} / {_display_horizon(str(row.get('horizon') or 'position'))} / {reason}")
-        if row.get("reason_to_watch"):
-            lines.append(f"    原因：{row['reason_to_watch']}")
+        lines.append(f"    状态：{row.get('reason_to_watch') or _exit_pool_reason_detail(subreason)}")
+        if row.get("chain_summary"):
+            lines.append(f"    来源链路：{row['chain_summary']}")
+        if row.get("source_decision_id"):
+            lines.append(f"    来源决策：{row['source_decision_id']}")
+        take_profit_range = row.get("take_profit_range") or {}
+        if take_profit_range.get("low") is not None and take_profit_range.get("high") is not None:
+            lines.append(
+                f"    原目标区：{float(take_profit_range['low']):.2f}-{float(take_profit_range['high']):.2f}"
+            )
+        if row.get("positioning_hint"):
+            lines.append(f"    当前处理：{row['positioning_hint']}")
+        lines.append("    使用边界：兑现池只面向已有浮盈仓位，不代表新的开仓信号。")
     return lines
 
 
@@ -3001,6 +3610,84 @@ def _format_decision_lines(rows: list[dict[str, Any]]) -> list[str]:
         outcome_context_line = _format_outcome_context_line(row)
         if outcome_context_line:
             lines.append(f"    历史后验背景：{outcome_context_line}")
+        if row.get("pool") == "exit" and row.get("source_decision_id"):
+            lines.append(f"    来源决策：{row['source_decision_id']}")
+        if row.get("pool") == "confirmation" and row.get("promoted_from_prewatch"):
+            lines.append(
+                "    "
+                f"确认机会路径：预备池 / {_display_prewatch_setup(row.get('prewatch_setup_type', ''))} / "
+                f"预备池 {float(row.get('prewatch_score', 0.0)):.2f} 分"
+            )
+            observation_count = int(row.get("prewatch_observation_count") or 0)
+            alert_sent_count = int(row.get("prewatch_alert_sent_count") or 0)
+            if observation_count > 0:
+                lifecycle_text = f"累计观察 {observation_count} 次"
+                if alert_sent_count > 0:
+                    lifecycle_text += f"，观察提醒 {alert_sent_count} 次"
+                first_seen_at = str(row.get("prewatch_first_seen_at") or "").strip()
+                last_seen_at = str(row.get("prewatch_last_seen_at") or "").strip()
+                if first_seen_at or last_seen_at:
+                    lifecycle_text += (
+                        f"（首次 {format_beijing_minute(first_seen_at)} / 最近 {format_beijing_minute(last_seen_at)}）"
+                    )
+                lines.append(f"    观察轨迹：{lifecycle_text}")
+            if row.get("source_decision_id"):
+                lines.append(f"    预备池来源决策：{row['source_decision_id']}")
+            if row.get("prewatch_promotion_reason"):
+                lines.append(f"    确认机会说明：{row['prewatch_promotion_reason']}")
+        source_summary = row.get("source_decision_summary") or {}
+        if row.get("pool") == "exit" and source_summary:
+            lines.append(
+                "    "
+                f"来源动作：{source_summary.get('pool_label', source_summary.get('pool', '-'))} / "
+                f"{source_summary.get('action', '-')} / "
+                f"优先级 {source_summary.get('priority', '-')} / "
+                f"综合 {float(source_summary.get('final_score', 0.0)):.2f}"
+            )
+    return lines
+
+
+def _format_trade_path_lines(rows: list[dict[str, Any]]) -> list[str]:
+    exit_rows = [
+        row
+        for row in rows
+        if row.get("pool") == "exit" and row.get("source_decision_summary")
+    ]
+    if not exit_rows:
+        return ["  本轮没有形成可追踪的确认 -> 兑现交易轨迹。"]
+    lines: list[str] = []
+    for row in exit_rows[:10]:
+        source_summary = row.get("source_decision_summary") or {}
+        symbol = row.get("symbol", "-")
+        source_created_at = source_summary.get("created_at")
+        exit_created_at = row.get("created_at")
+        lines.append(
+            f"  {symbol} / {source_summary.get('action', '-')} -> {row.get('action', '-')}"
+        )
+        lines.append(
+            "    "
+            f"起点：{source_summary.get('pool_label', source_summary.get('pool', '-'))} / "
+            f"{source_summary.get('action', '-')} / 优先级 {source_summary.get('priority', '-')} / "
+            f"综合 {float(source_summary.get('final_score', 0.0)):.2f}"
+        )
+        lines.append(
+            "    "
+            f"终点：{row.get('pool_label', row.get('pool', '-'))} / "
+            f"{row.get('action', '-')} / 触发模式 {row.get('trigger_mode', '-')} / "
+            f"综合 {float(row.get('final_score', 0.0)):.2f}"
+        )
+        if row.get("holding_days") is not None or row.get("realized_return") is not None:
+            lines.append(
+                "    "
+                f"结果：历时 {_format_metric_value(row.get('holding_days'), suffix=' 天')} / "
+                f"真实收益 {_format_metric_value(row.get('realized_return'), suffix='%')}"
+            )
+        if source_created_at or exit_created_at:
+            lines.append(
+                "    "
+                f"时间：{format_beijing_minute(source_created_at)} -> {format_beijing_minute(exit_created_at)} / "
+                f"历时 {_format_trade_path_duration(source_created_at, exit_created_at)}"
+            )
     return lines
 
 
@@ -3040,6 +3727,373 @@ def _format_outcome_context_line(row: dict[str, Any]) -> str | None:
     return "；".join(parts) + "。"
 
 
+def _format_funnel_rate(numerator: int, denominator: int) -> str:
+    if denominator <= 0:
+        return "-"
+    return f"{numerator / denominator * 100:.1f}%"
+
+
+def _format_candidate_evaluation_summary_lines(summary: dict[str, Any]) -> list[str]:
+    prewatch = summary.get("prewatch") or {}
+    confirmation = summary.get("confirmation") or {}
+    stage_rows = [row for row in (prewatch, confirmation) if row]
+    if not stage_rows or all(int(row.get("total_count", 0) or 0) <= 0 for row in stage_rows):
+        return ["  当前没有候选评估快照可供诊断。"]
+
+    lines: list[str] = []
+    for row in stage_rows:
+        stage_label = str(row.get("stage_label") or row.get("stage") or "未分类")
+        selected_label = "进入观察" if row.get("stage") == "prewatch" else "形成确认机会"
+        lines.append(
+            f"  {stage_label}：共 {int(row.get('total_count', 0) or 0)} 条，"
+            f"{selected_label} {int(row.get('selected_count', 0) or 0)} 条，"
+            f"未入选 {int(row.get('not_selected_count', 0) or 0)} 条，"
+            f"拒绝 {int(row.get('rejected_count', 0) or 0)} 条，"
+            f"异常 {int(row.get('error_count', 0) or 0)} 条。"
+        )
+        blockers = row.get("top_blocked_reasons") or []
+        if blockers:
+            parts = [
+                f"{item.get('label', item.get('reason', '-'))} {int(item.get('count', 0) or 0)} 条"
+                for item in blockers
+            ]
+            lines.append(f"    主要未通过原因：{' / '.join(parts)}")
+        errors = row.get("top_error_reasons") or []
+        if errors:
+            parts = [
+                f"{item.get('label', item.get('reason', '-'))} {int(item.get('count', 0) or 0)} 条"
+                for item in errors
+            ]
+            lines.append(f"    主要异常：{' / '.join(parts)}")
+    return lines
+
+
+def _format_candidate_evaluation_trend_lines(summary: dict[str, Any]) -> list[str]:
+    recent_window_days = int(summary.get("recent_window_days", 0) or 0)
+    baseline_window_days = int(summary.get("baseline_window_days", 0) or 0)
+    if recent_window_days <= 0 or baseline_window_days <= 0:
+        return ["  当前窗口还没有足够的候选评估样本来比较近 7 天趋势。"]
+
+    lines: list[str] = []
+    has_content = False
+    for stage_key in ("prewatch", "confirmation"):
+        row = summary.get(stage_key) or {}
+        reason_trends = list(row.get("reason_trends") or [])
+        if not reason_trends:
+            continue
+        has_content = True
+        lines.append(
+            f"  {row.get('stage_label', row.get('stage', '-'))}：近 {recent_window_days} 天 {int(row.get('recent_total_count', 0) or 0)} 条，"
+            f"当前窗口 {baseline_window_days} 天 {int(row.get('baseline_total_count', 0) or 0)} 条。"
+        )
+        for item in reason_trends:
+            lines.append(
+                "    "
+                f"{item.get('label', item.get('reason', '-'))}：近 {recent_window_days} 天 {int(item.get('recent_count', 0) or 0)} 条，"
+                f"{baseline_window_days} 天 {int(item.get('baseline_count', 0) or 0)} 条"
+            )
+    if not has_content:
+        return ["  当前窗口还没有足够的候选评估样本来比较近 7 天趋势。"]
+    return lines
+
+
+def _build_recommendation_parameter_checklist(
+    recommendation_details: list[dict[str, Any]],
+    *,
+    limit: int = 5,
+) -> list[str]:
+    seen_keys: set[str] = set()
+    items: list[str] = []
+    for detail in recommendation_details:
+        parameter_details = list((detail or {}).get("parameter_details") or [])
+        adjustable_details = [
+            item for item in parameter_details
+            if str(item.get("direction") or "").strip() in {"high", "low"}
+        ]
+        for item in adjustable_details:
+            key = str(item.get("key") or "").strip()
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            label = str(item.get("label") or key)
+            direction_label = str(item.get("direction_label") or "先排查")
+            items.append(f"{label}（{key}，{direction_label}）")
+            if len(items) >= limit:
+                return items
+    return items
+
+
+def _duration_days_between(start_value: Any, end_value: Any) -> float | None:
+    start_dt = parse_datetime(start_value)
+    end_dt = parse_datetime(end_value)
+    if start_dt is None or end_dt is None:
+        return None
+    return (end_dt - start_dt).total_seconds() / 86400.0
+
+
+def _format_pool_funnel_lines(
+    *,
+    prewatch_candidates: list[dict[str, Any]],
+    run_detail: dict[str, Any] | None,
+    decision_diagnostics: list[dict[str, Any]] | None,
+    card_diagnostics: list[dict[str, Any]] | None,
+) -> list[str]:
+    candidate_count = len(prewatch_candidates)
+    summary = run_detail.get("summary", {}) if run_detail else {}
+    light_push_count = int(summary.get("prewatch_alerts_sent_count", 0) or 0)
+    decision_rows = list(decision_diagnostics or [])
+    promoted_confirmation_rows = [
+        row
+        for row in decision_rows
+        if row.get("pool") == "confirmation" and row.get("promoted_from_prewatch")
+    ]
+    if not promoted_confirmation_rows and card_diagnostics:
+        promoted_confirmation_rows = [
+            row for row in card_diagnostics
+            if row.get("promoted_from_prewatch")
+        ]
+    promoted_confirmation_count = len(promoted_confirmation_rows)
+    promoted_after_light_push_count = sum(
+        1
+        for row in promoted_confirmation_rows
+        if int(row.get("prewatch_alert_sent_count") or 0) > 0
+    )
+    promoted_without_light_push_count = max(
+        promoted_confirmation_count - promoted_after_light_push_count,
+        0,
+    )
+    exit_rows = [
+        row for row in decision_rows
+        if row.get("pool") == "exit"
+    ]
+    exit_from_promoted_count = sum(
+        1
+        for row in exit_rows
+        if bool((row.get("source_decision_summary") or {}).get("promoted_from_prewatch"))
+    )
+    non_promoted_exit_count = max(len(exit_rows) - exit_from_promoted_count, 0)
+    if (
+        candidate_count <= 0
+        and light_push_count <= 0
+        and promoted_confirmation_count <= 0
+        and exit_from_promoted_count <= 0
+    ):
+        return ["  本轮没有形成可计算的三池漏斗。"]
+    lines = [f"  预备池候选：{candidate_count} 条"]
+    lines.append(
+        "  "
+        f"观察提醒：{light_push_count} 条 | 观察 -> 观察提醒转化率 {_format_funnel_rate(light_push_count, candidate_count)}"
+    )
+    lines.append(
+        "  "
+        f"确认机会：{promoted_confirmation_count} 条 | 观察 -> 确认机会转化率 {_format_funnel_rate(promoted_confirmation_count, candidate_count)}"
+    )
+    lines.append(
+        "  "
+        f"观察提醒后确认机会：{promoted_after_light_push_count} 条 | 观察提醒 -> 确认机会转化率 {_format_funnel_rate(promoted_after_light_push_count, light_push_count)}"
+    )
+    if promoted_without_light_push_count > 0:
+        lines.append(f"  另有 {promoted_without_light_push_count} 条未经过观察提醒，直接从观察进入确认机会。")
+    lines.append(
+        "  "
+        f"进入兑现池：{exit_from_promoted_count} 条 | 确认机会 -> 兑现转化率 {_format_funnel_rate(exit_from_promoted_count, promoted_confirmation_count)}"
+    )
+    if non_promoted_exit_count > 0:
+        lines.append(f"  另有 {non_promoted_exit_count} 条兑现池记录来自非预备池确认机会链路。")
+    return lines
+
+
+def _format_simulation_funnel_lines(
+    *,
+    prewatch_candidates: list[dict[str, Any]],
+    run_detail: dict[str, Any] | None,
+    decision_diagnostics: list[dict[str, Any]] | None,
+    card_diagnostics: list[dict[str, Any]] | None,
+) -> list[str]:
+    candidate_count = len(prewatch_candidates)
+    summary = run_detail.get("summary", {}) if run_detail else {}
+    light_push_count = int(summary.get("prewatch_alerts_sent_count", 0) or 0)
+    decision_rows = list(decision_diagnostics or [])
+    promoted_confirmation_rows = [
+        row
+        for row in decision_rows
+        if row.get("pool") == "confirmation" and row.get("promoted_from_prewatch")
+    ]
+    if not promoted_confirmation_rows and card_diagnostics:
+        promoted_confirmation_rows = [
+            row for row in card_diagnostics
+            if row.get("promoted_from_prewatch")
+        ]
+    promoted_confirmation_count = len(promoted_confirmation_rows)
+    simulated_entry_rows = [
+        row for row in promoted_confirmation_rows
+        if bool(row.get("entered"))
+    ]
+    simulated_entry_count = len(simulated_entry_rows)
+    pending_entry_count = max(promoted_confirmation_count - simulated_entry_count, 0)
+    exit_pool_transition_count = sum(
+        1 for row in simulated_entry_rows
+        if str(row.get("close_reason") or "").strip() == "exit_pool"
+    )
+    simulated_completed_exit_rows = [
+        row
+        for row in simulated_entry_rows
+        if str(row.get("close_reason") or "").strip() not in {"", "insufficient_lookahead"}
+    ]
+    simulated_completed_exit_count = len(simulated_completed_exit_rows)
+    simulated_open_count = sum(
+        1 for row in simulated_entry_rows
+        if str(row.get("close_reason") or "").strip() == "insufficient_lookahead"
+    )
+    confirmation_to_entry_days = [
+        duration
+        for duration in (
+            _duration_days_between(row.get("created_at"), row.get("entered_at"))
+            for row in simulated_entry_rows
+        )
+        if duration is not None
+    ]
+    entry_to_completed_exit_days = [
+        float(row.get("holding_days"))
+        for row in simulated_completed_exit_rows
+        if row.get("holding_days") is not None
+    ]
+    entry_timing_by_action: list[str] = []
+    completed_exit_timing_by_action: list[str] = []
+    for action in ("试探建仓", "确认做多"):
+        action_entry_days = [
+            duration
+            for duration in (
+                _duration_days_between(row.get("created_at"), row.get("entered_at"))
+                for row in simulated_entry_rows
+                if str(row.get("action") or "").strip() == action
+            )
+            if duration is not None
+        ]
+        if action_entry_days:
+            avg_days = sum(action_entry_days) / len(action_entry_days)
+            sorted_days = sorted(action_entry_days)
+            middle_index = len(sorted_days) // 2
+            if len(sorted_days) % 2 == 0:
+                median_days = (sorted_days[middle_index - 1] + sorted_days[middle_index]) / 2
+            else:
+                median_days = sorted_days[middle_index]
+            entry_timing_by_action.append(
+                f"{action}：样本 {len(action_entry_days)} 条，平均等待 {_format_metric_value(avg_days, suffix=' 天')}，"
+                f"中位数 {_format_metric_value(median_days, suffix=' 天')}"
+            )
+        action_completed_exit_days = [
+            float(row.get("holding_days"))
+            for row in simulated_completed_exit_rows
+            if str(row.get("action") or "").strip() == action and row.get("holding_days") is not None
+        ]
+        if action_completed_exit_days:
+            avg_days = sum(action_completed_exit_days) / len(action_completed_exit_days)
+            sorted_days = sorted(action_completed_exit_days)
+            middle_index = len(sorted_days) // 2
+            if len(sorted_days) % 2 == 0:
+                median_days = (sorted_days[middle_index - 1] + sorted_days[middle_index]) / 2
+            else:
+                median_days = sorted_days[middle_index]
+            completed_exit_timing_by_action.append(
+                f"{action}：样本 {len(action_completed_exit_days)} 条，平均持有 {_format_metric_value(avg_days, suffix=' 天')}，"
+                f"中位数 {_format_metric_value(median_days, suffix=' 天')}"
+            )
+    if (
+        candidate_count <= 0
+        and light_push_count <= 0
+        and promoted_confirmation_count <= 0
+        and simulated_entry_count <= 0
+    ):
+        return ["  本轮还没有形成可计算的完整模拟闭环。"]
+    exit_pool_completed_count = sum(
+        1 for row in simulated_completed_exit_rows
+        if str(row.get("close_reason") or "").strip() == "exit_pool"
+    )
+    invalidation_completed_count = sum(
+        1 for row in simulated_completed_exit_rows
+        if str(row.get("close_reason") or "").strip() == "hit_invalidation"
+    )
+    window_completed_count = sum(
+        1 for row in simulated_completed_exit_rows
+        if str(row.get("close_reason") or "").strip() == "window_complete"
+    )
+    take_profit_completed_count = sum(
+        1 for row in simulated_completed_exit_rows
+        if str(row.get("close_reason") or "").strip() == "hit_take_profit"
+    )
+    lines = [f"  观察：{candidate_count} 条"]
+    lines.append(
+        "  "
+        f"观察提醒：{light_push_count} 条 | 观察 -> 观察提醒转化率 {_format_funnel_rate(light_push_count, candidate_count)}"
+    )
+    lines.append(
+        "  "
+        f"确认机会：{promoted_confirmation_count} 条 | 观察 -> 确认机会转化率 {_format_funnel_rate(promoted_confirmation_count, candidate_count)}"
+    )
+    lines.append(
+        "  "
+        f"模拟进场：{simulated_entry_count} 条 | 确认机会 -> 模拟进场转化率 {_format_funnel_rate(simulated_entry_count, promoted_confirmation_count)}"
+    )
+    lines.append(
+        "  "
+        f"进入兑现池：{exit_pool_transition_count} 条 | 模拟进场 -> 进入兑现池转化率 {_format_funnel_rate(exit_pool_transition_count, simulated_entry_count)}"
+    )
+    lines.append(
+        "  "
+        f"模拟退出完成：{simulated_completed_exit_count} 条 | 模拟进场 -> 模拟退出完成率 {_format_funnel_rate(simulated_completed_exit_count, simulated_entry_count)}"
+    )
+    if confirmation_to_entry_days:
+        avg_days_to_entry = sum(confirmation_to_entry_days) / len(confirmation_to_entry_days)
+        sorted_days_to_entry = sorted(confirmation_to_entry_days)
+        middle_index = len(sorted_days_to_entry) // 2
+        if len(sorted_days_to_entry) % 2 == 0:
+            median_days_to_entry = (sorted_days_to_entry[middle_index - 1] + sorted_days_to_entry[middle_index]) / 2
+        else:
+            median_days_to_entry = sorted_days_to_entry[middle_index]
+        lines.append(
+            "  "
+            f"确认机会 -> 模拟进场：平均等待 {_format_metric_value(avg_days_to_entry, suffix=' 天')}，"
+            f"中位数 {_format_metric_value(median_days_to_entry, suffix=' 天')}"
+        )
+    if entry_to_completed_exit_days:
+        avg_days_to_completed_exit = sum(entry_to_completed_exit_days) / len(entry_to_completed_exit_days)
+        sorted_days_to_completed_exit = sorted(entry_to_completed_exit_days)
+        middle_index = len(sorted_days_to_completed_exit) // 2
+        if len(sorted_days_to_completed_exit) % 2 == 0:
+            median_days_to_completed_exit = (
+                sorted_days_to_completed_exit[middle_index - 1] + sorted_days_to_completed_exit[middle_index]
+            ) / 2
+        else:
+            median_days_to_completed_exit = sorted_days_to_completed_exit[middle_index]
+        lines.append(
+            "  "
+            f"模拟进场 -> 模拟退出完成：平均持有 {_format_metric_value(avg_days_to_completed_exit, suffix=' 天')}，"
+            f"中位数 {_format_metric_value(median_days_to_completed_exit, suffix=' 天')}"
+        )
+    for line in entry_timing_by_action:
+        lines.append(f"  按动作看成交等待：{line}")
+    for line in completed_exit_timing_by_action:
+        lines.append(f"  按动作看持有时长：{line}")
+    if pending_entry_count > 0:
+        lines.append(f"  另有 {pending_entry_count} 条确认机会尚未形成模拟进场。")
+    if simulated_open_count > 0:
+        lines.append(f"  另有 {simulated_open_count} 条已模拟进场，但当前仍在持有观察中。")
+    if simulated_completed_exit_count > 0:
+        parts = []
+        if exit_pool_completed_count > 0:
+            parts.append(f"兑现池 {exit_pool_completed_count} 条")
+        if take_profit_completed_count > 0:
+            parts.append(f"止盈位 {take_profit_completed_count} 条")
+        if invalidation_completed_count > 0:
+            parts.append(f"失效退出 {invalidation_completed_count} 条")
+        if window_completed_count > 0:
+            parts.append(f"窗口结算 {window_completed_count} 条")
+        if parts:
+            lines.append(f"  其中：{' / '.join(parts)}")
+    return lines
+
+
 def format_run_review(
     run_detail: dict[str, Any] | None,
     strategy_report: dict[str, Any],
@@ -3070,10 +4124,14 @@ def format_run_review(
         lines.append(
             "  "
             f"本轮状态 {_display_run_status(run_detail['status'])}，健康判断为 {health['status']}；"
-            f"共处理 {summary.get('events_processed', 0)} 个事件，生成 {summary.get('cards_generated', 0)} 张卡片，发送 {summary.get('alerts_sent', 0)} 条提醒，识别 {len(prewatch_candidates)} 个预备池候选，并发出 {summary.get('prewatch_alerts_sent_count', 0)} 条预备池轻推。"
+            f"共处理 {summary.get('events_processed', 0)} 个事件，生成 {summary.get('cards_generated', 0)} 张卡片，发送 {summary.get('alerts_sent', 0)} 条提醒，识别 {len(prewatch_candidates)} 个预备池候选，并发出 {summary.get('prewatch_alerts_sent_count', 0)} 条观察提醒。"
         )
         if exit_pool_cards:
-            lines.append(f"  另外有 {len(exit_pool_cards)} 个标的进入兑现池，建议优先处理已有浮盈仓位。")
+            breakdown = _format_exit_pool_breakdown(exit_pool_cards)
+            breakdown_suffix = f"（{breakdown}）" if breakdown else ""
+            lines.append(
+                f"  另外有 {len(exit_pool_cards)} 个标的进入兑现池{breakdown_suffix}，建议优先处理已有浮盈仓位。"
+            )
         if high_priority_cards > 0:
             lines.append(
                 f"  本轮出现 {high_priority_cards} 张高优先级卡片，其中实际发送 {sent_high_priority} 条，建议优先查看对应卡片。"
@@ -3105,6 +4163,29 @@ def format_run_review(
         lines.append(f"  {line}")
     lines.append("LLM 用量摘要：")
     lines.extend(_format_llm_usage_snapshot_lines(llm_usage_report))
+    lines.append("三池漏斗：")
+    lines.extend(
+        _format_pool_funnel_lines(
+            prewatch_candidates=prewatch_candidates,
+            run_detail=run_detail,
+            decision_diagnostics=decision_diagnostics,
+            card_diagnostics=card_diagnostics,
+        )
+    )
+    lines.append("完整模拟闭环：")
+    lines.extend(
+        _format_simulation_funnel_lines(
+            prewatch_candidates=prewatch_candidates,
+            run_detail=run_detail,
+            decision_diagnostics=decision_diagnostics,
+            card_diagnostics=card_diagnostics,
+        )
+    )
+    lines.append("候选诊断：")
+    lines.extend(_format_candidate_evaluation_summary_lines(run_detail.get("candidate_evaluation_summary") or {}))
+    lines.append("新增观察标的：")
+    sent_symbols = run_detail.get("summary", {}).get("prewatch_alert_symbols", []) if run_detail else []
+    lines.extend(_format_new_observation_lines(prewatch_candidates, sent_symbols))
     lines.append("机会概览：")
     event_types = strategy_report.get("event_type_performance", [])
     if not event_types:
@@ -3115,17 +4196,19 @@ def format_run_review(
         )
     lines.append("提醒结果：")
     alert_volume = strategy_report.get("alert_volume", [])
+    diagnostics = card_diagnostics or []
     if not alert_volume:
         lines.append("  本轮没有提醒数据。")
     for row in alert_volume:
         lines.append(
             f"  共 {row['total_alerts']} 条，其中已发送 {row['sent_alerts']} 条，压制 {row['suppressed_alerts']} 条，高优先级卡片 {row['high_priority_alerts']} 条，高优先级已发送 {row.get('sent_high_priority_alerts', 0)} 条。"
         )
+    lines.append("提醒压制诊断：")
+    lines.extend(_format_alert_suppression_lines(diagnostics, run_detail.get("candidate_evaluation_summary") or {}))
     lines.append("最终推送卡片：")
-    diagnostics = card_diagnostics or []
     sent_cards = [row for row in diagnostics if row.get("sent")]
     lines.extend(_format_push_card_lines(sent_cards))
-    lines.append("升池确认：")
+    lines.append("确认机会：")
     lines.extend(_format_promoted_confirmation_lines(diagnostics))
     lines.append("题材链路：")
     lines.extend(
@@ -3140,12 +4223,13 @@ def format_run_review(
     )
     lines.append("预备池：")
     lines.extend(_format_prewatch_lines(prewatch_candidates, symbol_theme_map=symbol_theme_map))
-    lines.append("预备池轻推：")
-    sent_symbols = run_detail.get("summary", {}).get("prewatch_alert_symbols", []) if run_detail else []
+    lines.append("观察提醒：")
     lines.extend(_format_prewatch_push_lines(prewatch_candidates, sent_symbols))
     lines.append("兑现池：")
     exit_pool_cards = run_detail.get("summary", {}).get("exit_pool_cards", []) if run_detail else []
     lines.extend(_format_exit_pool_lines(exit_pool_cards))
+    lines.append("交易轨迹：")
+    lines.extend(_format_trade_path_lines(decision_diagnostics or []))
     lines.append("决策记录：")
     lines.extend(_format_decision_lines(decision_diagnostics or []))
     lines.append("数据源状态：")
@@ -3165,12 +4249,30 @@ def format_run_review(
         lines.extend(_format_card_action_lines(row))
         lines.extend(_format_card_delivery_lines(row))
         lines.append(f"    解读：{_card_takeaway(row)}")
-        lines.append(
-            "    "
-            f"分数：事件 {row['event_score']}/{row['event_threshold']} ({row['event_margin']:+.2f})，"
-            f"市场 {row['market_score']}/{row['market_threshold']} ({row['market_margin']:+.2f})，"
-            f"综合 {row['final_score']}/{row['priority_threshold']} ({row['priority_margin']:+.2f})"
-        )
+        score_parts: list[str] = []
+        if row.get("event_score") is not None:
+            event_text = f"事件 {row.get('event_score')}"
+            if row.get("event_threshold") is not None:
+                event_text += f"/{row.get('event_threshold')}"
+            if row.get("event_margin") is not None:
+                event_text += f" ({float(row.get('event_margin')):+.2f})"
+            score_parts.append(event_text)
+        if row.get("market_score") is not None:
+            market_text = f"市场 {row.get('market_score')}"
+            if row.get("market_threshold") is not None:
+                market_text += f"/{row.get('market_threshold')}"
+            if row.get("market_margin") is not None:
+                market_text += f" ({float(row.get('market_margin')):+.2f})"
+            score_parts.append(market_text)
+        if row.get("final_score") is not None:
+            final_text = f"综合 {row.get('final_score')}"
+            if row.get("priority_threshold") is not None:
+                final_text += f"/{row.get('priority_threshold')}"
+            if row.get("priority_margin") is not None:
+                final_text += f" ({float(row.get('priority_margin')):+.2f})"
+            score_parts.append(final_text)
+        if score_parts:
+            lines.append("    分数：" + "，".join(score_parts))
         if not row.get("market_data_complete", True):
             lines.append(f"    行情状态：{row.get('market_data_note') or '行情快照暂不可用，未自动生成价格计划。'}")
         elif row.get("entry_range") and row.get("take_profit_range"):

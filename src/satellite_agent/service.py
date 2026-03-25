@@ -31,7 +31,7 @@ from .models import EventInsight, OpportunityCard, PriceRange, SourceHealthCheck
 from .notifier import Notifier
 from .observability import RunContext, StructuredLogger
 from .outcomes import compute_decision_outcome
-from .prewatch import build_prewatch_candidate, sort_prewatch_candidates
+from .prewatch import build_prewatch_candidate, evaluate_prewatch_snapshot, sort_prewatch_candidates
 from .scoring import SignalScorer
 from .sources import SourceAdapter
 from .store import Store
@@ -43,7 +43,7 @@ from .theme_linkage import (
     summarize_symbol_theme_context,
     theme_tags_for_symbol,
 )
-from .timefmt import BEIJING_TZ
+from .timefmt import BEIJING_TZ, format_beijing_minute
 
 STRONG_SELECTION_TERMS: tuple[tuple[str, float], ...] = (
     ("earnings", 24.0),
@@ -92,6 +92,8 @@ LOW_SIGNAL_SELECTION_TERMS: tuple[tuple[str, float], ...] = (
     ("everything you need to know", -24.0),
     ("what you need to know", -20.0),
 )
+
+SATELLITE_STRATEGY_VERSION = "trade-loop-v1"
 
 SOURCE_TYPE_SELECTION_WEIGHTS: dict[str, float] = {
     "filing": 28.0,
@@ -218,7 +220,9 @@ class SatelliteAgentService:
         self.scorer = scorer
         self.entry_exit = entry_exit
         self.notifier = notifier
-        self.runtime_snapshot = runtime_snapshot or {}
+        self.runtime_snapshot = dict(runtime_snapshot or {})
+        self.runtime_snapshot.setdefault("strategy_version", SATELLITE_STRATEGY_VERSION)
+        self.strategy_version = str(self.runtime_snapshot.get("strategy_version") or SATELLITE_STRATEGY_VERSION)
         self.run_name = run_name
         self.note = note
         self.prewatch_symbols = [symbol.upper() for symbol in (prewatch_symbols or [])]
@@ -772,6 +776,7 @@ class SatelliteAgentService:
         llm_requests_used = 0
         llm_daily_requests_used = self._llm_daily_usage_count(now)
         card_contexts: dict[str, dict] = {}
+        confirmation_evaluation_extras: list[dict[str, Any]] = []
         try:
             for raw_event in events:
                 event = self.normalizer.normalize(raw_event)
@@ -910,6 +915,28 @@ class SatelliteAgentService:
                                     "priority": degraded_card.priority,
                                 },
                             )
+                        else:
+                            confirmation_evaluation_extras.append(
+                                self._build_confirmation_candidate_evaluation_row(
+                                    symbol=event.symbol,
+                                    horizon=horizon,
+                                    event_id=event.event_id,
+                                    outcome="rejected",
+                                    reason="event_only_below_threshold",
+                                    score=degraded_card.final_score,
+                                    payload={
+                                        "source": "event_only_degraded",
+                                        "event_type": insight.event_type,
+                                        "event_score": round(float(degraded_card.event_score), 2),
+                                        "market_score": round(float(degraded_card.market_score), 2),
+                                        "final_score": round(float(degraded_card.final_score), 2),
+                                        "priority": str(degraded_card.priority),
+                                        "execution_eligible": bool(getattr(degraded_card, "execution_eligible", True)),
+                                        "market_data_complete": bool(getattr(degraded_card, "market_data_complete", True)),
+                                        "failure_reason": exc.__class__.__name__,
+                                    },
+                                )
+                            )
                         continue
                     try:
                         card, market_assessment = self.market_engine.score_confirmation(insight, snapshot)
@@ -951,6 +978,20 @@ class SatelliteAgentService:
                             event_id=event.event_id,
                             context={"horizon": horizon, "error": exc.__class__.__name__},
                         )
+                        confirmation_evaluation_extras.append(
+                            self._build_confirmation_candidate_evaluation_row(
+                                symbol=event.symbol,
+                                horizon=horizon,
+                                event_id=event.event_id,
+                                outcome="error",
+                                reason=f"scoring_failed:{exc.__class__.__name__}",
+                                payload={
+                                    "source": "confirmation_scoring",
+                                    "event_type": insight.event_type,
+                                    "error": exc.__class__.__name__,
+                                },
+                            )
+                        )
                         continue
             notification_candidates = self._apply_theme_linkage_to_confirmation_candidates(
                 notification_candidates
@@ -962,6 +1003,11 @@ class SatelliteAgentService:
             notification_candidates = self._apply_confirmation_packets(
                 notification_candidates,
                 confirmation_packets,
+            )
+            self._record_confirmation_candidate_evaluations(
+                notification_candidates,
+                run_id=run_context.run_id,
+                extras=confirmation_evaluation_extras,
             )
             notification_candidates = [
                 self._decorate_card_with_runtime_context(
@@ -1043,6 +1089,13 @@ class SatelliteAgentService:
                     "horizon": card.horizon,
                     "subreason": card.exit_pool_subreason,
                     "reason_to_watch": card.reason_to_watch,
+                    "positioning_hint": card.positioning_hint,
+                    "chain_summary": card.chain_summary,
+                    "source_decision_id": card.exit_pool_source_decision_id,
+                    "take_profit_range": {
+                        "low": card.take_profit_range.low,
+                        "high": card.take_profit_range.high,
+                    },
                 }
                 for card in exit_pool_cards
             ]
@@ -1548,6 +1601,7 @@ class SatelliteAgentService:
         if not watchlist:
             return []
         candidates = []
+        prewatch_evaluations: dict[str, dict[str, Any]] = {}
         near_miss_snapshots: dict[str, object] = {}
         horizon = "position"
         horizon_settings = self.settings.horizons[horizon]
@@ -1572,6 +1626,18 @@ class SatelliteAgentService:
                 except Exception as exc:
                     self._record_prewatch_failure(symbol)
                     run_context.metrics.prewatch_failures += 1
+                    prewatch_evaluations[symbol.upper()] = {
+                        "symbol": symbol.upper(),
+                        "horizon": horizon,
+                        "outcome": "error",
+                        "reason": f"build_failed:{exc.__class__.__name__}",
+                        "score": None,
+                        "payload": {
+                            "source": "scan",
+                            "error": exc.__class__.__name__,
+                            "min_score": round(float(self.settings.prewatch_min_score), 2),
+                        },
+                    }
                     logger.warning(
                         "prewatch_failed",
                         "Prewatch candidate generation failed for symbol.",
@@ -1585,10 +1651,40 @@ class SatelliteAgentService:
                 if snapshot_key not in saved_snapshot_keys:
                     self.store.save_indicator_snapshot(snapshot)
                     saved_snapshot_keys.add(snapshot_key)
+                evaluation = evaluate_prewatch_snapshot(
+                    snapshot,
+                    horizon_settings,
+                    min_score=self.settings.prewatch_min_score,
+                )
                 if candidate is None:
                     near_miss_snapshots[symbol] = snapshot
+                    prewatch_evaluations[symbol.upper()] = {
+                        "symbol": symbol.upper(),
+                        "horizon": horizon,
+                        "outcome": "rejected",
+                        "reason": str(evaluation.get("rejection_reason") or "rejected"),
+                        "score": float(evaluation.get("total_score") or 0.0),
+                        "payload": self._build_prewatch_evaluation_payload(
+                            snapshot=snapshot,
+                            evaluation=evaluation,
+                            source="scan",
+                        ),
+                    }
                     continue
                 candidates.append(candidate)
+                prewatch_evaluations[symbol.upper()] = {
+                    "symbol": symbol.upper(),
+                    "horizon": horizon,
+                    "outcome": "pending",
+                    "reason": "passed_scan_threshold",
+                    "score": round(float(candidate.score), 2),
+                    "payload": self._build_prewatch_evaluation_payload(
+                        snapshot=snapshot,
+                        candidate=candidate,
+                        evaluation=evaluation,
+                        source="scan",
+                    ),
+                }
         if near_miss_snapshots:
             candidates.extend(
                 self._build_theme_supported_prewatch_candidates(
@@ -1618,6 +1714,34 @@ class SatelliteAgentService:
             candidates,
             max_candidates=self.settings.max_prewatch_candidates_per_run,
         )
+        selected_ranks = {
+            candidate.symbol.upper(): index + 1
+            for index, candidate in enumerate(ranked)
+        }
+        for candidate in candidates:
+            symbol = candidate.symbol.upper()
+            existing = prewatch_evaluations.get(symbol, {})
+            payload = dict(existing.get("payload") or {})
+            if not payload:
+                payload = self._build_prewatch_evaluation_payload(
+                    candidate=candidate,
+                    source="event_support" if candidate.trigger_mode == "event" else "candidate_pool",
+                )
+            if symbol in selected_ranks:
+                payload["selected_rank"] = selected_ranks[symbol]
+                outcome = "selected"
+                reason = "ranked_in_run"
+            else:
+                outcome = "not_selected"
+                reason = "ranked_below_run_cap"
+            prewatch_evaluations[symbol] = {
+                "symbol": symbol,
+                "horizon": candidate.horizon,
+                "outcome": outcome,
+                "reason": reason,
+                "score": round(float(candidate.score), 2),
+                "payload": payload,
+            }
         run_context.metrics.prewatch_candidates = len(ranked)
         for candidate in ranked:
             self._record_prewatch_candidate(candidate)
@@ -1632,7 +1756,71 @@ class SatelliteAgentService:
                     "score": candidate.score,
                 },
             )
+        evaluation_created_at = utcnow().isoformat()
+        for item in sorted(prewatch_evaluations.values(), key=lambda row: (str(row.get("symbol") or ""), str(row.get("outcome") or ""))):
+            self.store.record_candidate_evaluation(
+                run_id=run_context.run_id,
+                stage="prewatch",
+                symbol=str(item.get("symbol") or ""),
+                horizon=str(item.get("horizon") or horizon),
+                outcome=str(item.get("outcome") or ""),
+                reason=str(item.get("reason") or ""),
+                score=item.get("score"),
+                strategy_version=self.strategy_version,
+                payload=dict(item.get("payload") or {}),
+                created_at=evaluation_created_at,
+            )
         return ranked
+
+    def _build_prewatch_evaluation_payload(
+        self,
+        *,
+        snapshot=None,
+        candidate=None,
+        evaluation: dict[str, object] | None = None,
+        source: str = "",
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "source": source,
+            "min_score": round(float(self.settings.prewatch_min_score), 2),
+        }
+        if snapshot is not None:
+            payload.update(
+                {
+                    "last_price": round(float(snapshot.last_price), 2),
+                    "rsi_14": round(float(snapshot.rsi_14), 2),
+                    "relative_volume": round(float(snapshot.relative_volume), 2),
+                    "trend_state": str(snapshot.trend_state),
+                    "atr_percent": round(float(snapshot.atr_percent), 2),
+                    "support_20": round(float(snapshot.support_20), 2),
+                    "resistance_20": round(float(snapshot.resistance_20), 2),
+                }
+            )
+        if evaluation:
+            payload.update(
+                {
+                    "prewatch_score": round(float(evaluation.get("total_score") or 0.0), 2),
+                    "setup_type": str(evaluation.get("setup_type") or ""),
+                    "rejection_reason": str(evaluation.get("rejection_reason") or ""),
+                    "score_breakdown": {
+                        "trend": round(float(evaluation.get("trend_score") or 0.0), 2),
+                        "volume": round(float(evaluation.get("volume_score") or 0.0), 2),
+                        "structure": round(float(evaluation.get("structure_score") or 0.0), 2),
+                        "momentum": round(float(evaluation.get("momentum_score") or 0.0), 2),
+                        "volatility": round(float(evaluation.get("volatility_score") or 0.0), 2),
+                    },
+                }
+            )
+        if candidate is not None:
+            payload.update(
+                {
+                    "prewatch_score": round(float(candidate.score), 2),
+                    "setup_type": str(candidate.setup_type),
+                    "trigger_mode": str(candidate.trigger_mode),
+                    "headline_summary": str(candidate.headline_summary),
+                }
+            )
+        return payload
 
     def _build_single_prewatch_candidate(
         self,
@@ -1815,8 +2003,8 @@ class SatelliteAgentService:
             entry_range=PriceRange(candidate.last_price, candidate.last_price),
             take_profit_range=PriceRange(candidate.last_price, candidate.last_price),
             invalidation_level=round(candidate.support_20, 2),
-            invalidation_reason="预备池轻推送，仅供观察，不作为正式交易依据。",
-            risk_notes=["预备池轻推送", "正式执行前需结合真实行情与事件确认"],
+            invalidation_reason="观察提醒，仅供观察，不作为正式交易依据。",
+            risk_notes=["观察提醒", "正式执行前需结合真实行情与事件确认"],
             source_refs=[],
             created_at=now,
             ttl=now + timedelta(days=10 if candidate.horizon == "position" else 5),
@@ -2145,11 +2333,12 @@ class SatelliteAgentService:
         return hashlib.sha1(serialized.encode("utf-8")).hexdigest()
 
     def _record_prewatch_alert_sent(self, candidate) -> None:
+        sent_at = utcnow().isoformat()
         self.store.set_state(
             self._prewatch_alert_state_key(candidate.symbol),
             json.dumps(
                 {
-                    "sent_at": utcnow().isoformat(),
+                    "sent_at": sent_at,
                     "score": round(float(candidate.score), 2),
                     "signature": self._prewatch_alert_signature(candidate),
                 },
@@ -2157,6 +2346,15 @@ class SatelliteAgentService:
                 ensure_ascii=False,
             ),
         )
+        state = self._load_prewatch_candidate_state(candidate.symbol)
+        if not state:
+            self._record_prewatch_candidate(candidate)
+            state = self._load_prewatch_candidate_state(candidate.symbol)
+        if not state:
+            return
+        state["alert_sent_count"] = max(int(state.get("alert_sent_count") or 0) + 1, 1)
+        state["last_alert_sent_at"] = sent_at
+        self._save_prewatch_candidate_state(candidate.symbol, state)
 
     def _prewatch_failure_state_key(self, symbol: str) -> str:
         return f"prewatch_failure:{symbol.upper()}"
@@ -2164,25 +2362,117 @@ class SatelliteAgentService:
     def _prewatch_candidate_state_key(self, symbol: str) -> str:
         return f"prewatch_candidate:{symbol.upper()}"
 
-    def _record_prewatch_candidate(self, candidate) -> None:
-        self.store.set_state(
-            self._prewatch_candidate_state_key(candidate.symbol),
-            json.dumps(candidate.to_record(), sort_keys=True),
-        )
-
-    def _load_recent_prewatch_candidate(self, symbol: str) -> dict | None:
+    def _load_prewatch_candidate_state(self, symbol: str) -> dict[str, Any]:
         raw = self.store.get_state(self._prewatch_candidate_state_key(symbol))
         if not raw:
-            return None
+            return {}
         try:
             payload = json.loads(raw)
-            as_of = datetime.fromisoformat(payload["as_of"])
-        except (KeyError, ValueError, TypeError, json.JSONDecodeError):
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        candidate_payload: dict[str, Any]
+        if isinstance(payload.get("candidate"), dict):
+            candidate_payload = dict(payload.get("candidate") or {})
+        elif "as_of" in payload and "setup_type" in payload:
+            candidate_payload = dict(payload)
+        else:
+            return {}
+        candidate_payload["symbol"] = str(candidate_payload.get("symbol") or symbol).upper()
+        as_of_text = str(candidate_payload.get("as_of") or "")
+        return {
+            "candidate": candidate_payload,
+            "first_seen_at": str(payload.get("first_seen_at") or as_of_text),
+            "last_seen_at": str(payload.get("last_seen_at") or as_of_text),
+            "observation_count": max(int(payload.get("observation_count") or 1), 1),
+            "alert_sent_count": max(int(payload.get("alert_sent_count") or 0), 0),
+            "last_alert_sent_at": str(payload.get("last_alert_sent_at") or ""),
+            "latest_prewatch_decision_id": str(payload.get("latest_prewatch_decision_id") or ""),
+            "latest_prewatch_event_id": str(payload.get("latest_prewatch_event_id") or ""),
+            "latest_prewatch_run_id": str(payload.get("latest_prewatch_run_id") or ""),
+        }
+
+    def _save_prewatch_candidate_state(self, symbol: str, state: dict[str, Any]) -> None:
+        self.store.set_state(
+            self._prewatch_candidate_state_key(symbol),
+            json.dumps(state, sort_keys=True, ensure_ascii=False),
+        )
+
+    def _record_prewatch_candidate(self, candidate) -> None:
+        candidate_record = candidate.to_record()
+        previous_state = self._load_prewatch_candidate_state(candidate.symbol)
+        previous_candidate = previous_state.get("candidate") or {}
+        repeated_same_observation = (
+            str(previous_candidate.get("as_of") or "") == str(candidate_record.get("as_of") or "")
+            and str(previous_candidate.get("setup_type") or "") == str(candidate_record.get("setup_type") or "")
+            and float(previous_candidate.get("score") or 0.0) == float(candidate_record.get("score") or 0.0)
+        )
+        observation_count = max(int(previous_state.get("observation_count") or 0), 0)
+        if not repeated_same_observation:
+            observation_count += 1
+        state = {
+            "candidate": candidate_record,
+            "first_seen_at": str(previous_state.get("first_seen_at") or candidate_record.get("as_of") or ""),
+            "last_seen_at": str(candidate_record.get("as_of") or previous_state.get("last_seen_at") or ""),
+            "observation_count": max(observation_count, 1),
+            "alert_sent_count": max(int(previous_state.get("alert_sent_count") or 0), 0),
+            "last_alert_sent_at": str(previous_state.get("last_alert_sent_at") or ""),
+            "latest_prewatch_decision_id": str(previous_state.get("latest_prewatch_decision_id") or ""),
+            "latest_prewatch_event_id": str(previous_state.get("latest_prewatch_event_id") or ""),
+            "latest_prewatch_run_id": str(previous_state.get("latest_prewatch_run_id") or ""),
+        }
+        self._save_prewatch_candidate_state(candidate.symbol, state)
+
+    def _load_recent_prewatch_candidate(self, symbol: str) -> dict | None:
+        state = self._load_prewatch_candidate_state(symbol)
+        if not state:
+            return None
+        payload = dict(state.get("candidate") or {})
+        timestamp_text = str(state.get("last_seen_at") or payload.get("as_of") or "")
+        try:
+            as_of = datetime.fromisoformat(timestamp_text)
+        except (ValueError, TypeError):
             return None
         age_seconds = (utcnow() - as_of).total_seconds()
         if age_seconds > max(self.settings.prewatch_promotion_window_hours, 0) * 3600:
             return None
+        payload["observation_count"] = max(int(state.get("observation_count") or 1), 1)
+        payload["first_seen_at"] = str(state.get("first_seen_at") or payload.get("as_of") or "")
+        payload["last_seen_at"] = str(state.get("last_seen_at") or payload.get("as_of") or "")
+        payload["alert_sent_count"] = max(int(state.get("alert_sent_count") or 0), 0)
+        payload["last_alert_sent_at"] = str(state.get("last_alert_sent_at") or "")
+        payload["latest_prewatch_decision_id"] = str(state.get("latest_prewatch_decision_id") or "")
+        payload["latest_prewatch_event_id"] = str(state.get("latest_prewatch_event_id") or "")
+        payload["latest_prewatch_run_id"] = str(state.get("latest_prewatch_run_id") or "")
         return payload
+
+    def _record_prewatch_decision_reference(
+        self,
+        *,
+        symbol: str,
+        decision_id: str,
+        event_id: str,
+        run_id: str,
+    ) -> None:
+        state = self._load_prewatch_candidate_state(symbol)
+        if not state:
+            return
+        state["latest_prewatch_decision_id"] = decision_id
+        state["latest_prewatch_event_id"] = event_id
+        state["latest_prewatch_run_id"] = run_id
+        self._save_prewatch_candidate_state(symbol, state)
+
+    def _build_prewatch_promotion_reason(self, prewatch_context: dict[str, Any]) -> str:
+        observation_count = max(int(prewatch_context.get("observation_count") or 1), 1)
+        alert_sent_count = max(int(prewatch_context.get("alert_sent_count") or 0), 0)
+        first_seen_text = format_beijing_minute(prewatch_context.get("first_seen_at"))
+        last_seen_text = format_beijing_minute(prewatch_context.get("last_seen_at"))
+        detail = f"累计观察 {observation_count} 次（首次 {first_seen_text}，最近一次 {last_seen_text}）"
+        if alert_sent_count > 0:
+            last_alert_text = format_beijing_minute(prewatch_context.get("last_alert_sent_at"))
+            detail += f"，期间已观察提醒 {alert_sent_count} 次（最近一次 {last_alert_text}）"
+        return f"此前已进入预备池，{detail}，本轮事件达到确认条件。"
 
     def _apply_prewatch_promotion(self, card, *, insight, prewatch_context: dict | None):
         if not prewatch_context:
@@ -2195,18 +2485,31 @@ class SatelliteAgentService:
             "pullback_watch": "回踩蓄势",
             "relative_strength_watch": "相对强势",
         }.get(setup_type, setup_type or "预备池")
+        observation_count = max(int(prewatch_context.get("observation_count") or 1), 1)
+        alert_sent_count = max(int(prewatch_context.get("alert_sent_count") or 0), 0)
+        lifecycle_hint = f"累计观察 {observation_count} 次"
+        if alert_sent_count > 0:
+            lifecycle_hint += f"，期间已观察提醒 {alert_sent_count} 次"
         positioning_hint = (
-            f"该标的此前已进入预备池（{setup_label}，{float(prewatch_context.get('score', 0.0)):.1f} 分），"
+            f"该标的此前已进入预备池（{setup_label}，{float(prewatch_context.get('score', 0.0)):.1f} 分，{lifecycle_hint}），"
             "本次事件触发确认，可从观察/轻仓阶段切换到正式确认。"
         )
+        promotion_reason = self._build_prewatch_promotion_reason(prewatch_context)
         reason_to_watch = card.reason_to_watch
-        if positioning_hint not in reason_to_watch:
-            reason_to_watch = f"{reason_to_watch} {positioning_hint}".strip()
+        if promotion_reason not in reason_to_watch:
+            reason_to_watch = f"{reason_to_watch} {promotion_reason}".strip()
         promoted_card = replace(
             card,
             promoted_from_prewatch=True,
             prewatch_score=round(float(prewatch_context.get("score", 0.0)), 2),
             prewatch_setup_type=setup_type,
+            prewatch_observation_count=observation_count,
+            prewatch_alert_sent_count=alert_sent_count,
+            prewatch_first_seen_at=str(prewatch_context.get("first_seen_at") or ""),
+            prewatch_last_seen_at=str(prewatch_context.get("last_seen_at") or ""),
+            prewatch_last_alert_sent_at=str(prewatch_context.get("last_alert_sent_at") or ""),
+            prewatch_source_decision_id=str(prewatch_context.get("latest_prewatch_decision_id") or ""),
+            prewatch_promotion_reason=promotion_reason,
             action_label="确认做多" if card.bias == "long" else card.action_label,
             positioning_hint=positioning_hint,
             reason_to_watch=reason_to_watch,
@@ -2702,6 +3005,31 @@ class SatelliteAgentService:
             decision_id = hashlib.sha1(
                 f"{run_id}:{packet.pool}:{packet.symbol}:{packet.horizon}:{packet.event_id}:{packet.trigger_mode}".encode("utf-8")
             ).hexdigest()
+            packet_record = packet.to_record()
+            if packet.pool == "prewatch":
+                prewatch_state = self._load_recent_prewatch_candidate(packet.symbol) or {}
+                if prewatch_state:
+                    packet_record["prewatch_lifecycle"] = {
+                        "observation_count": max(int(prewatch_state.get("observation_count") or 1), 1),
+                        "first_seen_at": str(prewatch_state.get("first_seen_at") or ""),
+                        "last_seen_at": str(prewatch_state.get("last_seen_at") or ""),
+                        "alert_sent_count": max(int(prewatch_state.get("alert_sent_count") or 0), 0),
+                        "last_alert_sent_at": str(prewatch_state.get("last_alert_sent_at") or ""),
+                    }
+            elif packet.pool == "confirmation" and packet.trigger_mode == "promoted":
+                prewatch_state = self._load_recent_prewatch_candidate(packet.symbol) or {}
+                if prewatch_state:
+                    packet_record["promoted_from_prewatch"] = True
+                    packet_record["prewatch_score"] = round(float(prewatch_state.get("score") or 0.0), 2)
+                    packet_record["prewatch_setup_type"] = str(prewatch_state.get("setup_type") or "")
+                    packet_record["prewatch_observation_count"] = max(int(prewatch_state.get("observation_count") or 1), 1)
+                    packet_record["prewatch_alert_sent_count"] = max(int(prewatch_state.get("alert_sent_count") or 0), 0)
+                    packet_record["prewatch_first_seen_at"] = str(prewatch_state.get("first_seen_at") or "")
+                    packet_record["prewatch_last_seen_at"] = str(prewatch_state.get("last_seen_at") or "")
+                    packet_record["prewatch_last_alert_sent_at"] = str(prewatch_state.get("last_alert_sent_at") or "")
+                    packet_record["source_decision_id"] = str(prewatch_state.get("latest_prewatch_decision_id") or "")
+                    packet_record["prewatch_promotion_reason"] = self._build_prewatch_promotion_reason(prewatch_state)
+            packet_record["strategy_version"] = self.strategy_version
             self.store.save_decision_record(
                 decision_id=decision_id,
                 run_id=run_id,
@@ -2722,8 +3050,98 @@ class SatelliteAgentService:
                 entry_plan=price_plan,
                 invalidation=invalidation,
                 ttl=(packet.price_plan.ttl_iso if packet.price_plan is not None else ""),
-                packet=packet.to_record(),
+                packet=packet_record,
                 created_at=utcnow().isoformat(),
+            )
+            if packet.pool == "prewatch":
+                self._record_prewatch_decision_reference(
+                    symbol=packet.symbol,
+                    decision_id=decision_id,
+                    event_id=packet.event_id,
+                    run_id=run_id,
+                )
+
+    def _build_confirmation_candidate_evaluation_row(
+        self,
+        *,
+        symbol: str,
+        horizon: str,
+        event_id: str,
+        outcome: str,
+        reason: str,
+        score: float | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "symbol": symbol.upper(),
+            "horizon": horizon,
+            "event_id": event_id,
+            "outcome": outcome,
+            "reason": reason,
+            "score": score,
+            "payload": dict(payload or {}),
+        }
+
+    def _record_confirmation_candidate_evaluations(
+        self,
+        cards: list,
+        *,
+        run_id: str,
+        extras: list[dict[str, Any]] | None = None,
+    ) -> None:
+        created_at = utcnow().isoformat()
+        for card in cards:
+            outcome = "selected"
+            reason = "confirmation_opportunity"
+            if not getattr(card, "execution_eligible", True):
+                outcome = "rejected"
+                reason = "execution_ineligible"
+            elif card.priority == "suppressed":
+                outcome = "rejected"
+                reason = "threshold_not_met"
+            payload = {
+                "source": "event_only_degraded" if not getattr(card, "market_data_complete", True) else "confirmation",
+                "event_type": str(getattr(card, "event_type", "") or ""),
+                "action_label": str(getattr(card, "action_label", "") or ""),
+                "priority": str(getattr(card, "priority", "") or ""),
+                "event_score": round(float(getattr(card, "event_score", 0.0) or 0.0), 2),
+                "market_score": round(float(getattr(card, "market_score", 0.0) or 0.0), 2),
+                "final_score": round(float(getattr(card, "final_score", 0.0) or 0.0), 2),
+                "execution_eligible": bool(getattr(card, "execution_eligible", True)),
+                "market_data_complete": bool(getattr(card, "market_data_complete", True)),
+                "promoted_from_prewatch": bool(getattr(card, "promoted_from_prewatch", False)),
+                "trigger_mode": (
+                    "promoted"
+                    if bool(getattr(card, "promoted_from_prewatch", False))
+                    else ("event_only" if not getattr(card, "market_data_complete", True) else "direct")
+                ),
+            }
+            self.store.record_candidate_evaluation(
+                run_id=run_id,
+                stage="confirmation",
+                symbol=card.symbol,
+                horizon=card.horizon,
+                event_id=card.event_id,
+                outcome=outcome,
+                reason=reason,
+                score=card.final_score,
+                strategy_version=self.strategy_version,
+                payload=payload,
+                created_at=created_at,
+            )
+        for item in extras or []:
+            self.store.record_candidate_evaluation(
+                run_id=run_id,
+                stage="confirmation",
+                symbol=str(item.get("symbol") or ""),
+                horizon=str(item.get("horizon") or ""),
+                event_id=str(item.get("event_id") or ""),
+                outcome=str(item.get("outcome") or ""),
+                reason=str(item.get("reason") or ""),
+                score=item.get("score"),
+                strategy_version=self.strategy_version,
+                payload=dict(item.get("payload") or {}),
+                created_at=created_at,
             )
 
     def _fetch_from_adapter(

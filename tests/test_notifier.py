@@ -67,6 +67,27 @@ def make_card(final_score: float) -> OpportunityCard:
     )
 
 
+def make_formal_card(final_score: float = 91.5) -> OpportunityCard:
+    card = make_card(final_score)
+    card.take_profit_range = PriceRange(106.0, 110.0)
+    card.priority = "high"
+    card.execution_eligible = True
+    return card
+
+
+def make_exit_card() -> OpportunityCard:
+    card = make_formal_card(82.0)
+    card.action_label = "进入兑现池"
+    card.exit_pool_subreason = "macro_protection"
+    card.chain_summary = "3天前确认做多 -> 今日进入兑现池"
+    card.exit_pool_source_decision_id = "decision-confirm-1"
+    card.reason_to_watch = "宏观环境转差且已有浮盈，当前更适合先做利润保护。"
+    card.positioning_hint = "外部风险抬升时，先把已有利润锁住，比继续硬扛更重要。"
+    card.llm_reasoning = "已有浮盈后遇到宏观风险抬升，当前更适合转入兑现管理。"
+    card.llm_uncertainty = "如果宏观压力很快消退，过早兑现可能少赚后续波段。"
+    return card
+
+
 class NotifierTests(unittest.TestCase):
     def test_deduplicates_within_four_hours_unless_score_improves(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -84,7 +105,7 @@ class NotifierTests(unittest.TestCase):
 
     def test_feishu_transport_builds_interactive_card_payload(self) -> None:
         transport = FeishuTransport("https://example.com/webhook")
-        payload = transport._build_interactive_payload(make_card(91.5))
+        payload = transport._build_interactive_payload(make_formal_card())
         self.assertEqual(payload["msg_type"], "interactive")
         self.assertEqual(payload["card"]["header"]["template"], "red")
         self.assertIn("NVIDIA", payload["card"]["header"]["title"]["content"])
@@ -93,15 +114,27 @@ class NotifierTests(unittest.TestCase):
         first_block = payload["card"]["elements"][0]["text"]["content"]
         self.assertIn("链路", first_block)
         self.assertIn("正式操作卡", first_block)
-        event_block = payload["card"]["elements"][2]["text"]["content"]
+        event_block = next(
+            element["text"]["content"]
+            for element in payload["card"]["elements"]
+            if element.get("tag") == "div" and "事件类型" in element.get("text", {}).get("content", "")
+        )
         self.assertIn("事件倾向", event_block)
         self.assertIn("事实摘要", event_block)
-        market_block = payload["card"]["elements"][4]["text"]["content"]
+        market_block = next(
+            element["text"]["content"]
+            for element in payload["card"]["elements"]
+            if element.get("tag") == "div" and "当前环境" in element.get("text", {}).get("content", "")
+        )
         self.assertIn("宏观覆盖", market_block)
         note_text = payload["card"]["elements"][-2]["elements"][0]["content"]
         self.assertIn("来源：example.com", note_text)
-        signal_heading = payload["card"]["elements"][5]["text"]["content"]
-        self.assertIn("信号评分", signal_heading)
+        signal_heading = next(
+            element["text"]["content"]
+            for element in payload["card"]["elements"]
+            if element.get("tag") == "div" and element.get("text", {}).get("content", "") == "**信号评分**"
+        )
+        self.assertEqual(signal_heading, "**信号评分**")
         ratio_field = next(
             field["text"]["content"]
             for element in payload["card"]["elements"]
@@ -109,8 +142,8 @@ class NotifierTests(unittest.TestCase):
             for field in element.get("fields", [])
             if "预期盈亏比" in field["text"]["content"]
         )
-        self.assertIn("偏弱", ratio_field)
-        self.assertIn("1.00", ratio_field)
+        self.assertIn("可接受", ratio_field)
+        self.assertIn("1.67", ratio_field)
         score_field = next(
             field["text"]["content"]
             for element in payload["card"]["elements"]
@@ -158,15 +191,36 @@ class NotifierTests(unittest.TestCase):
         payload = transport._build_interactive_payload(card)
         self.assertIn("加入观察", payload["card"]["header"]["title"]["content"])
         overview_text = payload["card"]["elements"][0]["text"]["content"]
-        self.assertIn("预备池观察", overview_text)
-        market_text = payload["card"]["elements"][4]["text"]["content"]
+        self.assertIn("观察卡", overview_text)
+        market_text = next(
+            element["text"]["content"]
+            for element in payload["card"]["elements"]
+            if element.get("tag") == "div" and "当前环境" in element.get("text", {}).get("content", "")
+        )
         self.assertIn("行情状态", market_text)
-        plan_heading = payload["card"]["elements"][9]["text"]["content"]
+        plan_heading = payload["card"]["elements"][2]["text"]["content"]
         self.assertIn("观察计划", plan_heading)
-        plan_text = payload["card"]["elements"][11]["text"]["content"]
+        plan_text = payload["card"]["elements"][3]["text"]["content"]
         self.assertIn("关注重点", plan_text)
         self.assertIn("升级触发", plan_text)
         self.assertIn("量能继续配合", plan_text)
+
+    def test_feishu_transport_builds_exit_pool_payload_with_guardrail(self) -> None:
+        transport = FeishuTransport("https://example.com/webhook")
+        payload = transport._build_interactive_payload(make_exit_card())
+        overview_text = payload["card"]["elements"][0]["text"]["content"]
+        self.assertIn("兑现管理卡", overview_text)
+        self.assertIn("优先保护利润", overview_text)
+        decision_text = payload["card"]["elements"][1]["text"]["content"]
+        self.assertIn("为什么进入兑现池", decision_text)
+        self.assertIn("宏观保护", decision_text)
+        self.assertIn("来源链路", decision_text)
+        self.assertIn("3天前确认做多 -> 今日进入兑现池", decision_text)
+        self.assertIn("只面向已有浮盈仓位", decision_text)
+        plan_text = payload["card"]["elements"][3]["text"]["content"]
+        self.assertIn("原目标区", plan_text)
+        self.assertIn("来源链路", plan_text)
+        self.assertIn("106.00 - 110.00", plan_text)
 
     def test_watch_card_title_does_not_repeat_observation_suffix(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -183,7 +237,7 @@ class NotifierTests(unittest.TestCase):
             store = Store(Path(temp_dir) / "test.db")
             store.initialize()
             notifier = Notifier(store=store, transport=None, dry_run=True)
-            card = make_card(91.5)
+            card = make_formal_card()
             title = notifier._title(card)
             self.assertEqual(title, "NVIDIA（NVDA） | 确认做多 | 财报事件")
 
@@ -202,14 +256,42 @@ class NotifierTests(unittest.TestCase):
             store.initialize()
             notifier = Notifier(store=store, transport=None, dry_run=True)
             body = notifier._body(make_card(76.0))
-            self.assertIn("预期盈亏比：偏弱（1.00）", body)
             self.assertIn("NVIDIA（NVDA）", body)
-            self.assertIn("相对量能", body)
-            self.assertIn("链路：2天前加入观察 -> 今日确认做多", body)
+            self.assertIn("链路：2天前加入观察 -> 今日加入观察", body)
+            self.assertIn("降级原因：降级观察：盈亏比不足", body)
+            self.assertIn("为什么现在先观察", body)
             self.assertIn("结构状态：多头（结构向上）（代表价格结构仍偏强", body)
             self.assertIn("事件倾向：偏利多（代表事件内容整体偏正面", body)
             self.assertIn("宏观覆盖：宏观风险覆盖已生效：综合分下调 12.0 分", body)
             self.assertIn("事件分：80.00（强催化，代表消息本身强度高", body)
+
+    def test_formal_card_body_prioritizes_execution_plan_and_core_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = Store(Path(temp_dir) / "test.db")
+            store.initialize()
+            notifier = Notifier(store=store, transport=None, dry_run=True)
+            body = notifier._body(make_formal_card())
+            self.assertIn("执行计划：", body)
+            self.assertIn("入场区间：100.00-101.00", body)
+            self.assertIn("失效价：98.00", body)
+            self.assertIn("预期盈亏比：可接受（1.67）", body)
+            self.assertIn("一句话核心：", body)
+            self.assertIn("最大风险：", body)
+            self.assertNotIn("动作由「确认做多」降为「试探建仓」", body)
+
+    def test_formal_card_deduplicates_and_prioritizes_sources(self) -> None:
+        transport = FeishuTransport("https://example.com/webhook")
+        card = make_formal_card()
+        card.source_refs = [
+            "https://news.google.com/articles/1",
+            "https://www.sec.gov/ixviewer/doc",
+            "https://www.reuters.com/world/us/example",
+            "https://news.google.com/articles/2",
+        ]
+        payload = transport._build_interactive_payload(card)
+        buttons = payload["card"]["elements"][-1]["actions"]
+        labels = [button["text"]["content"] for button in buttons]
+        self.assertEqual(labels, ["SEC Edgar", "Reuters", "Google News"])
 
     def test_plain_text_watch_card_uses_observation_specific_labels(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -226,6 +308,20 @@ class NotifierTests(unittest.TestCase):
             self.assertIn("当前处理：当前先放入观察名单，不追价。", body)
             self.assertIn("关注重点：先盯合作细节和订单金额是否继续落地。", body)
             self.assertIn("升级触发：若量能继续配合", body)
+
+    def test_plain_text_exit_card_uses_exit_specific_labels_and_guardrail(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = Store(Path(temp_dir) / "test.db")
+            store.initialize()
+            notifier = Notifier(store=store, transport=None, dry_run=True)
+            body = notifier._body(make_exit_card())
+            self.assertIn("卡片定位：兑现管理卡", body)
+            self.assertIn("为什么进入兑现池", body)
+            self.assertIn("兑现原因：宏观保护", body)
+            self.assertIn("来源链路：3天前确认做多 -> 今日进入兑现池", body)
+            self.assertIn("使用边界：只面向已有浮盈仓位，不代表新的开仓信号。", body)
+            self.assertIn("兑现计划：", body)
+            self.assertIn("原目标区：106.00-110.00", body)
 
     def test_skip_records_explicit_reason(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

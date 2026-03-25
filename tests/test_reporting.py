@@ -44,11 +44,13 @@ from satellite_agent.main import _build_historical_effect_review_data
 from satellite_agent.main import build_batch_replay_payload
 from satellite_agent.main import build_demo_flow_payload
 from satellite_agent.main import build_llm_usage_report_payload
+from satellite_agent.main import build_performance_review_payload
 from satellite_agent.main import build_replay_evaluation_payload
 from satellite_agent.main import build_run_comparison_payload
 from satellite_agent.main import build_strategy_report_payload
 from satellite_agent.main import build_theme_reference_payload
 from satellite_agent.main import format_theme_reference_payload
+from satellite_agent.main import format_live_run_artifacts
 from satellite_agent.main import write_live_run_artifacts
 from satellite_agent.config import Settings
 from satellite_agent.models import Bar, SourceHealthCheck, utcnow
@@ -58,6 +60,375 @@ from satellite_agent.theme_linkage import build_symbol_theme_map_from_watchlist_
 
 
 class ReportingTests(unittest.TestCase):
+    def test_format_run_review_highlights_exit_pool_breakdown_and_guidance(self) -> None:
+        run_detail = {
+            "run_id": "run-exit-1",
+            "status": "success",
+            "started_at": datetime(2026, 3, 24, 10, 0, tzinfo=timezone.utc).isoformat(),
+            "finished_at": datetime(2026, 3, 24, 10, 1, tzinfo=timezone.utc).isoformat(),
+            "config_snapshot": {"runtime_config": {"watchlist": {"stock_items": {}, "etf_items": {}}}},
+            "summary": {
+                "events_processed": 1,
+                "cards_generated": 2,
+                "alerts_sent": 1,
+                "prewatch_candidates": [],
+                "prewatch_alerts_sent_count": 0,
+                "exit_pool_cards": [
+                    {
+                        "symbol": "NVDA",
+                        "display_name": "NVIDIA",
+                        "horizon": "position",
+                        "subreason": "target_hit",
+                        "reason_to_watch": "价格已进入计划止盈区更深位置，当前更适合按计划兑现利润。",
+                        "positioning_hint": "已到达目标区更深位置（原目标区 120.00-128.00），优先按计划兑现利润。",
+                        "chain_summary": "3天前确认做多 -> 今日进入兑现池",
+                        "source_decision_id": "decision-confirm-1",
+                        "take_profit_range": {"low": 120.0, "high": 128.0},
+                    },
+                    {
+                        "symbol": "META",
+                        "display_name": "Meta Platforms",
+                        "horizon": "swing",
+                        "subreason": "macro_protection",
+                        "reason_to_watch": "宏观环境转差且已有浮盈，当前更适合先做利润保护。",
+                        "positioning_hint": "外部风险抬升时，先把已有利润锁住，比继续硬扛更重要。",
+                        "chain_summary": "昨晚试探建仓 -> 今日进入兑现池",
+                        "source_decision_id": "decision-confirm-2",
+                        "take_profit_range": {"low": 640.0, "high": 668.0},
+                    },
+                ],
+                "extraction_failures": 0,
+                "market_data_failures": 0,
+                "scoring_failures": 0,
+                "notification_failures": 0,
+                "skipped_cross_source_duplicate": 0,
+                "skipped_duplicate_event_id": 0,
+                "skipped_out_of_watchlist": 0,
+            },
+        }
+
+        review_text = format_run_review(
+            run_detail,
+            {
+                "event_type_performance": [],
+                "alert_volume": [],
+            },
+            [],
+            [],
+            [
+                {
+                    "decision_id": "decision-exit-1",
+                    "symbol": "NVDA",
+                    "pool": "exit",
+                    "pool_label": "兑现池",
+                    "action": "进入兑现池",
+                    "priority": "high",
+                    "confidence": "高",
+                    "event_score": 82.0,
+                    "market_score": 77.0,
+                    "theme_score": 6.0,
+                    "final_score": 88.0,
+                    "trigger_mode": "target_hit",
+                    "theme_ids": ["semiconductors_and_ai"],
+                    "source_decision_id": "decision-confirm-1",
+                    "created_at": datetime(2026, 3, 24, 10, 0, tzinfo=timezone.utc).isoformat(),
+                    "realized_return": 9.8,
+                    "holding_days": 3,
+                    "source_decision_summary": {
+                        "decision_id": "decision-confirm-1",
+                        "symbol": "NVDA",
+                        "pool": "confirmation",
+                        "pool_label": "确认池",
+                        "action": "确认做多",
+                        "priority": "high",
+                        "confidence": "高",
+                        "final_score": 86.5,
+                        "created_at": datetime(2026, 3, 21, 10, 0, tzinfo=timezone.utc).isoformat(),
+                    },
+                }
+            ],
+        )
+
+        self.assertIn("另外有 2 个标的进入兑现池（达标止盈 1 个，宏观保护 1 个）", review_text)
+        self.assertIn("兑现池：", review_text)
+        self.assertIn("NVIDIA / 波段 / 达标止盈", review_text)
+        self.assertIn("来源链路：3天前确认做多 -> 今日进入兑现池", review_text)
+        self.assertIn("来源决策：decision-confirm-1", review_text)
+        self.assertIn("原目标区：120.00-128.00", review_text)
+        self.assertIn("当前处理：已到达目标区更深位置", review_text)
+        self.assertIn("Meta Platforms / 短线 / 宏观保护", review_text)
+        self.assertIn("使用边界：兑现池只面向已有浮盈仓位，不代表新的开仓信号。", review_text)
+        self.assertIn("交易轨迹：", review_text)
+        self.assertIn("NVDA / 确认做多 -> 进入兑现池", review_text)
+        self.assertIn("起点：确认池 / 确认做多 / 优先级 high / 综合 86.50", review_text)
+        self.assertIn("终点：兑现池 / 进入兑现池 / 触发模式 target_hit / 综合 88.00", review_text)
+        self.assertIn("结果：历时 3.00 天 / 真实收益 9.80%", review_text)
+        self.assertIn("时间：2026-03-21 18:00 -> 2026-03-24 18:00 / 历时 3 天", review_text)
+        self.assertIn("来源动作：确认池 / 确认做多 / 优先级 high / 综合 86.50", review_text)
+
+    def test_format_run_review_reports_pool_funnel(self) -> None:
+        run_detail = {
+            "run_id": "run-funnel-1",
+            "status": "success",
+            "started_at": datetime(2026, 3, 24, 10, 0, tzinfo=timezone.utc).isoformat(),
+            "finished_at": datetime(2026, 3, 24, 10, 1, tzinfo=timezone.utc).isoformat(),
+            "config_snapshot": {"runtime_config": {"watchlist": {"stock_items": {}, "etf_items": {}}}},
+            "candidate_evaluation_summary": {
+                "prewatch": {
+                    "stage": "prewatch",
+                    "stage_label": "预备池",
+                    "total_count": 5,
+                    "selected_count": 3,
+                    "not_selected_count": 1,
+                    "rejected_count": 1,
+                    "error_count": 0,
+                    "top_blocked_reasons": [
+                        {"reason": "below_min_score", "label": "低于观察阈值", "count": 1},
+                        {"reason": "ranked_below_run_cap", "label": "排在本轮候选上限之外", "count": 1},
+                    ],
+                    "top_error_reasons": [],
+                },
+                "confirmation": {
+                    "stage": "confirmation",
+                    "stage_label": "确认机会",
+                    "total_count": 3,
+                    "selected_count": 1,
+                    "not_selected_count": 0,
+                    "rejected_count": 2,
+                    "error_count": 0,
+                    "top_blocked_reasons": [
+                        {"reason": "threshold_not_met", "label": "未达到确认阈值", "count": 1},
+                        {"reason": "execution_ineligible", "label": "不满足执行条件", "count": 1},
+                    ],
+                    "top_error_reasons": [],
+                },
+            },
+            "summary": {
+                "events_processed": 2,
+                "cards_generated": 3,
+                "alerts_sent": 1,
+                "prewatch_candidates": [
+                    {"symbol": "AAA", "horizon": "position", "setup_type": "breakout_watch", "score": 79.0, "headline_summary": "", "trigger_mode": "structure", "last_price": 100.0, "rsi_14": 56.0, "relative_volume": 1.2, "trend_state": "bullish", "action_hint": "", "reason_to_watch": ""},
+                    {"symbol": "BBB", "horizon": "position", "setup_type": "pullback_watch", "score": 76.0, "headline_summary": "", "trigger_mode": "structure", "last_price": 100.0, "rsi_14": 54.0, "relative_volume": 1.1, "trend_state": "bullish", "action_hint": "", "reason_to_watch": ""},
+                    {"symbol": "CCC", "horizon": "position", "setup_type": "relative_strength_watch", "score": 74.0, "headline_summary": "", "trigger_mode": "structure", "last_price": 100.0, "rsi_14": 52.0, "relative_volume": 1.0, "trend_state": "bullish", "action_hint": "", "reason_to_watch": ""},
+                ],
+                "prewatch_alerts_sent_count": 2,
+                "prewatch_alert_symbols": ["AAA", "BBB"],
+                "exit_pool_cards": [],
+                "extraction_failures": 0,
+                "market_data_failures": 0,
+                "scoring_failures": 0,
+                "notification_failures": 0,
+                "skipped_cross_source_duplicate": 0,
+                "skipped_duplicate_event_id": 0,
+                "skipped_out_of_watchlist": 0,
+            },
+        }
+
+        review_text = format_run_review(
+            run_detail,
+            {
+                "event_type_performance": [],
+                "alert_volume": [],
+            },
+            [],
+            [
+                {
+                    "card_id": "card-aaa",
+                    "symbol": "AAA",
+                    "display_name": "AAA Corp",
+                    "horizon": "position",
+                    "event_type": "guidance",
+                    "priority": "high",
+                    "action_label": "确认做多",
+                    "confidence_label": "高",
+                    "headline_summary": "AAA guidance improved.",
+                    "delivery_view": {
+                        "identity": "AAA Corp（AAA）",
+                        "event_type_display": "指引",
+                        "priority_display": "高优先级",
+                        "horizon_display": "波段",
+                        "action_label_effective": "确认做多",
+                        "confidence_label_effective": "高",
+                        "source_summary": "example.com",
+                        "event_reason_line": "事件解读：指引改善。",
+                        "market_reason_line": "行情解读：结构向上。",
+                        "theme_reason_line": "题材解读：AI",
+                        "valid_until_text": "03-28 18:00",
+                        "market_data_complete": True,
+                    },
+                    "identity": "AAA Corp（AAA）",
+                    "event_type_display": "指引",
+                    "priority_display": "高优先级",
+                    "horizon_display": "波段",
+                    "action_label_effective": "确认做多",
+                    "confidence_label_effective": "高",
+                    "source_summary": "example.com",
+                    "event_reason_line": "事件解读：指引改善。",
+                    "market_reason_line": "行情解读：结构向上。",
+                    "theme_reason_line": "题材解读：AI",
+                    "valid_until_text": "03-28 18:00",
+                    "market_data_complete": True,
+                    "reason_to_watch": "事件和市场都达标。",
+                    "positioning_hint": "可按计划执行。",
+                    "event_score": 82.0,
+                    "market_score": 76.0,
+                    "final_score": 86.0,
+                    "event_threshold": 60.0,
+                    "market_threshold": 55.0,
+                    "priority_threshold": 75.0,
+                    "event_margin": 22.0,
+                    "market_margin": 21.0,
+                    "priority_margin": 11.0,
+                    "event_pass": True,
+                    "market_pass": True,
+                    "priority_pass": True,
+                    "entry_range": {"low": 10.0, "high": 11.0},
+                    "take_profit_range": {"low": 13.0, "high": 15.0},
+                    "invalidation_level": 9.2,
+                    "invalidation_reason": "跌破关键支撑则失效。",
+                    "trend_state": "bullish",
+                    "rsi_14": 58.0,
+                    "relative_volume": 1.3,
+                    "source_refs": ["https://example.com/aaa"],
+                    "sent": True,
+                    "alert_reason": "sent",
+                },
+                {
+                    "card_id": "card-bbb",
+                    "symbol": "BBB",
+                    "priority": "suppressed",
+                    "sent": False,
+                    "alert_reason": "threshold_not_met",
+                },
+                {
+                    "card_id": "card-ccc",
+                    "symbol": "CCC",
+                    "priority": "normal",
+                    "sent": False,
+                    "alert_reason": "quality_cutoff",
+                },
+            ],
+            [
+                {
+                    "decision_id": "decision-confirm-1",
+                    "symbol": "AAA",
+                    "pool": "confirmation",
+                    "pool_label": "确认池",
+                    "action": "确认做多",
+                    "priority": "high",
+                    "confidence": "高",
+                    "event_score": 82.0,
+                    "market_score": 76.0,
+                    "theme_score": 5.0,
+                    "final_score": 86.0,
+                    "trigger_mode": "promoted",
+                    "theme_ids": ["ai"],
+                    "promoted_from_prewatch": True,
+                    "prewatch_score": 79.0,
+                    "prewatch_setup_type": "breakout_watch",
+                    "prewatch_observation_count": 3,
+                    "prewatch_alert_sent_count": 1,
+                    "prewatch_first_seen_at": datetime(2026, 3, 21, 10, 0, tzinfo=timezone.utc).isoformat(),
+                    "prewatch_last_seen_at": datetime(2026, 3, 24, 9, 0, tzinfo=timezone.utc).isoformat(),
+                    "prewatch_promotion_reason": "此前已进入预备池，累计观察 3 次，本轮事件达到确认条件。",
+                    "entered": True,
+                    "entered_at": datetime(2026, 3, 25, 10, 0, tzinfo=timezone.utc).isoformat(),
+                    "holding_days": 2.0,
+                    "close_reason": "exit_pool",
+                    "created_at": datetime(2026, 3, 24, 10, 0, tzinfo=timezone.utc).isoformat(),
+                },
+                {
+                    "decision_id": "decision-confirm-2",
+                    "symbol": "CCC",
+                    "pool": "confirmation",
+                    "pool_label": "确认池",
+                    "action": "确认做多",
+                    "priority": "normal",
+                    "confidence": "中",
+                    "event_score": 76.0,
+                    "market_score": 70.0,
+                    "theme_score": 4.0,
+                    "final_score": 78.0,
+                    "trigger_mode": "promoted",
+                    "theme_ids": ["ai"],
+                    "promoted_from_prewatch": True,
+                    "prewatch_score": 74.0,
+                    "prewatch_setup_type": "pullback_watch",
+                    "prewatch_observation_count": 2,
+                    "prewatch_alert_sent_count": 0,
+                    "prewatch_first_seen_at": datetime(2026, 3, 22, 10, 0, tzinfo=timezone.utc).isoformat(),
+                    "prewatch_last_seen_at": datetime(2026, 3, 24, 8, 0, tzinfo=timezone.utc).isoformat(),
+                    "prewatch_promotion_reason": "此前已进入预备池，累计观察 2 次，本轮事件达到确认条件。",
+                    "entered": False,
+                    "close_reason": "not_entered",
+                    "created_at": datetime(2026, 3, 24, 10, 0, tzinfo=timezone.utc).isoformat(),
+                },
+                {
+                    "decision_id": "decision-exit-1",
+                    "symbol": "AAA",
+                    "pool": "exit",
+                    "pool_label": "兑现池",
+                    "action": "进入兑现池",
+                    "priority": "high",
+                    "confidence": "高",
+                    "event_score": 80.0,
+                    "market_score": 75.0,
+                    "theme_score": 4.0,
+                    "final_score": 84.0,
+                    "trigger_mode": "target_hit",
+                    "theme_ids": ["ai"],
+                    "source_decision_id": "decision-confirm-1",
+                    "created_at": datetime(2026, 3, 24, 10, 0, tzinfo=timezone.utc).isoformat(),
+                    "source_decision_summary": {
+                        "decision_id": "decision-confirm-1",
+                        "symbol": "AAA",
+                        "pool": "confirmation",
+                        "pool_label": "确认池",
+                        "action": "确认做多",
+                        "priority": "high",
+                        "confidence": "高",
+                        "final_score": 86.0,
+                        "created_at": datetime(2026, 3, 24, 10, 0, tzinfo=timezone.utc).isoformat(),
+                        "promoted_from_prewatch": True,
+                        "prewatch_alert_sent_count": 1,
+                    },
+                },
+            ],
+        )
+
+        self.assertIn("三池漏斗：", review_text)
+        self.assertIn("预备池候选：3 条", review_text)
+        self.assertIn("观察提醒：2 条 | 观察 -> 观察提醒转化率 66.7%", review_text)
+        self.assertIn("确认机会：2 条 | 观察 -> 确认机会转化率 66.7%", review_text)
+        self.assertIn("观察提醒后确认机会：1 条 | 观察提醒 -> 确认机会转化率 50.0%", review_text)
+        self.assertIn("另有 1 条未经过观察提醒，直接从观察进入确认机会。", review_text)
+        self.assertIn("进入兑现池：1 条 | 确认机会 -> 兑现转化率 50.0%", review_text)
+        self.assertIn("候选诊断：", review_text)
+        self.assertIn("预备池：共 5 条，进入观察 3 条，未入选 1 条，拒绝 1 条，异常 0 条。", review_text)
+        self.assertIn("主要未通过原因：低于观察阈值 1 条 / 排在本轮候选上限之外 1 条", review_text)
+        self.assertIn("确认机会：共 3 条，形成确认机会 1 条，未入选 0 条，拒绝 2 条，异常 0 条。", review_text)
+        self.assertIn("主要未通过原因：未达到确认阈值 1 条 / 不满足执行条件 1 条", review_text)
+        self.assertIn("完整模拟闭环：", review_text)
+        self.assertIn("观察：3 条", review_text)
+        self.assertIn("模拟进场：1 条 | 确认机会 -> 模拟进场转化率 50.0%", review_text)
+        self.assertIn("进入兑现池：1 条 | 模拟进场 -> 进入兑现池转化率 100.0%", review_text)
+        self.assertIn("模拟退出完成：1 条 | 模拟进场 -> 模拟退出完成率 100.0%", review_text)
+        self.assertIn("确认机会 -> 模拟进场：平均等待 1.00 天，中位数 1.00 天", review_text)
+        self.assertIn("模拟进场 -> 模拟退出完成：平均持有 2.00 天，中位数 2.00 天", review_text)
+        self.assertIn("按动作看成交等待：确认做多：样本 1 条，平均等待 1.00 天，中位数 1.00 天", review_text)
+        self.assertIn("按动作看持有时长：确认做多：样本 1 条，平均持有 2.00 天，中位数 2.00 天", review_text)
+        self.assertIn("另有 1 条确认机会尚未形成模拟进场。", review_text)
+        self.assertIn("其中：兑现池 1 条", review_text)
+        self.assertIn("新增观察标的：", review_text)
+        self.assertIn("本轮新增观察标的 3 个，其中 1 个当前仍处于后台观察。", review_text)
+        self.assertIn("CCC / 波段 / 相对强势 / 预备池 74.00 分", review_text)
+        self.assertIn("当前状态：仅后台观察，尚未触发观察提醒。", review_text)
+        self.assertIn("提醒压制诊断：", review_text)
+        self.assertIn("共 3 张卡片，其中 1 张停留在观察级别，2 张进入正式提醒候选，实际发送 1 张。", review_text)
+        self.assertIn("确认机会候选被挡主因：未达到确认阈值 1 条 / 不满足执行条件 1 条", review_text)
+        self.assertIn("提醒阶段被拦主因：低于普通提醒门槛 1 张", review_text)
+
     def test_format_llm_usage_report_payload_summarizes_components(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "agent.db"
@@ -530,6 +901,696 @@ class ReportingTests(unittest.TestCase):
             self.assertIn("T+7 表现最差 Top3：", report_text)
             self.assertIn("T+7收益", report_text)
 
+    def test_historical_effect_review_summarizes_trade_paths_to_exit_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+            first_created_at = datetime(2026, 3, 14, 14, 0, tzinfo=timezone.utc).isoformat()
+            second_created_at = datetime(2026, 3, 16, 14, 0, tzinfo=timezone.utc).isoformat()
+
+            store.save_decision_record(
+                decision_id="decision-exit-pool-1",
+                run_id="run-review",
+                event_id="evt-exit-pool-1",
+                symbol="NVDA",
+                event_type="guidance",
+                pool="confirmation",
+                action="确认做多",
+                priority="high",
+                confidence="高",
+                event_score=84.0,
+                market_score=79.0,
+                theme_score=8.0,
+                final_score=87.0,
+                trigger_mode="direct",
+                llm_used=False,
+                theme_ids=["semis"],
+                entry_plan={
+                    "entry_range": {"low": 100.0, "high": 101.0},
+                    "take_profit_range": {"low": 110.0, "high": 115.0},
+                    "invalidation_level": 98.0,
+                },
+                invalidation={"level": 98.0, "reason": "跌破支撑"},
+                ttl=first_created_at,
+                packet={},
+                created_at=first_created_at,
+            )
+            store.save_decision_outcome(
+                decision_id="decision-exit-pool-1",
+                entered=True,
+                entered_at=first_created_at,
+                entry_price=101.0,
+                exit_price=112.0,
+                realized_return=10.89,
+                holding_days=3,
+                close_reason="exit_pool",
+                exit_subreason="target_hit",
+                hit_take_profit=True,
+                updated_at=first_created_at,
+            )
+
+            store.save_decision_record(
+                decision_id="decision-exit-pool-2",
+                run_id="run-review",
+                event_id="evt-exit-pool-2",
+                symbol="META",
+                event_type="earnings",
+                pool="confirmation",
+                action="试探建仓",
+                priority="normal",
+                confidence="中",
+                event_score=77.0,
+                market_score=68.0,
+                theme_score=7.0,
+                final_score=74.0,
+                trigger_mode="structure",
+                llm_used=False,
+                theme_ids=["software"],
+                entry_plan={
+                    "entry_range": {"low": 200.0, "high": 202.0},
+                    "take_profit_range": {"low": 212.0, "high": 218.0},
+                    "invalidation_level": 196.0,
+                },
+                invalidation={"level": 196.0, "reason": "跌破支撑"},
+                ttl=second_created_at,
+                packet={},
+                created_at=second_created_at,
+            )
+            store.save_decision_outcome(
+                decision_id="decision-exit-pool-2",
+                entered=True,
+                entered_at=second_created_at,
+                entry_price=201.0,
+                exit_price=214.0,
+                realized_return=6.47,
+                holding_days=1,
+                close_reason="exit_pool",
+                exit_subreason="macro_protection",
+                hit_take_profit=True,
+                updated_at=second_created_at,
+            )
+
+            review = _build_historical_effect_review_data(store, days=30, limit=10)
+            report_text = format_recent_performance_review(review)
+
+            self.assertEqual(review["trade_path_summary"]["exit_pool_transition_count"], 2)
+            self.assertEqual(review["trade_path_summary"]["avg_days_to_exit_pool"], 2.0)
+            self.assertEqual(review["trade_path_summary"]["median_days_to_exit_pool"], 2.0)
+            self.assertEqual(review["trade_path_summary"]["fastest_sample"]["symbol"], "META")
+            self.assertEqual(review["trade_path_summary"]["slowest_sample"]["symbol"], "NVDA")
+            self.assertEqual(review["trade_path_summary"]["recent_samples"][0]["symbol"], "META")
+            self.assertEqual(review["trade_path_summary"]["recent_samples"][1]["symbol"], "NVDA")
+            self.assertEqual(review["trade_path_summary"]["best_samples"][0]["symbol"], "NVDA")
+            self.assertEqual(review["trade_path_summary"]["worst_samples"][0]["symbol"], "META")
+            self.assertIn("交易轨迹摘要：", report_text)
+            self.assertIn("确认机会后进入兑现池：2 条", report_text)
+            self.assertIn("平均历时：2.00 天", report_text)
+            self.assertIn("中位数历时：2.00 天", report_text)
+            self.assertIn("确认做多 -> 兑现池：样本 1 条，平均 3.00 天", report_text)
+            self.assertIn("试探建仓 -> 兑现池：样本 1 条，平均 1.00 天", report_text)
+            self.assertIn("最快样本：META（试探建仓），1.00 天", report_text)
+            self.assertIn("最慢样本：NVDA（确认做多），3.00 天", report_text)
+            self.assertIn("代表样本（最近3条）：", report_text)
+            self.assertIn("- 2026-03-16 22:00 | META | 试探建仓 -> 兑现池退出（含达标止盈 / 提前锁盈 / 宏观保护） | 历时 1.00 天 | 真实收益 6.47%", report_text)
+            self.assertIn("- 2026-03-14 22:00 | NVDA | 确认做多 -> 兑现池退出（含达标止盈 / 提前锁盈 / 宏观保护） | 历时 3.00 天 | 真实收益 10.89%", report_text)
+            self.assertIn("收益最好轨迹样本：", report_text)
+            self.assertIn("收益最差轨迹样本：", report_text)
+
+    def test_historical_effect_review_summarizes_pool_funnel(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+            first_created_at = datetime(2026, 3, 14, 14, 0, tzinfo=timezone.utc).isoformat()
+            second_created_at = datetime(2026, 3, 15, 14, 0, tzinfo=timezone.utc).isoformat()
+            third_created_at = datetime(2026, 3, 16, 14, 0, tzinfo=timezone.utc).isoformat()
+
+            for decision_id, symbol, created_at in (
+                ("decision-prewatch-1", "AAA", first_created_at),
+                ("decision-prewatch-2", "BBB", second_created_at),
+                ("decision-prewatch-3", "CCC", third_created_at),
+            ):
+                store.save_decision_record(
+                    decision_id=decision_id,
+                    run_id="run-review",
+                    event_id=f"evt-{decision_id}",
+                    symbol=symbol,
+                    event_type="prewatch",
+                    pool="prewatch",
+                    action="加入观察",
+                    priority="normal",
+                    confidence="中",
+                    event_score=0.0,
+                    market_score=72.0,
+                    theme_score=4.0,
+                    final_score=74.0,
+                    trigger_mode="structure",
+                    llm_used=False,
+                    theme_ids=["ai"],
+                    entry_plan={},
+                    invalidation={},
+                    ttl=created_at,
+                    packet={
+                        "prewatch_lifecycle": {
+                            "observation_count": 1,
+                            "alert_sent_count": 0,
+                        }
+                    },
+                    created_at=created_at,
+                )
+
+            store.connection.executemany(
+                """
+                INSERT INTO alert_history
+                (run_id, dedup_key, card_id, symbol, event_id, horizon, priority, final_score, invalidation_level, sent, reason, notified_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        "run-review",
+                        "prewatch-notify:AAA:position",
+                        "prewatch-notify:AAA:1",
+                        "AAA",
+                        "prewatch-notify:AAA:1",
+                        "position",
+                        "suppressed",
+                        79.0,
+                        0.0,
+                        1,
+                        "sent",
+                        first_created_at,
+                    ),
+                    (
+                        "run-review",
+                        "prewatch-notify:BBB:position",
+                        "prewatch-notify:BBB:1",
+                        "BBB",
+                        "prewatch-notify:BBB:1",
+                        "position",
+                        "suppressed",
+                        78.0,
+                        0.0,
+                        1,
+                        "sent",
+                        second_created_at,
+                    ),
+                ],
+            )
+
+            store.save_decision_record(
+                decision_id="decision-confirm-1",
+                run_id="run-review",
+                event_id="evt-confirm-1",
+                symbol="AAA",
+                event_type="guidance",
+                pool="confirmation",
+                action="确认做多",
+                priority="high",
+                confidence="高",
+                event_score=84.0,
+                market_score=79.0,
+                theme_score=8.0,
+                final_score=87.0,
+                trigger_mode="promoted",
+                llm_used=False,
+                theme_ids=["ai"],
+                entry_plan={},
+                invalidation={},
+                ttl=third_created_at,
+                packet={
+                    "promoted_from_prewatch": True,
+                    "prewatch_alert_sent_count": 1,
+                    "prewatch_score": 79.0,
+                    "prewatch_setup_type": "breakout_watch",
+                },
+                created_at=third_created_at,
+            )
+            store.save_decision_outcome(
+                decision_id="decision-confirm-1",
+                entered=True,
+                entered_at=third_created_at,
+                entry_price=101.0,
+                exit_price=111.0,
+                realized_return=9.9,
+                holding_days=2,
+                close_reason="exit_pool",
+                updated_at=third_created_at,
+            )
+
+            store.save_decision_record(
+                decision_id="decision-confirm-2",
+                run_id="run-review",
+                event_id="evt-confirm-2",
+                symbol="CCC",
+                event_type="earnings",
+                pool="confirmation",
+                action="试探建仓",
+                priority="normal",
+                confidence="中",
+                event_score=78.0,
+                market_score=69.0,
+                theme_score=7.0,
+                final_score=75.0,
+                trigger_mode="promoted",
+                llm_used=False,
+                theme_ids=["ai"],
+                entry_plan={},
+                invalidation={},
+                ttl=third_created_at,
+                packet={
+                    "promoted_from_prewatch": True,
+                    "prewatch_alert_sent_count": 0,
+                    "prewatch_score": 74.0,
+                    "prewatch_setup_type": "pullback_watch",
+                },
+                created_at=third_created_at,
+            )
+            store.save_decision_outcome(
+                decision_id="decision-confirm-2",
+                entered=True,
+                entered_at=third_created_at,
+                entry_price=201.0,
+                close_reason="insufficient_lookahead",
+                updated_at=third_created_at,
+            )
+            store.connection.commit()
+
+            review = _build_historical_effect_review_data(store, days=30, limit=10)
+            report_text = format_recent_performance_review(review)
+
+            self.assertEqual(review["pool_funnel_summary"]["prewatch_candidate_count"], 3)
+            self.assertEqual(review["pool_funnel_summary"]["prewatch_light_push_count"], 2)
+            self.assertEqual(review["pool_funnel_summary"]["promoted_confirmation_count"], 2)
+            self.assertEqual(review["pool_funnel_summary"]["promoted_after_light_push_count"], 1)
+            self.assertEqual(review["pool_funnel_summary"]["promoted_without_light_push_count"], 1)
+            self.assertEqual(review["pool_funnel_summary"]["exit_from_promoted_count"], 1)
+            self.assertAlmostEqual(review["pool_funnel_summary"]["observation_to_light_push_rate"], 66.67, places=2)
+            self.assertAlmostEqual(review["pool_funnel_summary"]["observation_to_confirmation_rate"], 66.67, places=2)
+            self.assertAlmostEqual(review["pool_funnel_summary"]["light_push_to_confirmation_rate"], 50.0, places=2)
+            self.assertAlmostEqual(review["pool_funnel_summary"]["confirmation_to_exit_rate"], 50.0, places=2)
+            self.assertEqual(review["simulation_funnel_summary"]["simulated_entry_count"], 2)
+            self.assertEqual(review["simulation_funnel_summary"]["simulated_pending_entry_count"], 0)
+            self.assertEqual(review["simulation_funnel_summary"]["exit_pool_transition_count"], 1)
+            self.assertEqual(review["simulation_funnel_summary"]["simulated_completed_exit_count"], 1)
+            self.assertEqual(review["simulation_funnel_summary"]["simulated_open_count"], 1)
+            self.assertAlmostEqual(review["simulation_funnel_summary"]["confirmation_to_entry_rate"], 100.0, places=2)
+            self.assertAlmostEqual(review["simulation_funnel_summary"]["entry_to_exit_pool_rate"], 50.0, places=2)
+            self.assertAlmostEqual(review["simulation_funnel_summary"]["entry_to_completed_exit_rate"], 50.0, places=2)
+            self.assertAlmostEqual(review["simulation_funnel_summary"]["avg_confirmation_to_entry_days"], 0.0, places=2)
+            self.assertAlmostEqual(review["simulation_funnel_summary"]["median_confirmation_to_entry_days"], 0.0, places=2)
+            self.assertAlmostEqual(review["simulation_funnel_summary"]["avg_entry_to_completed_exit_days"], 2.0, places=2)
+            self.assertAlmostEqual(review["simulation_funnel_summary"]["median_entry_to_completed_exit_days"], 2.0, places=2)
+            self.assertEqual(
+                review["simulation_funnel_summary"]["entry_timing_by_action"],
+                [
+                    {
+                        "action": "试探建仓",
+                        "action_display": "试探建仓",
+                        "sample_count": 1,
+                        "avg_days_to_entry": 0.0,
+                        "median_days_to_entry": 0.0,
+                    },
+                    {
+                        "action": "确认做多",
+                        "action_display": "确认做多",
+                        "sample_count": 1,
+                        "avg_days_to_entry": 0.0,
+                        "median_days_to_entry": 0.0,
+                    },
+                ],
+            )
+            self.assertEqual(
+                review["simulation_funnel_summary"]["completed_exit_timing_by_action"],
+                [
+                    {
+                        "action": "确认做多",
+                        "action_display": "确认做多",
+                        "sample_count": 1,
+                        "avg_holding_days": 2.0,
+                        "median_holding_days": 2.0,
+                    }
+                ],
+            )
+            self.assertEqual(review["recent_observation_samples"][0]["symbol"], "CCC")
+            self.assertEqual(review["recent_observation_samples"][0]["observation_status"], "仅后台观察")
+            self.assertEqual(review["recent_observation_samples"][0]["confirmation_status"], "已形成确认机会")
+            self.assertIn("三池漏斗：", report_text)
+            self.assertIn("预备池候选：3 条", report_text)
+            self.assertIn("观察提醒：2 条（观察 -> 观察提醒转化率：66.67%）", report_text)
+            self.assertIn("确认机会：2 条（观察 -> 确认机会转化率：66.67%）", report_text)
+            self.assertIn("观察提醒后确认机会：1 条（观察提醒 -> 确认机会转化率：50.00%）", report_text)
+            self.assertIn("另有 1 条未经过观察提醒，直接从观察进入确认机会。", report_text)
+            self.assertIn("进入兑现池：1 条（确认机会 -> 兑现转化率：50.00%）", report_text)
+            self.assertIn("最近新增观察样本：", report_text)
+            self.assertIn("- 2026-03-16 22:00 | CCC | 仅后台观察 | 已形成确认机会", report_text)
+            self.assertIn("预备池 74.00 分 / 结构预热", report_text)
+            self.assertIn("完整模拟闭环：", report_text)
+            self.assertIn("观察：3 条", report_text)
+            self.assertIn("模拟进场：2 条（确认机会 -> 模拟进场转化率：100.00%）", report_text)
+            self.assertIn("进入兑现池：1 条（模拟进场 -> 进入兑现池转化率：50.00%）", report_text)
+            self.assertIn("模拟退出完成：1 条（模拟进场 -> 模拟退出完成率：50.00%）", report_text)
+            self.assertIn("确认机会 -> 模拟进场：平均等待 0.00 天，中位数 0.00 天", report_text)
+            self.assertIn("模拟进场 -> 模拟退出完成：平均持有 2.00 天，中位数 2.00 天", report_text)
+            self.assertIn("按动作看成交等待：确认做多：样本 1 条，平均等待 0.00 天，中位数 0.00 天", report_text)
+            self.assertIn("按动作看成交等待：试探建仓：样本 1 条，平均等待 0.00 天，中位数 0.00 天", report_text)
+            self.assertIn("按动作看持有时长：确认做多：样本 1 条，平均持有 2.00 天，中位数 2.00 天", report_text)
+            self.assertIn("另有 1 条已模拟进场，但当前仍在持有观察中。", report_text)
+            self.assertIn("其中：兑现池 1 条", report_text)
+
+    def test_historical_effect_review_summarizes_candidate_evaluation_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+            created_at = datetime(2026, 3, 20, 14, 0, tzinfo=timezone.utc).isoformat()
+
+            store.record_candidate_evaluation(
+                run_id="run-review",
+                stage="prewatch",
+                symbol="AAA",
+                horizon="position",
+                outcome="selected",
+                reason="ranked_in_run",
+                score=79.0,
+                strategy_version="trade-loop-v1",
+                payload={},
+                created_at=created_at,
+            )
+            store.record_candidate_evaluation(
+                run_id="run-review",
+                stage="prewatch",
+                symbol="BBB",
+                horizon="position",
+                outcome="rejected",
+                reason="below_min_score",
+                score=58.0,
+                strategy_version="trade-loop-v1",
+                payload={},
+                created_at=created_at,
+            )
+            store.record_candidate_evaluation(
+                run_id="run-review",
+                stage="prewatch",
+                symbol="CCC",
+                horizon="position",
+                outcome="not_selected",
+                reason="ranked_below_run_cap",
+                score=75.0,
+                strategy_version="trade-loop-v1",
+                payload={},
+                created_at=created_at,
+            )
+            store.record_candidate_evaluation(
+                run_id="run-review",
+                stage="confirmation",
+                symbol="AAA",
+                horizon="position",
+                event_id="evt-1",
+                outcome="selected",
+                reason="confirmation_opportunity",
+                score=86.0,
+                strategy_version="trade-loop-v1",
+                payload={},
+                created_at=created_at,
+            )
+            store.record_candidate_evaluation(
+                run_id="run-review",
+                stage="confirmation",
+                symbol="BBB",
+                horizon="position",
+                event_id="evt-2",
+                outcome="rejected",
+                reason="threshold_not_met",
+                score=68.0,
+                strategy_version="trade-loop-v1",
+                payload={},
+                created_at=created_at,
+            )
+            store.record_candidate_evaluation(
+                run_id="run-review",
+                stage="confirmation",
+                symbol="CCC",
+                horizon="position",
+                event_id="evt-3",
+                outcome="error",
+                reason="scoring_failed:ValueError",
+                score=None,
+                strategy_version="trade-loop-v1",
+                payload={},
+                created_at=created_at,
+            )
+
+            review = _build_historical_effect_review_data(store, days=30, limit=10)
+            report_text = format_recent_performance_review(review)
+
+            prewatch_summary = review["candidate_evaluation_summary"]["prewatch"]
+            confirmation_summary = review["candidate_evaluation_summary"]["confirmation"]
+            self.assertEqual(prewatch_summary["total_count"], 3)
+            self.assertEqual(prewatch_summary["selected_count"], 1)
+            self.assertEqual(prewatch_summary["not_selected_count"], 1)
+            self.assertEqual(prewatch_summary["rejected_count"], 1)
+            self.assertEqual(prewatch_summary["top_blocked_reasons"][0]["label"], "低于观察阈值")
+            self.assertEqual(confirmation_summary["total_count"], 3)
+            self.assertEqual(confirmation_summary["selected_count"], 1)
+            self.assertEqual(confirmation_summary["rejected_count"], 1)
+            self.assertEqual(confirmation_summary["error_count"], 1)
+            self.assertEqual(confirmation_summary["top_error_reasons"][0]["label"], "评分失败（ValueError）")
+            self.assertIn("候选诊断：", report_text)
+            self.assertIn("预备池：共 3 条，进入观察 1 条，未入选 1 条，拒绝 1 条，异常 0 条。", report_text)
+            self.assertIn("主要未通过原因：低于观察阈值 1 条 / 排在本轮候选上限之外 1 条", report_text)
+            self.assertIn("确认机会：共 3 条，形成确认机会 1 条，未入选 0 条，拒绝 1 条，异常 1 条。", report_text)
+            self.assertIn("主要未通过原因：未达到确认阈值 1 条", report_text)
+            self.assertIn("主要异常：评分失败（ValueError） 1 条", report_text)
+
+    def test_historical_effect_review_summarizes_candidate_evaluation_trends(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+            older_created_at = datetime(2026, 3, 6, 14, 0, tzinfo=timezone.utc).isoformat()
+            recent_created_at = datetime(2026, 3, 22, 14, 0, tzinfo=timezone.utc).isoformat()
+
+            store.record_candidate_evaluation(
+                run_id="run-old",
+                stage="prewatch",
+                symbol="OLD1",
+                horizon="position",
+                outcome="rejected",
+                reason="below_min_score",
+                score=57.0,
+                strategy_version="trade-loop-v1",
+                payload={},
+                created_at=older_created_at,
+            )
+            store.record_candidate_evaluation(
+                run_id="run-old",
+                stage="prewatch",
+                symbol="OLD2",
+                horizon="position",
+                outcome="not_selected",
+                reason="ranked_below_run_cap",
+                score=75.0,
+                strategy_version="trade-loop-v1",
+                payload={},
+                created_at=older_created_at,
+            )
+            store.record_candidate_evaluation(
+                run_id="run-new",
+                stage="prewatch",
+                symbol="NEW1",
+                horizon="position",
+                outcome="rejected",
+                reason="below_min_score",
+                score=58.0,
+                strategy_version="trade-loop-v1",
+                payload={},
+                created_at=recent_created_at,
+            )
+            store.record_candidate_evaluation(
+                run_id="run-new",
+                stage="prewatch",
+                symbol="NEW2",
+                horizon="position",
+                outcome="rejected",
+                reason="below_min_score",
+                score=59.0,
+                strategy_version="trade-loop-v1",
+                payload={},
+                created_at=recent_created_at,
+            )
+            store.record_candidate_evaluation(
+                run_id="run-new",
+                stage="confirmation",
+                symbol="NEW3",
+                horizon="position",
+                event_id="evt-new3",
+                outcome="rejected",
+                reason="threshold_not_met",
+                score=69.0,
+                strategy_version="trade-loop-v1",
+                payload={},
+                created_at=recent_created_at,
+            )
+            store.record_candidate_evaluation(
+                run_id="run-old",
+                stage="confirmation",
+                symbol="OLD3",
+                horizon="position",
+                event_id="evt-old3",
+                outcome="error",
+                reason="scoring_failed:ValueError",
+                score=None,
+                strategy_version="trade-loop-v1",
+                payload={},
+                created_at=older_created_at,
+            )
+
+            review = _build_historical_effect_review_data(store, days=30, limit=10)
+            report_text = format_recent_performance_review(review)
+
+            trend = review["candidate_evaluation_trend_summary"]
+            self.assertEqual(
+                review["recommendations"][0],
+                "近 7 天预备池更多卡在低于观察阈值，优先回看观察门槛是否偏高。",
+            )
+            self.assertEqual(
+                review["recommendation_details"][0]["parameter_keys"],
+                ["prewatch_min_score"],
+            )
+            self.assertEqual(
+                review["recommendation_details"][0]["parameter_details"][0]["direction"],
+                "high",
+            )
+            self.assertEqual(trend["recent_window_days"], 7)
+            self.assertEqual(trend["baseline_window_days"], 30)
+            self.assertEqual(trend["prewatch"]["recent_total_count"], 2)
+            self.assertEqual(trend["prewatch"]["baseline_total_count"], 4)
+            self.assertEqual(trend["prewatch"]["reason_trends"][0]["label"], "低于观察阈值")
+            self.assertEqual(trend["prewatch"]["reason_trends"][0]["recent_count"], 2)
+            self.assertEqual(trend["prewatch"]["reason_trends"][0]["baseline_count"], 3)
+            self.assertEqual(trend["confirmation"]["reason_trends"][0]["label"], "未达到确认阈值")
+            self.assertIn("候选诊断趋势：", report_text)
+            self.assertIn("预备池：近 7 天 2 条，当前窗口 30 天 4 条。", report_text)
+            self.assertIn("低于观察阈值：近 7 天 2 条，30 天 3 条", report_text)
+            self.assertIn("确认机会：近 7 天 1 条，当前窗口 30 天 2 条。", report_text)
+            self.assertIn("未达到确认阈值：近 7 天 1 条，30 天 1 条", report_text)
+            self.assertIn("下一步建议：", report_text)
+            self.assertIn("参数检查清单：", report_text)
+            self.assertIn("1. 观察门槛（prewatch_min_score，更可能偏高）", report_text)
+            self.assertIn("优先先调：", report_text)
+            self.assertIn("近 7 天预备池更多卡在低于观察阈值，优先回看观察门槛是否偏高。", report_text)
+            self.assertIn("对应参数：观察门槛（prewatch_min_score，更可能偏高）", report_text)
+
+    def test_format_recent_performance_review_groups_inspection_recommendations(self) -> None:
+        review = {
+            "status_label": "历史效果复盘（草稿）",
+            "status": "草稿",
+            "review_version": "v1",
+            "review_window": {"start_date": "2026-03-01", "end_date": "2026-03-24"},
+            "backfill_cutoff_at": datetime(2026, 3, 24, 10, 0, tzinfo=timezone.utc).isoformat(),
+            "formal_readiness": {"status_label": "未满足", "blockers": []},
+            "draft_reasons": [],
+            "overview": {},
+            "execution_quality": {},
+            "pool_funnel_summary": {},
+            "simulation_funnel_summary": {},
+            "candidate_evaluation_summary": {},
+            "candidate_evaluation_trend_summary": {},
+            "trade_path_summary": {},
+            "breakdowns": {},
+            "auxiliary_observation": [],
+            "appendix": {},
+            "recommendations": ["近 7 天确认评分异常增多，优先排查确认阶段评分链路。"],
+            "recommendation_details": [
+                {
+                    "text": "近 7 天确认评分异常增多，优先排查确认阶段评分链路。",
+                    "priority": 10,
+                    "source": "candidate_trend",
+                    "parameter_keys": [],
+                    "parameter_labels": [],
+                    "parameter_directions": [],
+                    "parameter_direction_labels": [],
+                    "parameter_details": [],
+                }
+            ],
+            "best_completed_decisions": [],
+            "worst_completed_decisions": [],
+            "best_t7_decisions": [],
+            "worst_t7_decisions": [],
+            "decision_details": [],
+        }
+
+        report_text = format_recent_performance_review(review)
+
+        self.assertIn("下一步建议：", report_text)
+        self.assertIn("优先先排查：", report_text)
+        self.assertIn("确认评分异常增多，优先排查确认阶段评分链路。", report_text)
+
+    def test_format_recent_performance_review_labels_missing_exit_price_states(self) -> None:
+        review = {
+            "status_label": "历史效果复盘（草稿）",
+            "status": "草稿",
+            "review_version": "v1",
+            "review_window": {"start_date": "2026-03-01", "end_date": "2026-03-24"},
+            "backfill_cutoff_at": datetime(2026, 3, 24, 10, 0, tzinfo=timezone.utc).isoformat(),
+            "formal_readiness": {"status_label": "未满足", "blockers": []},
+            "draft_reasons": [],
+            "overview": {},
+            "execution_quality": {},
+            "pool_funnel_summary": {},
+            "simulation_funnel_summary": {},
+            "candidate_evaluation_summary": {},
+            "candidate_evaluation_trend_summary": {},
+            "trade_path_summary": {},
+            "breakdowns": {},
+            "auxiliary_observation": [],
+            "appendix": {},
+            "recommendations": [],
+            "recommendation_details": [],
+            "best_completed_decisions": [],
+            "worst_completed_decisions": [],
+            "best_t7_decisions": [],
+            "worst_t7_decisions": [],
+            "decision_details": [
+                {
+                    "created_at": datetime(2026, 3, 24, 10, 0, tzinfo=timezone.utc).isoformat(),
+                    "symbol": "AAA",
+                    "event_type": "earnings",
+                    "event_type_display": "财报",
+                    "action": "确认做多",
+                    "action_display": "确认做多",
+                    "status_label": "未进场",
+                    "entered": False,
+                    "close_reason": "not_entered",
+                    "entry_price": None,
+                    "exit_price": None,
+                    "realized_return": None,
+                    "holding_days": None,
+                },
+                {
+                    "created_at": datetime(2026, 3, 24, 11, 0, tzinfo=timezone.utc).isoformat(),
+                    "symbol": "BBB",
+                    "event_type": "news",
+                    "event_type_display": "新闻",
+                    "action": "试探建仓",
+                    "action_display": "试探建仓",
+                    "status_label": "仍在观察窗",
+                    "entered": True,
+                    "close_reason": "insufficient_lookahead",
+                    "entry_price": 100.0,
+                    "exit_price": None,
+                    "realized_return": None,
+                    "holding_days": None,
+                },
+            ],
+        }
+
+        report_text = format_recent_performance_review(review)
+
+        self.assertIn("| 2026-03-24 18:00 | AAA | 财报 | 未进场（确认做多） | 暂无 | 未进场 | 暂无 | 暂无 |", report_text)
+        self.assertIn("| 2026-03-24 19:00 | BBB | 新闻 | 仍在观察窗（试探建仓） | 100.00 | 仍在持有 | 暂无 | 暂无 |", report_text)
+
     def test_serialize_strategy_report_completed_cohort_summary_prefers_completed_windows(self) -> None:
         report = serialize_strategy_report(
             [],
@@ -995,6 +2056,13 @@ class ReportingTests(unittest.TestCase):
                             "promoted_from_prewatch": True,
                             "prewatch_score": 81.5,
                             "prewatch_setup_type": "breakout_watch",
+                            "prewatch_observation_count": 3,
+                            "prewatch_alert_sent_count": 1,
+                            "prewatch_first_seen_at": "2026-03-12T14:00:00+00:00",
+                            "prewatch_last_seen_at": "2026-03-14T14:00:00+00:00",
+                            "prewatch_last_alert_sent_at": "2026-03-14T10:00:00+00:00",
+                            "prewatch_source_decision_id": "decision-prewatch-1",
+                            "prewatch_promotion_reason": "预备池阶段累计观察 3 次（首次 2026-03-12 22:00，最近一次 2026-03-14 22:00），期间已观察提醒 1 次（最近一次 2026-03-14 18:00），本轮事件达到确认条件。",
                             "event_score": 78.35,
                             "market_score": 58.9,
                             "final_score": 88.5,
@@ -1044,7 +2112,20 @@ class ReportingTests(unittest.TestCase):
                 entry_plan={"entry_range": {"low": 100.0, "high": 102.0}},
                 invalidation={"level": 98.0, "reason": "跌破关键支撑"},
                 ttl=finished.isoformat(),
-                packet={"symbol": "NVDA", "pool": "confirmation"},
+                packet={
+                    "symbol": "NVDA",
+                    "pool": "confirmation",
+                    "promoted_from_prewatch": True,
+                    "prewatch_score": 81.5,
+                    "prewatch_setup_type": "breakout_watch",
+                    "prewatch_observation_count": 3,
+                    "prewatch_alert_sent_count": 1,
+                    "prewatch_first_seen_at": "2026-03-12T14:00:00+00:00",
+                    "prewatch_last_seen_at": "2026-03-14T14:00:00+00:00",
+                    "prewatch_last_alert_sent_at": "2026-03-14T10:00:00+00:00",
+                    "source_decision_id": "decision-prewatch-1",
+                    "prewatch_promotion_reason": "预备池阶段累计观察 3 次（首次 2026-03-12 22:00，最近一次 2026-03-14 22:00），期间已观察提醒 1 次（最近一次 2026-03-14 18:00），本轮事件达到确认条件。",
+                },
                 created_at=finished.isoformat(),
             )
             store.save_decision_outcome(
@@ -1173,7 +2254,7 @@ class ReportingTests(unittest.TestCase):
             self.assertIn("Strongest event outcome so far: earnings avg_t3=4.2 with 1 outcomes.", strategy_text)
             self.assertIn("Best pool so far: confirmation avg_t3=4.2 with 1 outcomes.", strategy_text)
             self.assertIn("Outcome support is still thin, so any event or pool preference should be treated as provisional.", strategy_text)
-            self.assertIn("当前更适合观察和轻推，而不是把后验结果直接翻译成强执行动作。", strategy_text)
+            self.assertIn("当前更适合观察和观察提醒，而不是把后验结果直接翻译成强执行动作。", strategy_text)
             self.assertIn("Lean more on earnings while it keeps the best average T+3 return (4.2).", strategy_text)
             self.assertIn("Keep confirmation as the cleaner downstream pool; its average T+3 return is 4.2.", strategy_text)
             self.assertIn("Completed windows are still too few to justify a strong directional tilt.", strategy_text)
@@ -1220,17 +2301,20 @@ class ReportingTests(unittest.TestCase):
             self.assertIn("Started: 2026-03-14 22:00", replay_text)
             self.assertIn("预备池：", review_text)
             self.assertIn("NBIS / 波段 / 突破预热", review_text)
-            self.assertIn("预备池轻推：", review_text)
+            self.assertIn("观察提醒：", review_text)
             self.assertIn("决策记录：", review_text)
             self.assertIn("确认做多", review_text)
             self.assertIn("历史后验背景：事件 earnings 近期待回写 0 条，T+3 均值 4.2，已回写 1 条；池子 确认池 T+3 均值 4.2，止盈 1 条。", review_text)
             self.assertNotIn("后验结果概览：", review_text)
             self.assertNotIn("后验建议：", review_text)
             self.assertNotIn("策略倾向：", review_text)
-            self.assertIn("升池确认：", review_text)
+            self.assertIn("确认机会：", review_text)
             self.assertIn("NVDA / 交易周期：短线（1-7个交易日） / 财报事件 / 高优先级", review_text)
-            self.assertIn("升池原因：此前处于突破预热预备状态（81.50 分），本轮事件达到确认条件。", review_text)
-            self.assertIn("池位：预备池升级确认池（突破预热 / 预备池 81.50 分）", review_text)
+            self.assertIn("形成原因：此前处于突破预热预备状态（81.50 分），本轮事件达到确认条件。", review_text)
+            self.assertIn("确认机会链路：预备池阶段累计观察 3 次", review_text)
+            self.assertIn("观察轨迹：累计观察 3 次，观察提醒 1 次（首次 2026-03-12 22:00 / 最近 2026-03-14 22:00）", review_text)
+            self.assertIn("预备池来源决策：decision-prewatch-1", review_text)
+            self.assertIn("阶段：预备池 -> 确认机会（突破预热 / 预备池 81.50 分）", review_text)
             self.assertIn("仓位提示：可从观察仓提升到主交易仓位，优先等待盘中回踩确认。", review_text)
             self.assertIn("事件解读：财报事件：AI 需求改善带动 NVDA 进入确认阶段。", review_text)
             self.assertIn("题材解读：题材：AI芯片与半导体设备", review_text)
@@ -1239,12 +2323,16 @@ class ReportingTests(unittest.TestCase):
             self.assertIn("确认池：NVDA", review_text)
             self.assertIn("预备池：NBIS", review_text)
             self.assertIn("题材：AI芯片与半导体设备", review_text)
-            self.assertIn("本轮状态 成功，健康判断为 阻塞；共处理 2 个事件，生成 4 张卡片，发送 1 条提醒，识别 1 个预备池候选，并发出 1 条预备池轻推。", review_text)
+            self.assertIn("本轮状态 成功，健康判断为 阻塞；共处理 2 个事件，生成 4 张卡片，发送 1 条提醒，识别 1 个预备池候选，并发出 1 条观察提醒。", review_text)
             self.assertEqual(replay_json["run"]["run_id"], "run-1")
             self.assertEqual(replay_json["run"]["run_name"], "baseline")
             self.assertEqual(replay_json["prewatch_candidates"][0]["symbol"], "NBIS")
             self.assertEqual(replay_json["card_diagnostics"][0]["horizon"], "swing")
+            self.assertEqual(replay_json["alert_suppression_summary"]["total_cards"], 1)
+            self.assertIn("parameter_checklist", replay_json["alert_suppression_summary"])
             self.assertEqual(replay_json["decision_diagnostics"][0]["symbol"], "NVDA")
+            self.assertEqual(replay_json["decision_diagnostics"][0]["prewatch_observation_count"], 3)
+            self.assertEqual(replay_json["decision_diagnostics"][0]["source_decision_id"], "decision-prewatch-1")
             self.assertEqual(replay_json["decision_diagnostics"][0]["event_type_outcome_context"]["avg_t_plus_3_return"], 4.2)
             self.assertEqual(replay_json["decision_diagnostics"][0]["pool_outcome_context"]["take_profit_hits"], 1)
             self.assertIn("Run Comparison", comparison_text)
@@ -1317,8 +2405,10 @@ class ReportingTests(unittest.TestCase):
                 "write-performance-review",
                 "--workspace-dir",
                 str(workspace_dir),
-                "--days",
-                "14",
+                "--start-date",
+                "2026-03-01",
+                "--end-date",
+                "2026-03-14",
                 "--limit",
                 "5",
             ]
@@ -1328,11 +2418,13 @@ class ReportingTests(unittest.TestCase):
                         main()
 
             output = stdout.getvalue()
-            report_path = workspace_dir / "historical_effect" / "review.md"
-            payload_path = workspace_dir / "historical_effect" / "review_payload.json"
-            sample_audit_path = workspace_dir / "historical_effect" / "sample_audit.md"
-            sample_audit_payload_path = workspace_dir / "historical_effect" / "sample_audit_payload.json"
+            report_dir = workspace_dir / "historical_effect" / "windows" / "2026-03-01_to_2026-03-14"
+            report_path = report_dir / "review.md"
+            payload_path = report_dir / "review_payload.json"
+            sample_audit_path = report_dir / "sample_audit.md"
+            sample_audit_payload_path = report_dir / "sample_audit_payload.json"
             self.assertIn("历史效果复盘：", output)
+            self.assertIn("输出类型：自定义窗口", output)
             self.assertIn(str(report_path), output)
             self.assertIn(str(sample_audit_path), output)
             self.assertTrue(report_path.exists())
@@ -1354,7 +2446,110 @@ class ReportingTests(unittest.TestCase):
             payload = json.loads(payload_path.read_text(encoding="utf-8"))
             self.assertEqual(payload["run_id"], "run-performance")
             self.assertEqual(payload["window_days"], 14)
+            self.assertEqual(payload["review_scope"], "window")
             self.assertIn("sample_audit", payload)
+
+    def test_write_performance_review_command_supports_monthly_live_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            db_path = temp_path / "agent.db"
+            workspace_dir = temp_path / "reports"
+            store = Store(db_path)
+            store.initialize()
+            started = datetime(2026, 3, 14, 14, 0, tzinfo=timezone.utc)
+            finished = datetime(2026, 3, 14, 14, 1, tzinfo=timezone.utc)
+            store.record_run(
+                run_id="run-monthly",
+                started_at=started,
+                finished_at=finished,
+                status="success",
+                summary={"events_processed": 0, "cards_generated": 0, "alerts_sent": 0},
+            )
+            store.close()
+
+            stdout = io.StringIO()
+            argv = [
+                "satellite-agent",
+                "write-performance-review",
+                "--workspace-dir",
+                str(workspace_dir),
+                "--month",
+                "2026-03",
+                "--limit",
+                "5",
+            ]
+            with patch.dict(os.environ, {"SATELLITE_DB_PATH": str(db_path)}, clear=False):
+                with patch.object(sys, "argv", argv):
+                    with patch("sys.stdout", stdout):
+                        main()
+
+            output = stdout.getvalue()
+            report_dir = workspace_dir / "historical_effect" / "monthly" / "2026-03"
+            report_path = report_dir / "review.md"
+            payload_path = report_dir / "review_payload.json"
+            self.assertIn("输出类型：活的月报 2026-03", output)
+            self.assertIn(str(report_path), output)
+            self.assertTrue(report_path.exists())
+            self.assertTrue(payload_path.exists())
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["review_scope"], "monthly")
+            self.assertEqual(payload["review_slug"], "2026-03")
+
+    def test_build_performance_review_payload_writes_recent_live_monthlies_for_default_window(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            db_path = temp_path / "agent.db"
+            workspace_dir = temp_path / "reports"
+            store = Store(db_path)
+            store.initialize()
+            started = datetime(2026, 3, 24, 10, 0, tzinfo=timezone.utc)
+            finished = datetime(2026, 3, 24, 10, 1, tzinfo=timezone.utc)
+            store.record_run(
+                run_id="run-rolling",
+                started_at=started,
+                finished_at=finished,
+                status="success",
+                summary={"events_processed": 0, "cards_generated": 0, "alerts_sent": 0},
+            )
+
+            with patch("satellite_agent.main.utcnow", return_value=datetime(2026, 3, 24, 12, 0, tzinfo=timezone.utc)):
+                payload = build_performance_review_payload(
+                    store,
+                    workspace_dir=workspace_dir,
+                    run_id="run-rolling",
+                    days=30,
+                    limit=5,
+                )
+
+            self.assertEqual(payload["review_scope"], "rolling")
+            self.assertEqual(payload["performance_review_path"], str((workspace_dir / "historical_effect" / "review.md").resolve()))
+            monthly_outputs = payload.get("monthly_review_outputs") or []
+            self.assertEqual([item.get("month") for item in monthly_outputs], ["2026-03", "2026-02", "2026-01"])
+            for month_token in ("2026-03", "2026-02", "2026-01"):
+                self.assertTrue((workspace_dir / "historical_effect" / "monthly" / month_token / "review.md").exists())
+                self.assertTrue((workspace_dir / "historical_effect" / "monthly" / month_token / "review_payload.json").exists())
+            store.close()
+
+    def test_format_live_run_artifacts_lists_synced_monthly_reviews(self) -> None:
+        text = format_live_run_artifacts(
+            {
+                "run_id": "live-run-1",
+                "outcome_backfill": {"days": 45, "scanned": 2, "updated": 1, "skipped": 1, "fetched_symbols": 1},
+                "review_path": "/tmp/serve_review.md",
+                "historical_effect_review_path": "/tmp/historical_effect/review.md",
+                "historical_effect_review_refreshed": True,
+                "historical_effect_monthly_outputs": [
+                    {"month": "2026-03", "performance_review_path": "/tmp/historical_effect/monthly/2026-03/review.md"},
+                    {"month": "2026-02", "performance_review_path": "/tmp/historical_effect/monthly/2026-02/review.md"},
+                ],
+                "llm_usage_report_path": "/tmp/llm_usage/report.md",
+                "llm_usage_report_refreshed": True,
+                "payload_path": "/tmp/serve_payload.json",
+            }
+        )
+        self.assertIn("同步月报：2 份", text)
+        self.assertIn("2026-03: /tmp/historical_effect/monthly/2026-03/review.md", text)
+        self.assertIn("2026-02: /tmp/historical_effect/monthly/2026-02/review.md", text)
 
     def test_write_llm_usage_report_cli_writes_report_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2437,12 +3632,35 @@ class ReportingTests(unittest.TestCase):
             self.assertEqual(payload["batch"]["recommendation_name"], "baseline")
             self.assertTrue(Path(payload["replay"]["report_path"]).exists())
             self.assertTrue(Path(payload["replay"]["payload_path"]).exists())
+            self.assertTrue(Path(payload["preview"]["report_path"]).exists())
+            self.assertTrue(Path(payload["preview"]["payload_path"]).exists())
+            self.assertEqual(payload["preview"]["mode_count"], 5)
             self.assertTrue(Path(payload["batch"]["manifest_path"]).exists())
             self.assertTrue(Path(payload["batch"]["report_path"]).exists())
             self.assertTrue(Path(payload["batch"]["index_path"]).exists())
             self.assertTrue(Path(payload["batch"]["promoted_config_path"]).exists())
             copied_spec = json.loads(Path(payload["batch"]["spec_path"]).read_text(encoding="utf-8"))
             self.assertEqual(copied_spec["replay_path"], str(replay_path.resolve()))
+            preview_payload = json.loads(Path(payload["preview"]["payload_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(len(preview_payload["items"]), 5)
+            self.assertEqual(preview_payload["items"][1]["mode_name"], "formal_downgraded")
+            self.assertEqual(preview_payload["items"][1]["mode_label"], "自动降级观察卡")
+            self.assertEqual(preview_payload["items"][-1]["mode_name"], "exit_pool")
+            self.assertEqual(preview_payload["items"][0]["mode_label"], "正式操作卡")
+            self.assertIn("render_view", preview_payload["items"][0])
+            self.assertIn("card_type", preview_payload["items"][0]["render_view"])
+            self.assertIn("适合结合价格计划做执行判断", preview_payload["items"][0]["use_case"])
+            self.assertEqual(preview_payload["items"][-1]["mode_label"], "兑现池管理卡")
+            self.assertIn("不适合当成新的开仓信号", preview_payload["items"][-1]["not_for"])
+            preview_report = Path(payload["preview"]["report_path"]).read_text(encoding="utf-8")
+            self.assertIn("最终卡型：", preview_report)
+            self.assertIn("最终动作：", preview_report)
+            self.assertIn("自动降级：", preview_report)
+            self.assertIn("自动降级观察卡", preview_report)
+            self.assertIn("适用场景：", preview_report)
+            self.assertIn("不适用场景：", preview_report)
+            self.assertIn("使用提示：", preview_report)
+            self.assertIn("优先结合原目标区和当前强弱", preview_report)
             promoted = json.loads(Path(payload["batch"]["promoted_config_path"]).read_text(encoding="utf-8"))
             self.assertEqual(promoted["strategy"]["event_score_threshold"], 60.0)
 
@@ -2463,6 +3681,8 @@ class ReportingTests(unittest.TestCase):
                         main()
             output = stdout.getvalue()
             self.assertIn("初版流程联调", output)
+            self.assertIn("卡片预览：", output)
+            self.assertIn("预览模式数：5", output)
             self.assertIn("Batch 推荐：baseline", output)
             self.assertIn("推荐配置：", output)
 
@@ -2927,8 +4147,17 @@ class ReportingTests(unittest.TestCase):
                     mocked_preview.return_value = {
                         "symbol": "NVDA",
                         "watch_mode": False,
+                        "degraded_formal_mode": False,
                         "llm_enabled": True,
                         "llm_used": True,
+                        "render_view": {
+                            "card_type": "formal",
+                            "action_label": "确认做多",
+                            "downgraded_to_watch": False,
+                            "downgrade_reason": "",
+                            "render_warning": "",
+                            "chain_summary": "昨晚试探建仓 -> 今日确认做多",
+                        },
                         "title": "NVIDIA（NVDA） | 确认做多 | 战略合作",
                         "body": "资讯摘要：测试摘要\\n影响推理：测试推理",
                         "delivery_view": {},
@@ -2938,6 +4167,9 @@ class ReportingTests(unittest.TestCase):
 
         output = stdout.getvalue()
         self.assertIn("本地预览卡片", output)
+        self.assertIn("最终卡型：formal", output)
+        self.assertIn("最终动作：确认做多", output)
+        self.assertIn("自动降级：否", output)
         self.assertIn("LLM 实际参与：是", output)
         self.assertIn("测试摘要", output)
 
@@ -2957,8 +4189,17 @@ class ReportingTests(unittest.TestCase):
                         "symbol": "NBIS",
                         "watch_mode": False,
                         "prewatch_light": True,
+                        "degraded_formal_mode": False,
                         "llm_enabled": True,
                         "llm_used": True,
+                        "render_view": {
+                            "card_type": "watch",
+                            "action_label": "加入观察",
+                            "downgraded_to_watch": False,
+                            "downgrade_reason": "",
+                            "render_warning": "",
+                            "chain_summary": "昨晚加入观察 -> 今日继续跟踪",
+                        },
                         "title": "[预备池] Nebius（NBIS） | 加入观察 | 战略合作",
                         "body": "事实摘要：测试轻推摘要\n为什么现在先观察：测试轻推理由",
                         "delivery_view": {},
@@ -2967,8 +4208,91 @@ class ReportingTests(unittest.TestCase):
                     main()
 
         output = stdout.getvalue()
-        self.assertIn("模式：预备池轻推送", output)
+        self.assertIn("模式：观察提醒", output)
+        self.assertIn("最终卡型：watch", output)
         self.assertIn("测试轻推摘要", output)
+
+    def test_preview_alert_render_cli_supports_exit_pool_mode(self) -> None:
+        stdout = io.StringIO()
+        argv = [
+            "satellite-agent",
+            "preview-alert-render",
+            "--symbol",
+            "NVDA",
+            "--exit-pool",
+        ]
+        with patch.object(sys, "argv", argv):
+            with patch("sys.stdout", stdout):
+                with patch("satellite_agent.main.build_preview_alert_payload") as mocked_preview:
+                    mocked_preview.return_value = {
+                        "symbol": "NVDA",
+                        "watch_mode": False,
+                        "prewatch_light": False,
+                        "exit_pool_mode": True,
+                        "degraded_formal_mode": False,
+                        "llm_enabled": True,
+                        "llm_used": True,
+                        "render_view": {
+                            "card_type": "exit",
+                            "action_label": "进入兑现池",
+                            "downgraded_to_watch": False,
+                            "downgrade_reason": "",
+                            "render_warning": "",
+                            "chain_summary": "3天前确认做多 -> 今日进入兑现池",
+                        },
+                        "title": "NVIDIA（NVDA） | 进入兑现池 | 战略合作",
+                        "body": "为什么进入兑现池：测试退出理由\n来源链路：3天前确认做多 -> 今日进入兑现池",
+                        "delivery_view": {},
+                        "feishu_card": {},
+                    }
+                    main()
+
+        output = stdout.getvalue()
+        self.assertIn("模式：兑现池管理卡", output)
+        self.assertIn("最终卡型：exit", output)
+        self.assertIn("测试退出理由", output)
+        self.assertIn("来源链路", output)
+
+    def test_preview_alert_render_cli_supports_formal_downgraded_mode(self) -> None:
+        stdout = io.StringIO()
+        argv = [
+            "satellite-agent",
+            "preview-alert-render",
+            "--symbol",
+            "AMD",
+            "--formal-downgraded",
+        ]
+        with patch.object(sys, "argv", argv):
+            with patch("sys.stdout", stdout):
+                with patch("satellite_agent.main.build_preview_alert_payload") as mocked_preview:
+                    mocked_preview.return_value = {
+                        "symbol": "AMD",
+                        "watch_mode": False,
+                        "prewatch_light": False,
+                        "exit_pool_mode": False,
+                        "degraded_formal_mode": True,
+                        "llm_enabled": True,
+                        "llm_used": True,
+                        "render_view": {
+                            "card_type": "watch",
+                            "action_label": "加入观察",
+                            "downgraded_to_watch": True,
+                            "downgrade_reason": "降级观察：盈亏比不足",
+                            "render_warning": "formal_render_conflict_auto_downgraded",
+                            "chain_summary": "今日试探建仓 -> 今日确认做多",
+                        },
+                        "title": "AMD | 加入观察 | 财报事件",
+                        "body": "降级原因：降级观察：盈亏比不足\n为什么现在先观察：测试降级理由",
+                        "delivery_view": {},
+                        "feishu_card": {},
+                    }
+                    main()
+
+        output = stdout.getvalue()
+        self.assertIn("模式：自动降级观察卡", output)
+        self.assertIn("最终卡型：watch", output)
+        self.assertIn("自动降级：是", output)
+        self.assertIn("降级观察：盈亏比不足", output)
 
     def test_run_once_writes_latest_live_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

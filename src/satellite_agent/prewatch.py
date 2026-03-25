@@ -4,30 +4,64 @@ from .config import HorizonSettings
 from .models import IndicatorSnapshot, PrewatchCandidate
 
 
-def build_prewatch_candidate(
+def evaluate_prewatch_snapshot(
     snapshot: IndicatorSnapshot,
     horizon_settings: HorizonSettings,
     *,
     min_score: float,
-) -> PrewatchCandidate | None:
-    if snapshot.trend_state == "bearish":
-        return None
-
-    if snapshot.rsi_14 >= 75.0 and not snapshot.is_pullback and not (
-        snapshot.intraday_breakout and snapshot.relative_volume >= 1.8
-    ):
-        return None
-
+) -> dict[str, object]:
     trend_score = _trend_score(snapshot.trend_state, snapshot.last_price, snapshot.sma_20, snapshot.sma_60)
     volume_score = _volume_score(snapshot.relative_volume)
     structure_score = _structure_score(snapshot)
     momentum_score = _momentum_score(snapshot.rsi_14)
     volatility_score = _volatility_score(snapshot.atr_percent, horizon_settings.atr_percent_ceiling)
     total_score = round(trend_score + volume_score + structure_score + momentum_score + volatility_score, 2)
-    if total_score < min_score:
+    setup_type = _setup_type(snapshot)
+
+    rejection_reason = ""
+    if snapshot.trend_state == "bearish":
+        rejection_reason = "bearish_trend"
+    elif snapshot.rsi_14 >= 75.0 and not snapshot.is_pullback and not (
+        snapshot.intraday_breakout and snapshot.relative_volume >= 1.8
+    ):
+        rejection_reason = "overheated_without_breakout"
+    elif total_score < min_score:
+        rejection_reason = "below_min_score"
+
+    return {
+        "eligible": rejection_reason == "",
+        "rejection_reason": rejection_reason,
+        "setup_type": setup_type,
+        "total_score": total_score,
+        "trend_score": round(trend_score, 2),
+        "volume_score": round(volume_score, 2),
+        "structure_score": round(structure_score, 2),
+        "momentum_score": round(momentum_score, 2),
+        "volatility_score": round(volatility_score, 2),
+    }
+
+
+def build_prewatch_candidate(
+    snapshot: IndicatorSnapshot,
+    horizon_settings: HorizonSettings,
+    *,
+    min_score: float,
+) -> PrewatchCandidate | None:
+    evaluation = evaluate_prewatch_snapshot(
+        snapshot,
+        horizon_settings,
+        min_score=min_score,
+    )
+    if not bool(evaluation.get("eligible")):
         return None
 
-    setup_type = _setup_type(snapshot)
+    trend_score = float(evaluation.get("trend_score") or 0.0)
+    volume_score = float(evaluation.get("volume_score") or 0.0)
+    structure_score = float(evaluation.get("structure_score") or 0.0)
+    momentum_score = float(evaluation.get("momentum_score") or 0.0)
+    volatility_score = float(evaluation.get("volatility_score") or 0.0)
+    total_score = float(evaluation.get("total_score") or 0.0)
+    setup_type = str(evaluation.get("setup_type") or _setup_type(snapshot))
     return PrewatchCandidate(
         symbol=snapshot.symbol,
         horizon=snapshot.horizon,

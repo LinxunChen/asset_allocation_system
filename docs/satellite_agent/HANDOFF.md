@@ -70,6 +70,8 @@ PYTHONPATH=src .venv/bin/python -m satellite_agent.main preview-alert-render --s
   - [config/satellite_agent/agent.json](/Users/linxun/CodeSpace/asset_allocation_system/config/satellite_agent/agent.json)
 - API key 放在：
   - `config/satellite_agent/.env.local`
+  - 变量名固定为 `SATELLITE_OPENAI_API_KEY`
+  - 不写进 `config/satellite_agent/agent.json`
   - 已被 `.gitignore` 忽略
 
 当前默认口径：
@@ -129,6 +131,12 @@ PYTHONPATH=src .venv/bin/python -m satellite_agent.main write-llm-usage-report -
 
 - `serve` 下历史效果复盘按小时节流刷新
 - `run-once / daily-run` 会自动更新相关产物
+- 默认滚动主报告路径：
+  - `data/satellite_agent/serve/historical_effect/review.md`
+- 自定义窗口复盘会写到：
+  - `data/satellite_agent/serve/historical_effect/windows/<start>_to_<end>/review.md`
+- 活的月报会写到：
+  - `data/satellite_agent/serve/historical_effect/monthly/YYYY-MM/review.md`
 
 ### 6. 兑现池与止盈区重构 v1 已完成
 

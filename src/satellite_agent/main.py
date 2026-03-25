@@ -5,6 +5,7 @@ import csv
 import json
 import os
 import time
+from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 import re
@@ -26,7 +27,7 @@ from .market_data import (
     StooqDailyMarketDataProvider,
     YahooFinanceMarketDataProvider,
 )
-from .notifier import FeishuTransport, Notifier
+from .notifier import FeishuTransport, Notifier, build_render_view
 from .outcomes import backfill_decision_outcomes, backfill_recent_decision_outcomes, explain_decision_outcome
 from .reporting import (
     _config_summary,
@@ -93,6 +94,7 @@ EXECUTABLE_DECISION_ACTIONS = ("试探建仓", "确认做多")
 OBSERVATION_DECISION_ACTION = "加入观察"
 US_MARKET_TZ = ZoneInfo("America/New_York")
 SERVE_HISTORICAL_EFFECT_REFRESH_SECONDS = 3600
+ACTIVE_MONTHLY_REVIEW_MONTHS = 3
 LLM_USAGE_REPORT_WINDOW_DAYS = 7
 SERVE_LLM_USAGE_REFRESH_SECONDS = 3600
 RUN_ONCE_WORKSPACE_DIR = "./data/satellite_agent/run_once"
@@ -173,6 +175,351 @@ def _historical_effect_priority_label(priority: str) -> str:
         "suppressed": "压制",
         "unknown": "未分类",
     }.get(priority, priority or "未分类")
+
+
+def _candidate_evaluation_stage_label(stage: str) -> str:
+    return {
+        "prewatch": "预备池",
+        "confirmation": "确认机会",
+    }.get(stage, stage or "未分类")
+
+
+def _candidate_evaluation_reason_label(reason: str) -> str:
+    normalized = str(reason or "").strip()
+    mapping = {
+        "below_min_score": "低于观察阈值",
+        "bearish_trend": "趋势偏弱",
+        "overheated_without_breakout": "过热但未突破",
+        "ranked_below_run_cap": "排在本轮候选上限之外",
+        "threshold_not_met": "未达到确认阈值",
+        "execution_ineligible": "不满足执行条件",
+        "event_only_below_threshold": "事件降级分数不足",
+        "confirmation_opportunity": "形成确认机会",
+        "passed_scan_threshold": "通过预备池初筛",
+        "ranked_in_run": "进入本轮观察",
+    }
+    if normalized in mapping:
+        return mapping[normalized]
+    if normalized.startswith("build_failed:"):
+        return f"构建失败（{normalized.split(':', 1)[1] or 'Unknown'}）"
+    if normalized.startswith("scoring_failed:"):
+        return f"评分失败（{normalized.split(':', 1)[1] or 'Unknown'}）"
+    return normalized or "未说明"
+
+
+def _summarize_candidate_evaluation_rows(
+    rows: list[dict[str, Any]],
+    *,
+    stage: str,
+    limit: int = 3,
+) -> dict[str, Any]:
+    outcome_counts = Counter(str(row.get("outcome") or "").strip() or "unknown" for row in rows)
+    blocked_reason_counts: Counter[str] = Counter()
+    error_reason_counts: Counter[str] = Counter()
+    for row in rows:
+        outcome = str(row.get("outcome") or "").strip()
+        reason = str(row.get("reason") or "").strip() or "unknown"
+        if outcome in {"rejected", "not_selected"}:
+            blocked_reason_counts[reason] += 1
+        elif outcome == "error":
+            error_reason_counts[reason] += 1
+
+    def _serialize_reason_counts(counter: Counter[str]) -> list[dict[str, Any]]:
+        ordered = sorted(
+            counter.items(),
+            key=lambda item: (-item[1], _candidate_evaluation_reason_label(item[0]), item[0]),
+        )
+        return [
+            {
+                "reason": reason,
+                "label": _candidate_evaluation_reason_label(reason),
+                "count": count,
+            }
+            for reason, count in ordered[:limit]
+        ]
+
+    return {
+        "stage": stage,
+        "stage_label": _candidate_evaluation_stage_label(stage),
+        "total_count": len(rows),
+        "selected_count": int(outcome_counts.get("selected", 0)),
+        "not_selected_count": int(outcome_counts.get("not_selected", 0)),
+        "rejected_count": int(outcome_counts.get("rejected", 0)),
+        "error_count": int(outcome_counts.get("error", 0)),
+        "top_blocked_reasons": _serialize_reason_counts(blocked_reason_counts),
+        "top_error_reasons": _serialize_reason_counts(error_reason_counts),
+    }
+
+
+def _build_candidate_evaluation_summary(
+    rows: list[dict[str, Any]],
+    *,
+    limit: int = 3,
+) -> dict[str, Any]:
+    grouped: dict[str, list[dict[str, Any]]] = {
+        "prewatch": [],
+        "confirmation": [],
+    }
+    for row in rows:
+        stage = str(row.get("stage") or "").strip()
+        if stage in grouped:
+            grouped[stage].append(row)
+    return {
+        "prewatch": _summarize_candidate_evaluation_rows(grouped["prewatch"], stage="prewatch", limit=limit),
+        "confirmation": _summarize_candidate_evaluation_rows(grouped["confirmation"], stage="confirmation", limit=limit),
+    }
+
+
+def _build_candidate_reason_trend_rows(
+    recent_rows: list[dict[str, Any]],
+    baseline_rows: list[dict[str, Any]],
+    *,
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    recent_counts: Counter[str] = Counter()
+    baseline_counts: Counter[str] = Counter()
+    for row in recent_rows:
+        outcome = str(row.get("outcome") or "").strip()
+        reason = str(row.get("reason") or "").strip()
+        if outcome in {"rejected", "not_selected", "error"} and reason:
+            recent_counts[reason] += 1
+    for row in baseline_rows:
+        outcome = str(row.get("outcome") or "").strip()
+        reason = str(row.get("reason") or "").strip()
+        if outcome in {"rejected", "not_selected", "error"} and reason:
+            baseline_counts[reason] += 1
+    if not recent_counts and not baseline_counts:
+        return []
+    ordered_reasons = sorted(
+        set(recent_counts) | set(baseline_counts),
+        key=lambda reason: (
+            -recent_counts.get(reason, 0),
+            -baseline_counts.get(reason, 0),
+            _candidate_evaluation_reason_label(reason),
+            reason,
+        ),
+    )
+    items: list[dict[str, Any]] = []
+    for reason in ordered_reasons[:limit]:
+        recent_count = int(recent_counts.get(reason, 0))
+        baseline_count = int(baseline_counts.get(reason, 0))
+        if recent_count <= 0 and baseline_count <= 0:
+            continue
+        items.append(
+            {
+                "reason": reason,
+                "label": _candidate_evaluation_reason_label(reason),
+                "recent_count": recent_count,
+                "baseline_count": baseline_count,
+            }
+        )
+    return items
+
+
+def _build_candidate_evaluation_trend_summary(
+    *,
+    recent_rows: list[dict[str, Any]],
+    baseline_rows: list[dict[str, Any]],
+    recent_window_days: int,
+    baseline_window_days: int,
+    limit: int = 3,
+) -> dict[str, Any]:
+    grouped_recent: dict[str, list[dict[str, Any]]] = {
+        "prewatch": [],
+        "confirmation": [],
+    }
+    grouped_baseline: dict[str, list[dict[str, Any]]] = {
+        "prewatch": [],
+        "confirmation": [],
+    }
+    for row in recent_rows:
+        stage = str(row.get("stage") or "").strip()
+        if stage in grouped_recent:
+            grouped_recent[stage].append(row)
+    for row in baseline_rows:
+        stage = str(row.get("stage") or "").strip()
+        if stage in grouped_baseline:
+            grouped_baseline[stage].append(row)
+    result: dict[str, Any] = {
+        "recent_window_days": recent_window_days,
+        "baseline_window_days": baseline_window_days,
+    }
+    for stage in ("prewatch", "confirmation"):
+        result[stage] = {
+            "stage": stage,
+            "stage_label": _candidate_evaluation_stage_label(stage),
+            "recent_total_count": len(grouped_recent[stage]),
+            "baseline_total_count": len(grouped_baseline[stage]),
+            "reason_trends": _build_candidate_reason_trend_rows(
+                grouped_recent[stage],
+                grouped_baseline[stage],
+                limit=limit,
+            ),
+        }
+    return result
+
+
+def _parameter_label(parameter_key: str) -> str:
+    return {
+        "prewatch_min_score": "观察门槛",
+        "max_prewatch_candidates_per_run": "观察候选上限",
+        "prewatch_event_min_score": "事件预热观察门槛",
+        "event_score_threshold": "确认阈值",
+        "confirmation_bonus": "确认加分项",
+        "execution_entry_buffer_pct": "入场缓冲",
+        "execution_invalidation_buffer_pct": "失效缓冲",
+        "take_profit_pct": "止盈区间",
+        "take_profit_extension_pct": "扩展止盈区",
+        "trend_filter_strength": "趋势过滤强度",
+    }.get(parameter_key, parameter_key)
+
+
+def _parameter_direction_label(direction: str) -> str:
+    return {
+        "high": "更可能偏高",
+        "low": "更可能偏低",
+        "inspect": "先排查",
+    }.get(direction, direction or "先排查")
+
+
+def _build_recommendation_item(
+    *,
+    text: str,
+    priority: int,
+    parameter_hints: list[tuple[str, str]] | None = None,
+    source: str = "",
+) -> dict[str, Any]:
+    parameter_details: list[dict[str, str]] = []
+    seen_parameter_keys: set[str] = set()
+    for item in parameter_hints or []:
+        key = str(item[0] or "").strip()
+        direction = str(item[1] or "").strip() or "inspect"
+        if not key or key in seen_parameter_keys:
+            continue
+        seen_parameter_keys.add(key)
+        parameter_details.append(
+            {
+                "key": key,
+                "label": _parameter_label(key),
+                "direction": direction,
+                "direction_label": _parameter_direction_label(direction),
+            }
+        )
+    return {
+        "text": text,
+        "priority": priority,
+        "source": source,
+        "parameter_keys": [row["key"] for row in parameter_details],
+        "parameter_labels": [row["label"] for row in parameter_details],
+        "parameter_directions": [row["direction"] for row in parameter_details],
+        "parameter_direction_labels": [row["direction_label"] for row in parameter_details],
+        "parameter_details": parameter_details,
+    }
+
+
+def _candidate_trend_recommendation_for_reason(*, stage: str, reason: str) -> dict[str, Any] | None:
+    normalized = str(reason or "").strip()
+    if stage == "prewatch":
+        if normalized == "below_min_score":
+            return _build_recommendation_item(
+                text="近 7 天预备池更多卡在低于观察阈值，优先回看观察门槛是否偏高。",
+                priority=10,
+                parameter_hints=[("prewatch_min_score", "high")],
+                source="candidate_trend",
+            )
+        if normalized == "ranked_below_run_cap":
+            return _build_recommendation_item(
+                text="近 7 天预备池更常排在候选上限之外，优先回看候选上限或预备池排序逻辑。",
+                priority=10,
+                parameter_hints=[("max_prewatch_candidates_per_run", "low")],
+                source="candidate_trend",
+            )
+        if normalized in {"bearish_trend", "overheated_without_breakout"}:
+            return _build_recommendation_item(
+                text="近 7 天预备池更多被市场结构挡掉，优先检查趋势与过热过滤是否过严。",
+                priority=10,
+                parameter_hints=[("trend_filter_strength", "inspect")],
+                source="candidate_trend",
+            )
+        if normalized.startswith("build_failed:"):
+            return _build_recommendation_item(
+                text="近 7 天预备池构建异常增多，优先排查预备池快照或指标生成链路。",
+                priority=10,
+                source="candidate_trend",
+            )
+    if stage == "confirmation":
+        if normalized == "threshold_not_met":
+            return _build_recommendation_item(
+                text="近 7 天确认机会更多卡在未达到确认阈值，优先回看确认门槛或加分项设置。",
+                priority=10,
+                parameter_hints=[("event_score_threshold", "high"), ("confirmation_bonus", "low")],
+                source="candidate_trend",
+            )
+        if normalized == "execution_ineligible":
+            return _build_recommendation_item(
+                text="近 7 天确认机会更多卡在执行条件，优先检查入场区、失效位和执行约束是否过严。",
+                priority=10,
+                parameter_hints=[
+                    ("execution_entry_buffer_pct", "inspect"),
+                    ("execution_invalidation_buffer_pct", "inspect"),
+                ],
+                source="candidate_trend",
+            )
+        if normalized == "event_only_below_threshold":
+            return _build_recommendation_item(
+                text="近 7 天事件降级样本更常卡在分数不足，优先回看事件降级阈值和文案降级逻辑。",
+                priority=10,
+                parameter_hints=[("prewatch_event_min_score", "high"), ("event_score_threshold", "high")],
+                source="candidate_trend",
+            )
+        if normalized.startswith("scoring_failed:"):
+            return _build_recommendation_item(
+                text="近 7 天确认评分异常增多，优先排查确认阶段评分链路。",
+                priority=10,
+                source="candidate_trend",
+            )
+    return None
+
+
+def _build_candidate_trend_recommendations(summary: dict[str, Any]) -> list[dict[str, Any]]:
+    recent_window_days = int(summary.get("recent_window_days", 0) or 0)
+    baseline_window_days = int(summary.get("baseline_window_days", 0) or 0)
+    if recent_window_days <= 0 or baseline_window_days <= 0:
+        return []
+    recommendations: list[dict[str, Any]] = []
+    for stage in ("prewatch", "confirmation"):
+        stage_summary = summary.get(stage) or {}
+        for item in stage_summary.get("reason_trends") or []:
+            recent_count = int(item.get("recent_count", 0) or 0)
+            baseline_count = int(item.get("baseline_count", 0) or 0)
+            if recent_count < 2 or baseline_count <= 0:
+                continue
+            recent_rate = recent_count / max(recent_window_days, 1)
+            baseline_rate = baseline_count / max(baseline_window_days, 1)
+            if recent_rate < baseline_rate * 1.5:
+                continue
+            recommendation = _candidate_trend_recommendation_for_reason(
+                stage=stage,
+                reason=str(item.get("reason") or ""),
+            )
+            if recommendation and recommendation["text"] not in {row["text"] for row in recommendations}:
+                recommendations.append(recommendation)
+            if len(recommendations) >= 2:
+                return recommendations
+    return recommendations
+
+
+def _prioritize_recommendations(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    ordered: list[dict[str, Any]] = []
+    indexed_items = list(enumerate(items))
+    for _, item in sorted(indexed_items, key=lambda item: (int(item[1].get("priority", 999) or 999), item[0])):
+        text = str(item.get("text") or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        ordered.append(item)
+    return ordered
 
 
 def _historical_effect_exit_reason_label(reason: str) -> str:
@@ -262,6 +609,8 @@ def _serialize_ranked_decision_rows(
                     entered=bool(row.get("entered")),
                     close_reason=str(row.get("close_reason") or ""),
                 ),
+                "entered": bool(row.get("entered")),
+                "close_reason": str(row.get("close_reason") or ""),
                 "real_exit_label": (
                     "已真实退出"
                 if str(row.get("close_reason") or "") in {"exit_pool", "hit_take_profit", "hit_invalidation", "window_complete"}
@@ -304,6 +653,98 @@ def _resolve_review_window(*, days: int, start_date: str = "", end_date: str = "
         "window_days": (end_day - start_day).days + 1,
         "since": start_dt.astimezone(timezone.utc).isoformat(),
         "until": end_exclusive_dt.astimezone(timezone.utc).isoformat(),
+    }
+
+
+def _resolve_month_review_window(month: str) -> dict[str, Any]:
+    token = str(month or "").strip()
+    match = re.fullmatch(r"(\d{4})-(\d{2})", token)
+    if match is None:
+        raise SystemExit("month must be in YYYY-MM format.")
+    year = int(match.group(1))
+    month_value = int(match.group(2))
+    if month_value < 1 or month_value > 12:
+        raise SystemExit("month must be in YYYY-MM format.")
+    start_day = date(year, month_value, 1)
+    if month_value == 12:
+        next_month_start = date(year + 1, 1, 1)
+    else:
+        next_month_start = date(year, month_value + 1, 1)
+    end_day = next_month_start - timedelta(days=1)
+    window = _resolve_review_window(days=1, start_date=start_day.isoformat(), end_date=end_day.isoformat())
+    window["month"] = token
+    return window
+
+
+def _review_window_slug(window: dict[str, Any]) -> str:
+    start_date = str(window.get("start_date") or "").strip()
+    end_date = str(window.get("end_date") or "").strip()
+    if start_date and end_date and start_date != end_date:
+        return f"{start_date}_to_{end_date}"
+    return start_date or end_date or "window"
+
+
+def _is_default_rolling_review_request(*, days: int, start_date: str = "", end_date: str = "", month: str = "") -> bool:
+    return (
+        not str(start_date or "").strip()
+        and not str(end_date or "").strip()
+        and not str(month or "").strip()
+        and int(days) == RECENT_PERFORMANCE_WINDOW_DAYS
+    )
+
+
+def _iter_recent_month_tokens(*, reference_day: date, count: int) -> list[str]:
+    if count <= 0:
+        return []
+    tokens: list[str] = []
+    year = reference_day.year
+    month_value = reference_day.month
+    for _ in range(count):
+        tokens.append(f"{year:04d}-{month_value:02d}")
+        month_value -= 1
+        if month_value <= 0:
+            month_value = 12
+            year -= 1
+    return tokens
+
+
+def _resolve_historical_effect_output_paths(
+    *,
+    workspace_dir: Path,
+    window: dict[str, Any],
+    days: int,
+    start_date: str = "",
+    end_date: str = "",
+    month: str = "",
+) -> dict[str, Any]:
+    historical_effect_dir = workspace_dir / "historical_effect"
+    historical_effect_dir.mkdir(parents=True, exist_ok=True)
+    month_token = str(month or "").strip()
+    if month_token:
+        output_dir = historical_effect_dir / "monthly" / month_token
+        scope = "monthly"
+        scope_label = f"活的月报 {month_token}"
+        slug = month_token
+    elif _is_default_rolling_review_request(days=days, start_date=start_date, end_date=end_date, month=month):
+        output_dir = historical_effect_dir
+        scope = "rolling"
+        scope_label = f"滚动近 {RECENT_PERFORMANCE_WINDOW_DAYS} 天"
+        slug = "rolling-30d"
+    else:
+        slug = _review_window_slug(window)
+        output_dir = historical_effect_dir / "windows" / slug
+        scope = "window"
+        scope_label = "自定义窗口"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return {
+        "review_scope": scope,
+        "review_scope_label": scope_label,
+        "review_slug": slug,
+        "output_dir": output_dir,
+        "performance_review_path": output_dir / "review.md",
+        "payload_path": output_dir / "review_payload.json",
+        "sample_audit_path": output_dir / "sample_audit.md",
+        "sample_audit_payload_path": output_dir / "sample_audit_payload.json",
     }
 
 
@@ -767,12 +1208,57 @@ def _build_historical_effect_review_data(
             if archive_store is not None
             else []
         )
+        main_candidate_evaluation_rows = [
+            dict(row)
+            for row in store.load_candidate_evaluations_for_window(
+                since=window["since"],
+                until=window["until"],
+            )
+        ]
+        archive_candidate_evaluation_rows = (
+            [
+                dict(row)
+                for row in archive_store.load_candidate_evaluations_for_window(
+                    since=window["since"],
+                    until=window["until"],
+                )
+            ]
+            if archive_store is not None
+            else []
+        )
     finally:
         if archive_store is not None:
             archive_store.close()
 
     rows = _merge_decision_rows(list(main_rows), list(archive_rows))
     observation_rows_merged = _merge_decision_rows(list(observation_rows), list(archive_observation_rows))
+    candidate_evaluation_summary = _build_candidate_evaluation_summary(
+        main_candidate_evaluation_rows + archive_candidate_evaluation_rows,
+        limit=limit,
+    )
+    review_until_dt = datetime.fromisoformat(str(window["until"]))
+    review_since_dt = datetime.fromisoformat(str(window["since"]))
+    recent_window_days = min(int(window.get("window_days") or days or 0), 7)
+    recent_since_dt = max(review_since_dt, review_until_dt - timedelta(days=max(recent_window_days, 1)))
+    recent_since = recent_since_dt.isoformat()
+    recent_candidate_evaluation_rows = [
+        row
+        for row in (main_candidate_evaluation_rows + archive_candidate_evaluation_rows)
+        if recent_since <= str(row.get("created_at") or "") < str(window["until"])
+    ]
+    candidate_evaluation_trend_summary = _build_candidate_evaluation_trend_summary(
+        recent_rows=recent_candidate_evaluation_rows,
+        baseline_rows=main_candidate_evaluation_rows + archive_candidate_evaluation_rows,
+        recent_window_days=max(recent_window_days, 1),
+        baseline_window_days=int(window.get("window_days") or days or 0),
+        limit=limit,
+    )
+    historical_alert_rows = []
+    for raw_row in store.load_alert_history_for_window(since=window["since"]):
+        row = dict(raw_row)
+        if str(row.get("notified_at") or "") >= str(window["until"]):
+            continue
+        historical_alert_rows.append(row)
     entered_rows = [row for row in rows if bool(row.get("entered"))]
     not_entered_rows = [row for row in rows if not bool(row.get("entered"))]
     take_profit_rows = [row for row in entered_rows if _is_profit_exit_reason(str(row.get("close_reason") or ""))]
@@ -838,33 +1324,63 @@ def _build_historical_effect_review_data(
     worst_pool = _worst_completed_group(pool_breakdown)
     best_trigger = _best_completed_group(trigger_breakdown)
     worst_trigger = _worst_completed_group(trigger_breakdown)
-    recommendations: list[str] = []
+    recommendation_items: list[dict[str, Any]] = []
     if not rows:
-        recommendations.append("当前窗口内没有可执行建议，先继续积累样本。")
+        recommendation_items.append(
+            _build_recommendation_item(
+                text="当前窗口内没有可执行建议，先继续积累样本。",
+                priority=80,
+                source="baseline",
+            )
+        )
     else:
         if best_event is not None:
-            recommendations.append(
-                f"{best_event['label']} 是当前窗口里表现最好的事件类型，可优先保留并继续观察后续样本。"
+            recommendation_items.append(
+                _build_recommendation_item(
+                    text=f"{best_event['label']} 是当前窗口里表现最好的事件类型，可优先保留并继续观察后续样本。",
+                    priority=50,
+                    source="historical_outcome",
+                )
             )
         if worst_event is not None and worst_event is not best_event:
-            recommendations.append(
-                f"{worst_event['label']} 表现最弱，优先回看这类事件的阈值、排序和入场时机。"
+            recommendation_items.append(
+                _build_recommendation_item(
+                    text=f"{worst_event['label']} 表现最弱，优先回看这类事件的阈值、排序和入场时机。",
+                    priority=30,
+                    source="historical_outcome",
+                )
             )
         if best_pool is not None:
-            recommendations.append(
-                f"{best_pool['label']} 当前是表现更好的池子，可优先作为后续筛选和排序参考。"
+            recommendation_items.append(
+                _build_recommendation_item(
+                    text=f"{best_pool['label']} 当前是表现更好的池子，可优先作为后续筛选和排序参考。",
+                    priority=50,
+                    source="historical_outcome",
+                )
             )
         if worst_pool is not None and worst_pool is not best_pool:
-            recommendations.append(
-                f"{worst_pool['label']} 当前表现偏弱，优先检查该池子的升池标准和价格计划。"
+            recommendation_items.append(
+                _build_recommendation_item(
+                    text=f"{worst_pool['label']} 当前表现偏弱，优先检查该池子的升池标准和价格计划。",
+                    priority=30,
+                    source="historical_outcome",
+                )
             )
         if best_trigger is not None:
-            recommendations.append(
-                f"{best_trigger['label']} 当前相对更稳，可继续观察这类触发方式的后续样本。"
+            recommendation_items.append(
+                _build_recommendation_item(
+                    text=f"{best_trigger['label']} 当前相对更稳，可继续观察这类触发方式的后续样本。",
+                    priority=55,
+                    source="historical_outcome",
+                )
             )
         if worst_trigger is not None and worst_trigger is not best_trigger:
-            recommendations.append(
-                f"{worst_trigger['label']} 当前偏弱，值得回看触发条件是否过于宽松。"
+            recommendation_items.append(
+                _build_recommendation_item(
+                    text=f"{worst_trigger['label']} 当前偏弱，值得回看触发条件是否过于宽松。",
+                    priority=35,
+                    source="historical_outcome",
+                )
             )
         invalidation_rate = _percentage(len(invalidation_rows), len(entered_rows)) or 0.0
         window_complete_rate = _percentage(len(window_complete_rows), len(entered_rows)) or 0.0
@@ -872,19 +1388,55 @@ def _build_historical_effect_review_data(
         take_profit_rate = _percentage(len(take_profit_rows), len(entered_rows)) or 0.0
         avg_runup = next((row.get("avg_value") for row in auxiliary_metrics if row.get("field") == "max_runup"), None)
         if invalidation_rate >= 40.0:
-            recommendations.append("失效退出占比偏高，优先检查入场是否过早，以及失效缓冲是否过窄。")
+            recommendation_items.append(
+                _build_recommendation_item(
+                    text="失效退出占比偏高，优先检查入场是否过早，以及失效缓冲是否过窄。",
+                    priority=20,
+                    parameter_hints=[
+                        ("execution_entry_buffer_pct", "inspect"),
+                        ("execution_invalidation_buffer_pct", "inspect"),
+                    ],
+                    source="historical_outcome",
+                )
+            )
         if window_complete_rate >= 40.0:
-            recommendations.append("复盘窗口结算占比偏高，说明止盈偏远或催化延续性还不够强。")
+            recommendation_items.append(
+                _build_recommendation_item(
+                    text="复盘窗口结算占比偏高，说明止盈偏远或催化延续性还不够强。",
+                    priority=20,
+                    parameter_hints=[("take_profit_pct", "high"), ("take_profit_extension_pct", "high")],
+                    source="historical_outcome",
+                )
+            )
         if not_entered_rate >= 40.0:
-            recommendations.append("未进场样本偏多，说明入场区间可能偏保守，值得回看挂单区间。")
+            recommendation_items.append(
+                _build_recommendation_item(
+                    text="未进场样本偏多，说明入场区间可能偏保守，值得回看挂单区间。",
+                    priority=20,
+                    parameter_hints=[("execution_entry_buffer_pct", "high")],
+                    source="historical_outcome",
+                )
+            )
         if take_profit_rate == 0.0 and avg_runup is not None and float(avg_runup) > 0:
-            recommendations.append("样本中曾出现一定浮盈但没有止盈兑现，建议回看止盈区间是否偏远。")
-    if not recommendations:
-        recommendations.append("当前样本表现较均衡，继续累计更多完整样本后再调整策略。")
-    deduped_recommendations: list[str] = []
-    for line in recommendations:
-        if line not in deduped_recommendations:
-            deduped_recommendations.append(line)
+            recommendation_items.append(
+                _build_recommendation_item(
+                    text="样本中曾出现一定浮盈但没有止盈兑现，建议回看止盈区间是否偏远。",
+                    priority=20,
+                    parameter_hints=[("take_profit_pct", "high"), ("take_profit_extension_pct", "high")],
+                    source="historical_outcome",
+                )
+            )
+    recommendation_items.extend(_build_candidate_trend_recommendations(candidate_evaluation_trend_summary))
+    if not recommendation_items:
+        recommendation_items.append(
+            _build_recommendation_item(
+                text="当前样本表现较均衡，继续累计更多完整样本后再调整策略。",
+                priority=90,
+                source="baseline",
+            )
+        )
+    prioritized_recommendations = _prioritize_recommendations(recommendation_items)
+    deduped_recommendations = [str(item.get("text") or "") for item in prioritized_recommendations]
 
     ranked_completed_rows = [
         row
@@ -971,6 +1523,305 @@ def _build_historical_effect_review_data(
         ),
         reverse=True,
     )[:20]
+    exit_pool_transition_rows = [
+        row
+        for row in rows
+        if bool(row.get("entered")) and str(row.get("close_reason") or "") == "exit_pool"
+    ]
+    exit_pool_transition_holding_days = [
+        float(row.get("holding_days"))
+        for row in exit_pool_transition_rows
+        if row.get("holding_days") is not None
+    ]
+    exit_pool_transition_by_action: list[dict[str, Any]] = []
+    for action in EXECUTABLE_DECISION_ACTIONS:
+        action_rows = [
+            row for row in exit_pool_transition_rows
+            if str(row.get("action") or "").strip() == action
+        ]
+        holding_values = [
+            float(row.get("holding_days"))
+            for row in action_rows
+            if row.get("holding_days") is not None
+        ]
+        if not action_rows:
+            continue
+        exit_pool_transition_by_action.append(
+            {
+                "action": action,
+                "action_display": _historical_effect_action_label(action),
+                "sample_count": len(action_rows),
+                "avg_holding_days": _mean(holding_values),
+                "median_holding_days": _median(holding_values),
+            }
+        )
+    fastest_exit_pool_transition = None
+    slowest_exit_pool_transition = None
+    transition_rows_with_days = [
+        row for row in exit_pool_transition_rows
+        if row.get("holding_days") is not None
+    ]
+    if transition_rows_with_days:
+        fastest_exit_pool_transition = min(
+            transition_rows_with_days,
+            key=lambda row: (float(row.get("holding_days") or 0.0), str(row.get("created_at") or "")),
+        )
+        slowest_exit_pool_transition = max(
+            transition_rows_with_days,
+            key=lambda row: (float(row.get("holding_days") or 0.0), str(row.get("created_at") or "")),
+        )
+    recent_exit_pool_samples = [
+        {
+            "symbol": str(row.get("symbol") or ""),
+            "event_type": str(row.get("event_type") or ""),
+            "event_type_display": _historical_effect_event_type_label(str(row.get("event_type") or "")),
+            "action": str(row.get("action") or ""),
+            "action_display": _historical_effect_action_label(str(row.get("action") or "")),
+            "close_reason": str(row.get("close_reason") or ""),
+            "close_reason_display": _historical_effect_exit_reason_label(str(row.get("close_reason") or "")),
+            "exit_subreason": str(row.get("exit_subreason") or ""),
+            "holding_days": row.get("holding_days"),
+            "realized_return": row.get("realized_return"),
+            "created_at": str(row.get("created_at") or ""),
+        }
+        for row in sorted(
+            exit_pool_transition_rows,
+            key=lambda row: (
+                str(row.get("created_at") or ""),
+                str(row.get("symbol") or ""),
+            ),
+            reverse=True,
+        )[:3]
+    ]
+    exit_pool_samples_with_return = [
+        row for row in exit_pool_transition_rows
+        if row.get("realized_return") is not None
+    ]
+
+    def _serialize_trade_path_sample(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "symbol": str(row.get("symbol") or ""),
+            "event_type": str(row.get("event_type") or ""),
+            "event_type_display": _historical_effect_event_type_label(str(row.get("event_type") or "")),
+            "action": str(row.get("action") or ""),
+            "action_display": _historical_effect_action_label(str(row.get("action") or "")),
+            "close_reason": str(row.get("close_reason") or ""),
+            "close_reason_display": _historical_effect_exit_reason_label(str(row.get("close_reason") or "")),
+            "exit_subreason": str(row.get("exit_subreason") or ""),
+            "holding_days": row.get("holding_days"),
+            "realized_return": row.get("realized_return"),
+            "created_at": str(row.get("created_at") or ""),
+        }
+
+    best_exit_pool_samples = [
+        _serialize_trade_path_sample(row)
+        for row in sorted(
+            exit_pool_samples_with_return,
+            key=lambda row: (
+                float(row.get("realized_return") or 0.0),
+                str(row.get("created_at") or ""),
+            ),
+            reverse=True,
+        )[:3]
+    ]
+    worst_exit_pool_samples = [
+        _serialize_trade_path_sample(row)
+        for row in sorted(
+            exit_pool_samples_with_return,
+            key=lambda row: (
+                float(row.get("realized_return") or 0.0),
+                str(row.get("created_at") or ""),
+            ),
+        )[:3]
+    ]
+    promoted_confirmation_rows = [
+        row
+        for row in rows
+        if bool(_load_json_dict(row.get("packet_json")).get("promoted_from_prewatch"))
+        or str(row.get("trigger_mode") or "").strip() == "promoted"
+    ]
+    promoted_after_light_push_rows = [
+        row
+        for row in promoted_confirmation_rows
+        if int(_load_json_dict(row.get("packet_json")).get("prewatch_alert_sent_count") or 0) > 0
+    ]
+    prewatch_alert_rows = [
+        row
+        for row in historical_alert_rows
+        if bool(row.get("sent"))
+        and (
+            str(row.get("dedup_key") or "").startswith("prewatch-notify:")
+            or str(row.get("card_id") or "").startswith("prewatch-notify:")
+        )
+    ]
+    prewatch_alert_symbols = {
+        str(row.get("symbol") or "").strip().upper()
+        for row in prewatch_alert_rows
+        if str(row.get("symbol") or "").strip()
+    }
+    promoted_confirmation_symbols = {
+        str(row.get("symbol") or "").strip().upper()
+        for row in promoted_confirmation_rows
+        if str(row.get("symbol") or "").strip()
+    }
+    recent_observation_samples = []
+    for row in sorted(
+        observation_rows_merged,
+        key=lambda item: (
+            str(item.get("created_at") or ""),
+            str(item.get("symbol") or ""),
+        ),
+        reverse=True,
+    )[:5]:
+        symbol = str(row.get("symbol") or "").strip().upper()
+        packet = _load_json_dict(row.get("packet_json"))
+        lifecycle = packet.get("prewatch_lifecycle") if isinstance(packet.get("prewatch_lifecycle"), dict) else {}
+        recent_observation_samples.append(
+            {
+                "symbol": symbol,
+                "created_at": str(row.get("created_at") or ""),
+                "horizon": str(row.get("horizon") or "position"),
+                "setup_type": str(packet.get("setup_type") or ""),
+                "score": float(row.get("final_score") or 0.0),
+                "trigger_mode": str(row.get("trigger_mode") or ""),
+                "theme_ids": list(row.get("theme_ids") or []),
+                "observation_count": int(lifecycle.get("observation_count") or 0),
+                "alert_sent_count": int(lifecycle.get("alert_sent_count") or 0),
+                "observation_status": "已触发观察提醒" if symbol in prewatch_alert_symbols else "仅后台观察",
+                "confirmation_status": "已形成确认机会" if symbol in promoted_confirmation_symbols else "仍在观察",
+            }
+        )
+    exit_from_promoted_rows = [
+        row
+        for row in promoted_confirmation_rows
+        if bool(row.get("entered")) and str(row.get("close_reason") or "").strip() == "exit_pool"
+    ]
+    simulated_entry_rows = [row for row in promoted_confirmation_rows if bool(row.get("entered"))]
+    simulated_pending_entry_rows = [row for row in promoted_confirmation_rows if not bool(row.get("entered"))]
+    simulated_completed_exit_rows = [
+        row
+        for row in promoted_confirmation_rows
+        if bool(row.get("entered")) and str(row.get("close_reason") or "").strip() not in {"", "insufficient_lookahead"}
+    ]
+    simulated_open_rows = [
+        row
+        for row in promoted_confirmation_rows
+        if bool(row.get("entered")) and str(row.get("close_reason") or "").strip() == "insufficient_lookahead"
+    ]
+    simulated_exit_breakdown = {
+        "exit_pool": sum(
+            1 for row in simulated_completed_exit_rows
+            if str(row.get("close_reason") or "").strip() == "exit_pool"
+        ),
+        "hit_take_profit": sum(
+            1 for row in simulated_completed_exit_rows
+            if str(row.get("close_reason") or "").strip() == "hit_take_profit"
+        ),
+        "hit_invalidation": sum(
+            1 for row in simulated_completed_exit_rows
+            if str(row.get("close_reason") or "").strip() == "hit_invalidation"
+        ),
+        "window_complete": sum(
+            1 for row in simulated_completed_exit_rows
+            if str(row.get("close_reason") or "").strip() == "window_complete"
+        ),
+    }
+    confirmation_to_entry_days = []
+    for row in simulated_entry_rows:
+        created_at_text = str(row.get("created_at") or "").strip()
+        entered_at_text = str(row.get("entered_at") or "").strip()
+        if not created_at_text or not entered_at_text:
+            continue
+        try:
+            created_at_dt = datetime.fromisoformat(created_at_text)
+            entered_at_dt = datetime.fromisoformat(entered_at_text)
+        except ValueError:
+            continue
+        confirmation_to_entry_days.append((entered_at_dt - created_at_dt).total_seconds() / 86400.0)
+    entry_to_completed_exit_days = [
+        float(row.get("holding_days"))
+        for row in simulated_completed_exit_rows
+        if row.get("holding_days") is not None
+    ]
+    entry_timing_by_action: list[dict[str, Any]] = []
+    completed_exit_timing_by_action: list[dict[str, Any]] = []
+    for action in EXECUTABLE_DECISION_ACTIONS:
+        action_entry_days = []
+        for row in simulated_entry_rows:
+            if str(row.get("action") or "").strip() != action:
+                continue
+            created_at_text = str(row.get("created_at") or "").strip()
+            entered_at_text = str(row.get("entered_at") or "").strip()
+            if not created_at_text or not entered_at_text:
+                continue
+            try:
+                created_at_dt = datetime.fromisoformat(created_at_text)
+                entered_at_dt = datetime.fromisoformat(entered_at_text)
+            except ValueError:
+                continue
+            action_entry_days.append((entered_at_dt - created_at_dt).total_seconds() / 86400.0)
+        if action_entry_days:
+            entry_timing_by_action.append(
+                {
+                    "action": action,
+                    "action_display": _historical_effect_action_label(action),
+                    "sample_count": len(action_entry_days),
+                    "avg_days_to_entry": _mean(action_entry_days),
+                    "median_days_to_entry": _median(action_entry_days),
+                }
+            )
+        action_completed_exit_days = [
+            float(row.get("holding_days"))
+            for row in simulated_completed_exit_rows
+            if str(row.get("action") or "").strip() == action and row.get("holding_days") is not None
+        ]
+        if action_completed_exit_days:
+            completed_exit_timing_by_action.append(
+                {
+                    "action": action,
+                    "action_display": _historical_effect_action_label(action),
+                    "sample_count": len(action_completed_exit_days),
+                    "avg_holding_days": _mean(action_completed_exit_days),
+                    "median_holding_days": _median(action_completed_exit_days),
+                }
+            )
+    pool_funnel_summary = {
+        "prewatch_candidate_count": len(observation_rows_merged),
+        "prewatch_light_push_count": len(prewatch_alert_rows),
+        "promoted_confirmation_count": len(promoted_confirmation_rows),
+        "promoted_after_light_push_count": len(promoted_after_light_push_rows),
+        "promoted_without_light_push_count": max(
+            len(promoted_confirmation_rows) - len(promoted_after_light_push_rows),
+            0,
+        ),
+        "exit_from_promoted_count": len(exit_from_promoted_rows),
+        "observation_to_light_push_rate": _percentage(len(prewatch_alert_rows), len(observation_rows_merged)),
+        "observation_to_confirmation_rate": _percentage(len(promoted_confirmation_rows), len(observation_rows_merged)),
+        "light_push_to_confirmation_rate": _percentage(len(promoted_after_light_push_rows), len(prewatch_alert_rows)),
+        "confirmation_to_exit_rate": _percentage(len(exit_from_promoted_rows), len(promoted_confirmation_rows)),
+    }
+    simulation_funnel_summary = {
+        "prewatch_candidate_count": len(observation_rows_merged),
+        "prewatch_light_push_count": len(prewatch_alert_rows),
+        "promoted_confirmation_count": len(promoted_confirmation_rows),
+        "simulated_entry_count": len(simulated_entry_rows),
+        "simulated_pending_entry_count": len(simulated_pending_entry_rows),
+        "exit_pool_transition_count": len(exit_from_promoted_rows),
+        "simulated_completed_exit_count": len(simulated_completed_exit_rows),
+        "simulated_open_count": len(simulated_open_rows),
+        "observation_to_light_push_rate": _percentage(len(prewatch_alert_rows), len(observation_rows_merged)),
+        "observation_to_confirmation_rate": _percentage(len(promoted_confirmation_rows), len(observation_rows_merged)),
+        "confirmation_to_entry_rate": _percentage(len(simulated_entry_rows), len(promoted_confirmation_rows)),
+        "entry_to_exit_pool_rate": _percentage(len(exit_from_promoted_rows), len(simulated_entry_rows)),
+        "entry_to_completed_exit_rate": _percentage(len(simulated_completed_exit_rows), len(simulated_entry_rows)),
+        "avg_confirmation_to_entry_days": _mean(confirmation_to_entry_days),
+        "median_confirmation_to_entry_days": _median(confirmation_to_entry_days),
+        "avg_entry_to_completed_exit_days": _mean(entry_to_completed_exit_days),
+        "median_entry_to_completed_exit_days": _median(entry_to_completed_exit_days),
+        "entry_timing_by_action": entry_timing_by_action,
+        "completed_exit_timing_by_action": completed_exit_timing_by_action,
+        "completed_exit_breakdown": simulated_exit_breakdown,
+    }
     return {
         "status": "正式" if formal_ready else "草稿",
         "status_label": "历史效果复盘（正式）" if formal_ready else "历史效果复盘（草稿）",
@@ -1015,6 +1866,44 @@ def _build_historical_effect_review_data(
             "completed_outcome_count": len(completed_rows),
             "pending_outcome_count": len(pending_rows),
         },
+        "trade_path_summary": {
+            "exit_pool_transition_count": len(exit_pool_transition_rows),
+            "avg_days_to_exit_pool": _mean(exit_pool_transition_holding_days),
+            "median_days_to_exit_pool": _median(exit_pool_transition_holding_days),
+            "by_action": exit_pool_transition_by_action,
+            "fastest_sample": (
+                {
+                    "symbol": str(fastest_exit_pool_transition.get("symbol") or ""),
+                    "event_type": str(fastest_exit_pool_transition.get("event_type") or ""),
+                    "action": str(fastest_exit_pool_transition.get("action") or ""),
+                    "action_display": _historical_effect_action_label(str(fastest_exit_pool_transition.get("action") or "")),
+                    "holding_days": fastest_exit_pool_transition.get("holding_days"),
+                    "created_at": str(fastest_exit_pool_transition.get("created_at") or ""),
+                }
+                if fastest_exit_pool_transition is not None
+                else {}
+            ),
+            "slowest_sample": (
+                {
+                    "symbol": str(slowest_exit_pool_transition.get("symbol") or ""),
+                    "event_type": str(slowest_exit_pool_transition.get("event_type") or ""),
+                    "action": str(slowest_exit_pool_transition.get("action") or ""),
+                    "action_display": _historical_effect_action_label(str(slowest_exit_pool_transition.get("action") or "")),
+                    "holding_days": slowest_exit_pool_transition.get("holding_days"),
+                    "created_at": str(slowest_exit_pool_transition.get("created_at") or ""),
+                }
+                if slowest_exit_pool_transition is not None
+                else {}
+            ),
+            "recent_samples": recent_exit_pool_samples,
+            "best_samples": best_exit_pool_samples,
+            "worst_samples": worst_exit_pool_samples,
+        },
+        "pool_funnel_summary": pool_funnel_summary,
+        "simulation_funnel_summary": simulation_funnel_summary,
+        "candidate_evaluation_summary": candidate_evaluation_summary,
+        "candidate_evaluation_trend_summary": candidate_evaluation_trend_summary,
+        "recent_observation_samples": recent_observation_samples,
         "auxiliary_observation": auxiliary_metrics,
         "breakdowns": {
             "event_type": event_breakdown,
@@ -1039,6 +1928,7 @@ def _build_historical_effect_review_data(
                     close_reason=str(row.get("close_reason") or ""),
                 ),
                 "entered": bool(row.get("entered")),
+                "close_reason": str(row.get("close_reason") or ""),
                 "entry_price": row.get("entry_price"),
                 "exit_price": row.get("exit_price"),
                 "realized_return": row.get("realized_return"),
@@ -1063,6 +1953,7 @@ def _build_historical_effect_review_data(
             metric_field="t_plus_7_return",
         ),
         "recommendations": deduped_recommendations[:6],
+        "recommendation_details": prioritized_recommendations[:6],
     }
 
 
@@ -2180,6 +3071,11 @@ def _build_historical_outcome_context(store: Store, *, days: int, limit: int) ->
 def build_replay_evaluation_payload(store: Store, *, run_id: str, days: int, limit: int) -> dict:
     run_row = store.load_run(run_id)
     run_detail = serialize_run_detail(run_row, store.load_logs(run_id, limit=200)) if run_row else None
+    if run_detail is not None:
+        run_detail["candidate_evaluation_summary"] = _build_candidate_evaluation_summary(
+            [dict(row) for row in store.load_candidate_evaluations(run_id)],
+            limit=limit,
+        )
     strategy_report = _build_run_scoped_strategy_report(store, run_id=run_id, limit=limit)
     source_health = serialize_source_health(store.load_source_health(run_id))
     event_type_context, pool_context = _build_historical_outcome_context(store, days=days, limit=limit)
@@ -2308,6 +3204,13 @@ def _build_card_diagnostics(
                 "promoted_from_prewatch": card.get("promoted_from_prewatch", False),
                 "prewatch_score": card.get("prewatch_score", 0.0),
                 "prewatch_setup_type": card.get("prewatch_setup_type", ""),
+                "prewatch_observation_count": card.get("prewatch_observation_count", 0),
+                "prewatch_alert_sent_count": card.get("prewatch_alert_sent_count", 0),
+                "prewatch_first_seen_at": card.get("prewatch_first_seen_at", ""),
+                "prewatch_last_seen_at": card.get("prewatch_last_seen_at", ""),
+                "prewatch_last_alert_sent_at": card.get("prewatch_last_alert_sent_at", ""),
+                "prewatch_source_decision_id": card.get("prewatch_source_decision_id", ""),
+                "prewatch_promotion_reason": card.get("prewatch_promotion_reason", ""),
                 "theme_tags": card.get("theme_tags") or theme_tags_for_symbol(card["symbol"], symbol_theme_map),
                 "confirmed_peer_symbols": card.get("confirmed_peer_symbols", []),
                 "trend_state": card.get("trend_state", ""),
@@ -2417,7 +3320,23 @@ def _build_decision_diagnostics(
                 "llm_used": bool(row["llm_used"]),
                 "theme_ids": theme_ids,
                 "packet": packet,
+                "source_decision_id": str(packet.get("source_decision_id") or ""),
+                "promoted_from_prewatch": bool(packet.get("promoted_from_prewatch")),
+                "prewatch_score": float(packet.get("prewatch_score") or 0.0),
+                "prewatch_setup_type": str(packet.get("prewatch_setup_type") or ""),
+                "prewatch_observation_count": int(packet.get("prewatch_observation_count") or 0),
+                "prewatch_alert_sent_count": int(packet.get("prewatch_alert_sent_count") or 0),
+                "prewatch_first_seen_at": str(packet.get("prewatch_first_seen_at") or ""),
+                "prewatch_last_seen_at": str(packet.get("prewatch_last_seen_at") or ""),
+                "prewatch_last_alert_sent_at": str(packet.get("prewatch_last_alert_sent_at") or ""),
+                "prewatch_promotion_reason": str(packet.get("prewatch_promotion_reason") or ""),
                 "created_at": row["created_at"],
+                "entered": bool(row["entered"]) if row["entered"] is not None else False,
+                "entered_at": row["entered_at"],
+                "entry_price": row["entry_price"],
+                "exit_price": row["exit_price"],
+                "realized_return": row["realized_return"],
+                "holding_days": row["holding_days"],
                 "t_plus_1_return": row["t_plus_1_return"],
                 "t_plus_3_return": row["t_plus_3_return"],
                 "t_plus_5_return": row["t_plus_5_return"],
@@ -2434,6 +3353,34 @@ def _build_decision_diagnostics(
                 "pool_outcome_context": pool_context.get(str(row["pool"] or ""), {}),
             }
         )
+    by_decision_id = {str(item.get("decision_id") or ""): item for item in items}
+    for item in items:
+        source_decision_id = str(item.get("source_decision_id") or "").strip()
+        if not source_decision_id:
+            continue
+        source_item = by_decision_id.get(source_decision_id)
+        if source_item is None:
+            continue
+        item["source_decision_summary"] = {
+            "decision_id": source_decision_id,
+            "symbol": source_item.get("symbol"),
+            "pool": source_item.get("pool"),
+            "pool_label": source_item.get("pool_label"),
+            "action": source_item.get("action"),
+            "priority": source_item.get("priority"),
+            "confidence": source_item.get("confidence"),
+            "final_score": source_item.get("final_score"),
+            "created_at": source_item.get("created_at"),
+            "promoted_from_prewatch": bool(source_item.get("promoted_from_prewatch")),
+            "prewatch_score": source_item.get("prewatch_score"),
+            "prewatch_setup_type": source_item.get("prewatch_setup_type"),
+            "prewatch_observation_count": source_item.get("prewatch_observation_count"),
+            "prewatch_alert_sent_count": source_item.get("prewatch_alert_sent_count"),
+            "prewatch_first_seen_at": source_item.get("prewatch_first_seen_at"),
+            "prewatch_last_seen_at": source_item.get("prewatch_last_seen_at"),
+            "prewatch_last_alert_sent_at": source_item.get("prewatch_last_alert_sent_at"),
+            "prewatch_promotion_reason": source_item.get("prewatch_promotion_reason"),
+        }
     return items
 
 
@@ -3027,6 +3974,10 @@ def build_daily_run_payload(
             raise RuntimeError("No run generated during daily run.")
         run_id = latest_run["run_id"]
         run_detail = serialize_run_detail(latest_run, service.store.load_logs(run_id, limit=200))
+        run_detail["candidate_evaluation_summary"] = _build_candidate_evaluation_summary(
+            [dict(row) for row in service.store.load_candidate_evaluations(run_id)],
+            limit=limit,
+        )
         strategy_report = _build_run_scoped_strategy_report(service.store, run_id=run_id, limit=limit)
         source_health = serialize_source_health(service.store.load_source_health(run_id))
         card_diagnostics = _build_card_diagnostics(
@@ -3156,6 +4107,7 @@ def build_performance_review_payload(
     limit: int,
     start_date: str = "",
     end_date: str = "",
+    month: str = "",
 ) -> dict:
     workspace_dir = workspace_dir.resolve()
     workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -3176,6 +4128,10 @@ def build_performance_review_payload(
 
     if run_row is not None and selected_run_id:
         run_detail = serialize_run_detail(run_row, store.load_logs(selected_run_id, limit=200))
+        run_detail["candidate_evaluation_summary"] = _build_candidate_evaluation_summary(
+            [dict(row) for row in store.load_candidate_evaluations(selected_run_id)],
+            limit=limit,
+        )
         strategy_report = _build_run_scoped_strategy_report(store, run_id=selected_run_id, limit=limit)
         source_health = serialize_source_health(store.load_source_health(selected_run_id))
         card_diagnostics = _build_card_diagnostics(
@@ -3200,68 +4156,124 @@ def build_performance_review_payload(
             card_diagnostics,
             decision_diagnostics,
         )
+    month_token = str(month or "").strip()
+    if month_token and (str(start_date or "").strip() or str(end_date or "").strip()):
+        raise SystemExit("month cannot be combined with start-date/end-date.")
+    if month_token and int(days) != RECENT_PERFORMANCE_WINDOW_DAYS:
+        raise SystemExit("month cannot be combined with custom days. Use --month YYYY-MM only.")
 
-    historical_effect_review = _build_historical_effect_review_data(
-        store,
+    requested_window = (
+        _resolve_month_review_window(month_token)
+        if month_token
+        else _resolve_review_window(days=days, start_date=start_date, end_date=end_date)
+    )
+    output_paths = _resolve_historical_effect_output_paths(
+        workspace_dir=workspace_dir,
+        window=requested_window,
         days=days,
-        limit=limit,
         start_date=start_date,
         end_date=end_date,
+        month=month_token,
     )
-    performance_review_text = format_recent_performance_review(historical_effect_review)
-    sample_audit_payload = build_outcome_sample_payload(
-        store,
-        days=days,
-        limit=OUTCOME_SAMPLE_AUDIT_LIMIT,
-        start_date=start_date,
-        end_date=end_date,
-    )
-    sample_audit_text = format_outcome_sample_payload(sample_audit_payload)
 
-    performance_review_path = historical_effect_dir / "review.md"
-    payload_path = historical_effect_dir / "review_payload.json"
-    sample_audit_path = historical_effect_dir / "sample_audit.md"
-    sample_audit_payload_path = historical_effect_dir / "sample_audit_payload.json"
-    payload = {
-        "workspace_dir": str(workspace_dir),
-        "database_path": str(store.database_path.resolve()),
-        "run_id": selected_run_id,
-        "window_days": historical_effect_review["review_window"]["window_days"],
-        "limit": limit,
-        "performance_review_path": str(performance_review_path),
-        "payload_path": str(payload_path),
-        "sample_audit_path": str(sample_audit_path),
-        "sample_audit_payload_path": str(sample_audit_payload_path),
-        "historical_effect_review": historical_effect_review,
-        "sample_audit": sample_audit_payload,
-        "current_run": run_detail,
-        "current_strategy_report": strategy_report,
-        "health_summary": health_summary,
-    }
-    _write_report(performance_review_path, performance_review_text)
-    _write_json(payload_path, payload)
-    _write_report(sample_audit_path, sample_audit_text)
-    _write_json(sample_audit_payload_path, sample_audit_payload)
+    def _write_review_bundle(*, window: dict[str, Any], target_paths: dict[str, Any]) -> dict[str, Any]:
+        review_start = str(window.get("start_date") or "")
+        review_end = str(window.get("end_date") or "")
+        review_days = int(window.get("window_days") or 0)
+        historical_effect_review = _build_historical_effect_review_data(
+            store,
+            days=review_days,
+            limit=limit,
+            start_date=review_start,
+            end_date=review_end,
+        )
+        historical_effect_review["review_scope"] = target_paths["review_scope"]
+        historical_effect_review["review_scope_label"] = target_paths["review_scope_label"]
+        historical_effect_review["review_slug"] = target_paths["review_slug"]
+        historical_effect_review["last_generated_at"] = utcnow().astimezone(BEIJING_TZ).isoformat()
+        performance_review_text = format_recent_performance_review(historical_effect_review)
+        sample_audit_payload = build_outcome_sample_payload(
+            store,
+            days=review_days,
+            limit=OUTCOME_SAMPLE_AUDIT_LIMIT,
+            start_date=review_start,
+            end_date=review_end,
+        )
+        sample_audit_text = format_outcome_sample_payload(sample_audit_payload)
+        payload = {
+            "workspace_dir": str(workspace_dir),
+            "database_path": str(store.database_path.resolve()),
+            "run_id": selected_run_id,
+            "window_days": historical_effect_review["review_window"]["window_days"],
+            "limit": limit,
+            "review_scope": target_paths["review_scope"],
+            "review_scope_label": target_paths["review_scope_label"],
+            "review_slug": target_paths["review_slug"],
+            "output_dir": str(target_paths["output_dir"]),
+            "performance_review_path": str(target_paths["performance_review_path"]),
+            "payload_path": str(target_paths["payload_path"]),
+            "sample_audit_path": str(target_paths["sample_audit_path"]),
+            "sample_audit_payload_path": str(target_paths["sample_audit_payload_path"]),
+            "historical_effect_review": historical_effect_review,
+            "sample_audit": sample_audit_payload,
+            "current_run": run_detail,
+            "current_strategy_report": strategy_report,
+            "health_summary": health_summary,
+        }
+        _write_report(target_paths["performance_review_path"], performance_review_text)
+        _write_json(target_paths["payload_path"], payload)
+        _write_report(target_paths["sample_audit_path"], sample_audit_text)
+        _write_json(target_paths["sample_audit_payload_path"], sample_audit_payload)
+        return payload
+
+    payload = _write_review_bundle(window=requested_window, target_paths=output_paths)
+    monthly_review_outputs: list[dict[str, Any]] = []
+    if payload["review_scope"] == "rolling":
+        reference_day = _parse_local_date(payload["historical_effect_review"]["review_window"]["end_date"])
+        for month_token_item in _iter_recent_month_tokens(reference_day=reference_day, count=ACTIVE_MONTHLY_REVIEW_MONTHS):
+            month_window = _resolve_month_review_window(month_token_item)
+            month_paths = _resolve_historical_effect_output_paths(
+                workspace_dir=workspace_dir,
+                window=month_window,
+                days=month_window["window_days"],
+                month=month_token_item,
+            )
+            month_payload = _write_review_bundle(window=month_window, target_paths=month_paths)
+            monthly_review_outputs.append(
+                {
+                    "month": month_token_item,
+                    "performance_review_path": month_payload["performance_review_path"],
+                    "payload_path": month_payload["payload_path"],
+                    "sample_audit_path": month_payload["sample_audit_path"],
+                }
+            )
+    payload["monthly_review_outputs"] = monthly_review_outputs
+    _write_json(Path(payload["payload_path"]), payload)
     return payload
 
 
 def format_performance_review_result(payload: dict) -> str:
     review = payload.get("historical_effect_review") or {}
     window = review.get("review_window") or {}
-    return "\n".join(
-        [
-            "历史效果复盘：",
-            f"工作目录：{payload.get('workspace_dir', '-')}",
-            f"数据库：{payload.get('database_path', '-')}",
-            f"参考运行：{payload.get('run_id', '-') or '-'}",
-            f"状态：{review.get('status', '-')}",
-            f"复盘口径版本：{review.get('review_version', '-')}",
-            f"统计区间：{window.get('start_date', '-')} ~ {window.get('end_date', '-')}",
-            f"样本抽检：{payload.get('sample_audit_path', '-')}",
-            f"报告文件：{payload.get('performance_review_path', '-')}",
-            f"结构化数据：{payload.get('payload_path', '-')}",
-        ]
-    )
+    lines = [
+        "历史效果复盘：",
+        f"工作目录：{payload.get('workspace_dir', '-')}",
+        f"数据库：{payload.get('database_path', '-')}",
+        f"参考运行：{payload.get('run_id', '-') or '-'}",
+        f"输出类型：{payload.get('review_scope_label', '-')}",
+        f"状态：{review.get('status', '-')}",
+        f"复盘口径版本：{review.get('review_version', '-')}",
+        f"统计区间：{window.get('start_date', '-')} ~ {window.get('end_date', '-')}",
+        f"样本抽检：{payload.get('sample_audit_path', '-')}",
+        f"报告文件：{payload.get('performance_review_path', '-')}",
+        f"结构化数据：{payload.get('payload_path', '-')}",
+    ]
+    monthly_outputs = payload.get("monthly_review_outputs") or []
+    if monthly_outputs:
+        lines.append(f"同步月报：{len(monthly_outputs)} 份")
+        for item in monthly_outputs:
+            lines.append(f"  - {item.get('month', '-')}: {item.get('performance_review_path', '-')}")
+    return "\n".join(lines)
 
 
 def _should_refresh_historical_effect_review(*, workspace_dir: Path, min_interval_seconds: int) -> bool:
@@ -3343,6 +4355,9 @@ def write_live_run_artifacts(
         "review_path": str(review_path),
         "historical_effect_review_path": historical_effect_review_path,
         "historical_effect_review_refreshed": should_refresh_historical_effect,
+        "historical_effect_monthly_outputs": (
+            historical_effect_payload.get("monthly_review_outputs", []) if should_refresh_historical_effect else []
+        ),
         "llm_usage_report_path": llm_usage_report_path,
         "llm_usage_report_refreshed": should_refresh_llm_usage,
         "payload_path": str(payload_path),
@@ -3353,27 +4368,35 @@ def format_live_run_artifacts(payload: dict) -> str:
     historical_effect_line = f"历史效果复盘：{payload.get('historical_effect_review_path', '-')}"
     if not payload.get("historical_effect_review_refreshed", True):
         historical_effect_line += "（本轮沿用上次刷新）"
+    monthly_outputs = payload.get("historical_effect_monthly_outputs") or []
     llm_usage_line = f"LLM 用量报告：{payload.get('llm_usage_report_path', '-')}"
     if not payload.get("llm_usage_report_refreshed", True):
         llm_usage_line += "（本轮沿用上次刷新）"
-    return "\n".join(
+    lines = [
+        "实时运行结果已落盘：",
+        f"运行 ID：{payload.get('run_id', '-')}",
+        (
+            "后验回补："
+            f"最近 {((payload.get('outcome_backfill') or {}).get('days', '-'))} 天，"
+            f"扫描 {((payload.get('outcome_backfill') or {}).get('scanned', 0))} / "
+            f"更新 {((payload.get('outcome_backfill') or {}).get('updated', 0))} / "
+            f"跳过 {((payload.get('outcome_backfill') or {}).get('skipped', 0))} / "
+            f"补 bars {((payload.get('outcome_backfill') or {}).get('fetched_symbols', 0))}"
+        ),
+        f"运行过程复盘：{payload.get('review_path', '-')}",
+        historical_effect_line,
+    ]
+    if monthly_outputs:
+        lines.append(f"同步月报：{len(monthly_outputs)} 份")
+        for item in monthly_outputs:
+            lines.append(f"  - {item.get('month', '-')}: {item.get('performance_review_path', '-')}")
+    lines.extend(
         [
-            "实时运行结果已落盘：",
-            f"运行 ID：{payload.get('run_id', '-')}",
-            (
-                "后验回补："
-                f"最近 {((payload.get('outcome_backfill') or {}).get('days', '-'))} 天，"
-                f"扫描 {((payload.get('outcome_backfill') or {}).get('scanned', 0))} / "
-                f"更新 {((payload.get('outcome_backfill') or {}).get('updated', 0))} / "
-                f"跳过 {((payload.get('outcome_backfill') or {}).get('skipped', 0))} / "
-                f"补 bars {((payload.get('outcome_backfill') or {}).get('fetched_symbols', 0))}"
-            ),
-            f"运行过程复盘：{payload.get('review_path', '-')}",
-            historical_effect_line,
             llm_usage_line,
             f"结构化数据：{payload.get('payload_path', '-')}",
         ]
     )
+    return "\n".join(lines)
 
 
 def format_live_cycle_started(*, started_at, workspace_dir: Path) -> str:
@@ -3508,6 +4531,7 @@ def _build_preview_notification_card(
     *,
     symbol: str = "NVDA",
     watch_mode: bool = False,
+    degraded_formal_mode: bool = False,
 ) -> OpportunityCard:
     now = utcnow()
     normalized_symbol = symbol.upper()
@@ -3556,24 +4580,101 @@ def _build_preview_notification_card(
             prewatch_setup_type="pullback_watch",
             positioning_hint="当前先放入观察名单，不追价，等结构和催化进一步确认后再升级。",
         )
+    if degraded_formal_mode:
+        return OpportunityCard(
+            card_id=f"preview-formal-degraded:{normalized_symbol}",
+            event_id=f"preview-formal-degraded-event:{normalized_symbol}",
+            symbol=normalized_symbol,
+            horizon="swing",
+            event_type="earnings",
+            headline_summary="模拟正式信号降级场景，用于预览执行信号被自动降级后的展示效果。",
+            bull_case="若盘后关键数据继续超预期，且次日放量脱离震荡区，后续仍可能重新升级为正式机会。",
+            bear_case="若结构继续横盘且预期盈亏比不足，贸然按正式卡执行更容易陷入低质量交易。",
+            event_score=84.0,
+            market_score=66.0,
+            final_score=77.8,
+            entry_range=PriceRange(199.85, 204.28),
+            take_profit_range=PriceRange(207.50, 211.40),
+            invalidation_level=194.08,
+            invalidation_reason="若价格跌破事件触发后的关键支撑位，做多逻辑失效。",
+            risk_notes=["财报后波动往往放大，过紧止损容易被噪音触发。"],
+            source_refs=[
+                "https://www.sec.gov/ixviewer/doc",
+                "https://www.reuters.com/world/us/example",
+                "https://news.google.com/articles/preview-amd",
+            ],
+            created_at=now,
+            ttl=now + timedelta(days=4),
+            priority="high",
+            dedup_key=f"preview-formal-degraded:{normalized_symbol}",
+            bias="long",
+            display_name=display_name,
+            action_label="确认做多",
+            confidence_label="高",
+            confidence_score=82.0,
+            reason_to_watch="事件强度已经够，但当前价格结构和预期盈亏比还不够理想，适合先看次日量价确认。",
+            trend_state="neutral",
+            rsi_14=49.6,
+            relative_volume=0.26,
+            theme_tags=theme_tags,
+            chain_summary="今日试探建仓 -> 今日确认做多",
+            market_regime="neutral",
+            rate_risk="medium",
+            geopolitical_risk="low",
+            macro_risk_score=40.0,
+            positioning_hint="先盯次日量价是否转强，再决定是否重新升级为正式机会。",
+            execution_eligible=False,
+            execution_note="按当前入场区、止盈区和失效价估算，预期盈亏比不足，先降级为观察。",
+            llm_summary="AMD 财报事件本身较强，但当前仍处在震荡区，且量能明显不足。",
+            llm_impact_inference="若次日放量脱离震荡区，才更像可重新升级的正式机会。",
+            llm_reasoning="财报催化够强，但当前预期盈亏比不足，先观察比直接执行更稳。",
+            llm_uncertainty="若管理层指引偏保守，股价可能快速回落。",
+        )
     return OpportunityCard(
         card_id=f"preview-formal:{normalized_symbol}",
         event_id=f"preview-formal-event:{normalized_symbol}",
         symbol=normalized_symbol,
         horizon="swing",
-        event_type="strategic",
-        headline_summary="模拟正式卡片，用于预览当前 LLM 文案和完整通知渲染效果。",
-        bull_case="若事件兑现顺利，叙事会继续强化，短线资金更容易沿主线加速交易。",
-        bear_case="若预期兑现不足或量能回落，强势信号容易迅速降温。",
-        event_score=82.0,
-        market_score=76.0,
-        final_score=79.6,
-        entry_range=PriceRange(100.0, 102.0),
-        take_profit_range=PriceRange(108.0, 112.0),
-        invalidation_level=97.0,
-        invalidation_reason="模拟卡片，不作为真实交易依据。",
-        risk_notes=["模拟预览用卡片", "正式执行前需结合真实行情与事件确认"],
-        source_refs=["https://example.com/preview-alert"],
+        event_type="strategic" if normalized_symbol == "PLTR" else "strategic",
+        headline_summary=(
+            "PLTR 扩大战略合作与商业化落地，适合预览更接近真实正式卡的文案结构。"
+            if normalized_symbol == "PLTR"
+            else "模拟正式卡片，用于预览当前 LLM 文案和完整通知渲染效果。"
+        ),
+        bull_case=(
+            "若合作规模与兑现路径继续明朗，软件与大模型应用叙事更容易获得资金继续跟随。"
+            if normalized_symbol == "PLTR"
+            else "若事件兑现顺利，叙事会继续强化，短线资金更容易沿主线加速交易。"
+        ),
+        bear_case=(
+            "若合作细节长期模糊，市场可能把这轮上涨当成预期交易并快速回吐。"
+            if normalized_symbol == "PLTR"
+            else "若预期兑现不足或量能回落，强势信号容易迅速降温。"
+        ),
+        event_score=81.95 if normalized_symbol == "PLTR" else 82.0,
+        market_score=70.75 if normalized_symbol == "PLTR" else 76.0,
+        final_score=77.47 if normalized_symbol == "PLTR" else 79.6,
+        entry_range=PriceRange(150.67, 155.20) if normalized_symbol == "PLTR" else PriceRange(100.0, 102.0),
+        take_profit_range=PriceRange(178.65, 192.72) if normalized_symbol == "PLTR" else PriceRange(108.0, 112.0),
+        invalidation_level=145.82 if normalized_symbol == "PLTR" else 97.0,
+        invalidation_reason=(
+            "若价格跌破事件触发后的关键支撑位，做多逻辑失效。"
+            if normalized_symbol == "PLTR"
+            else "模拟卡片，不作为真实交易依据。"
+        ),
+        risk_notes=(
+            ["若后续无法披露具体合作细节，市场可能因预期落空而抛售。"]
+            if normalized_symbol == "PLTR"
+            else ["模拟预览用卡片", "正式执行前需结合真实行情与事件确认"]
+        ),
+        source_refs=(
+            [
+                "https://www.reuters.com/world/us/example-pltr",
+                "https://news.google.com/articles/preview-pltr",
+            ]
+            if normalized_symbol == "PLTR"
+            else ["https://example.com/preview-alert"]
+        ),
         created_at=now,
         ttl=now + timedelta(days=5),
         priority="high",
@@ -3582,18 +4683,100 @@ def _build_preview_notification_card(
         display_name=display_name,
         action_label="确认做多",
         confidence_label="高",
-        confidence_score=84.0,
-        reason_to_watch="如果当前文案读起来足够清楚，说明 Qwen 生成链路已经适合继续上线观察。",
-        trend_state="bullish",
-        rsi_14=61.5,
-        relative_volume=1.72,
-        theme_tags=theme_tags,
-        chain_summary="昨晚试探建仓 -> 今日升级确认做多",
-        market_regime="risk_on",
+        confidence_score=82.0 if normalized_symbol == "PLTR" else 84.0,
+        reason_to_watch=(
+            "合作规模与兑现路径已经基本过线，当前更适合按价格计划执行，而不是继续停留在观察层。"
+            if normalized_symbol == "PLTR"
+            else "如果当前文案读起来足够清楚，说明 Qwen 生成链路已经适合继续上线观察。"
+        ),
+        trend_state="neutral" if normalized_symbol == "PLTR" else "bullish",
+        rsi_14=53.3 if normalized_symbol == "PLTR" else 61.5,
+        relative_volume=0.52 if normalized_symbol == "PLTR" else 1.72,
+        theme_tags=theme_tags or (["AI软件与大模型应用"] if normalized_symbol == "PLTR" else theme_tags),
+        chain_summary="今日试探建仓 -> 今日确认做多" if normalized_symbol == "PLTR" else "昨晚试探建仓 -> 今日升级确认做多",
+        market_regime="neutral" if normalized_symbol == "PLTR" else "risk_on",
         rate_risk="medium",
         geopolitical_risk="low",
-        macro_risk_score=25.0,
-        positioning_hint="适合按价格计划跟随，不适合追高扩仓。",
+        macro_risk_score=35.0 if normalized_symbol == "PLTR" else 25.0,
+        positioning_hint=(
+            "当前更适合按价格计划执行，不适合因为题材热度直接脱离入场区追高。"
+            if normalized_symbol == "PLTR"
+            else "适合按价格计划跟随，不适合追高扩仓。"
+        ),
+        llm_reasoning=(
+            "合作规模与兑现路径已基本过线，这里更像可执行机会而不是继续观察。"
+            if normalized_symbol == "PLTR"
+            else "事件与市场确认共振，当前可按计划执行。"
+        ),
+        llm_uncertainty=(
+            "若合作细节迟迟不清，市场可能先卖预期。"
+            if normalized_symbol == "PLTR"
+            else "若量能衰减，强势信号可能迅速降温。"
+        ),
+        llm_summary=(
+            "PLTR 的战略合作与商业化兑现路径正在变清楚，当前更接近正式机会。"
+            if normalized_symbol == "PLTR"
+            else ""
+        ),
+        llm_impact_inference=(
+            "若合作规模和兑现节奏继续明朗，软件与大模型应用主线更容易获得资金继续跟随。"
+            if normalized_symbol == "PLTR"
+            else ""
+        ),
+    )
+
+
+def _build_preview_exit_pool_card(
+    runtime_config: AgentRuntimeConfig,
+    *,
+    symbol: str = "NVDA",
+) -> OpportunityCard:
+    now = utcnow()
+    normalized_symbol = symbol.upper()
+    display_name = _preview_display_name(runtime_config, normalized_symbol)
+    theme_tags = _preview_theme_tags(runtime_config, normalized_symbol)
+    return OpportunityCard(
+        card_id=f"preview-exit:{normalized_symbol}",
+        event_id=f"preview-exit-event:{normalized_symbol}",
+        symbol=normalized_symbol,
+        horizon="position",
+        event_type="strategic",
+        headline_summary="模拟兑现池卡片，用于预览从确认到兑现的完整提示效果。",
+        bull_case="前期进攻逻辑已兑现一部分，当前重点不再是找新买点，而是管好已有利润。",
+        bear_case="若继续把兑现卡当成新开仓信号，容易在高位追入或回吐已有浮盈。",
+        event_score=79.0,
+        market_score=73.0,
+        final_score=81.0,
+        entry_range=PriceRange(100.0, 102.0),
+        take_profit_range=PriceRange(110.0, 116.0),
+        invalidation_level=97.0,
+        invalidation_reason="模拟卡片，不作为真实交易依据。",
+        risk_notes=["模拟预览用卡片", "兑现池卡不代表新的开仓信号"],
+        source_refs=["https://example.com/preview-alert"],
+        created_at=now,
+        ttl=now + timedelta(days=2),
+        priority="high",
+        dedup_key=f"preview-exit:{normalized_symbol}",
+        bias="long",
+        display_name=display_name,
+        action_label="进入兑现池",
+        confidence_label="高",
+        confidence_score=86.0,
+        reason_to_watch="价格已进入目标区更深位置，当前更适合按计划兑现利润，而不是继续当作进攻卡处理。",
+        trend_state="bullish",
+        rsi_14=67.3,
+        relative_volume=1.46,
+        theme_tags=theme_tags,
+        chain_summary="3天前确认做多 -> 今日进入兑现池",
+        market_regime="neutral",
+        rate_risk="medium",
+        geopolitical_risk="low",
+        macro_risk_score=42.0,
+        positioning_hint="已到达目标区更深位置，优先兑现利润，不再继续追新仓。",
+        execution_eligible=False,
+        execution_note="兑现池卡只面向已有仓位管理。",
+        exit_pool_subreason="target_hit",
+        exit_pool_source_decision_id="preview-confirm-decision",
     )
 
 
@@ -3603,18 +4786,41 @@ def _build_preview_event_insight(symbol: str) -> EventInsight:
     return EventInsight(
         event_id=f"preview-insight:{normalized_symbol}",
         symbol=normalized_symbol,
-        event_type="strategic",
-        headline_summary="公司宣布扩大与 AI 基建相关的合作与投入。",
-        bull_case="合作落地会强化市场对后续订单与资本开支扩张的预期。",
-        bear_case="若合作更多停留在叙事层，市场可能快速回吐短线溢价。",
-        importance=84.0,
+        event_type="earnings" if normalized_symbol == "AMD" else "strategic",
+        headline_summary=(
+            "AMD 发布财报并给出后续指引，市场重点会盯核心业务与管理层表态。"
+            if normalized_symbol == "AMD"
+            else "公司宣布扩大与 AI 基建相关的合作与投入。"
+        ),
+        bull_case=(
+            "若数据中心、AI 相关指引继续强化，市场更容易把这次财报当成中短期催化。"
+            if normalized_symbol == "AMD"
+            else "合作落地会强化市场对后续订单与资本开支扩张的预期。"
+        ),
+        bear_case=(
+            "若管理层指引偏保守或盈利兑现不及预期，股价可能快速回落。"
+            if normalized_symbol == "AMD"
+            else "若合作更多停留在叙事层，市场可能快速回吐短线溢价。"
+        ),
+        importance=86.0 if normalized_symbol == "AMD" else 84.0,
         source_credibility=86.0,
         novelty=72.0,
         sentiment=0.70,
         theme_relevance=90.0,
         llm_confidence=80.0,
-        risk_notes=["兑现节奏低于预期是主要失败点。"],
-        source_refs=["https://example.com/preview-alert"],
+        risk_notes=(
+            ["若次日仍无法放量脱离震荡区，强事件也可能先变成预期盈亏比不足的观察样本。"]
+            if normalized_symbol == "AMD"
+            else ["兑现节奏低于预期是主要失败点。"]
+        ),
+        source_refs=(
+            [
+                "https://www.sec.gov/ixviewer/doc",
+                "https://www.reuters.com/world/us/example-amd",
+            ]
+            if normalized_symbol == "AMD"
+            else ["https://example.com/preview-alert"]
+        ),
         raw_payload={"mode": "preview"},
         created_at=now,
     )
@@ -3628,8 +4834,34 @@ def build_preview_alert_payload(
     symbol: str = "NVDA",
     watch_mode: bool = False,
     prewatch_light: bool = False,
+    exit_pool_mode: bool = False,
+    degraded_formal_mode: bool = False,
 ) -> dict[str, Any]:
     llm_used = False
+
+    def _merge_preview_narrative(base_card: OpportunityCard, narrative) -> OpportunityCard:
+        return OpportunityCard(
+            **{
+                **base_card.__dict__,
+                "llm_summary": narrative.summary or base_card.llm_summary,
+                "llm_impact_inference": narrative.impact_inference or base_card.llm_impact_inference,
+                "llm_reasoning": narrative.reasoning or base_card.llm_reasoning,
+                "llm_uncertainty": narrative.uncertainty or base_card.llm_uncertainty,
+                "narrative_priority_adjustment": (
+                    narrative.priority_adjustment
+                    if any(
+                        [
+                            narrative.summary,
+                            narrative.impact_inference,
+                            narrative.reasoning,
+                            narrative.uncertainty,
+                        ]
+                    )
+                    else base_card.narrative_priority_adjustment
+                ),
+            }
+        )
+
     if prewatch_light:
         service = build_service(
             settings,
@@ -3641,7 +4873,7 @@ def build_preview_alert_payload(
             horizon="position",
             setup_type="pullback_watch",
             score=78.0,
-            headline_summary="模拟预备池轻推送，用于预览当前轻推正文与 LLM 文案效果。",
+            headline_summary="模拟观察提醒，用于预览当前提醒正文与 LLM 文案效果。",
             action_hint="轻仓观察",
             reason_to_watch="先盯合作细节、订单金额和时间表是否继续落地，再决定是否升级。",
             last_price=100.0,
@@ -3672,8 +4904,8 @@ def build_preview_alert_payload(
                 card.llm_uncertainty,
             ]
         )
-    else:
-        card = _build_preview_notification_card(runtime_config, symbol=symbol, watch_mode=watch_mode)
+    elif exit_pool_mode:
+        card = _build_preview_exit_pool_card(runtime_config, symbol=symbol)
         insight = _build_preview_event_insight(card.symbol)
         if settings.openai_api_key and settings.use_llm_narration:
             narrator = OpenAINarrator(
@@ -3690,16 +4922,39 @@ def build_preview_alert_payload(
                 theme_text=" / ".join(card.theme_tags) if card.theme_tags else "未标注",
                 chain_summary=card.chain_summary or "首次出现",
             )
-            card = OpportunityCard(
-                **{
-                    **card.__dict__,
-                    "llm_summary": narrative.summary,
-                    "llm_impact_inference": narrative.impact_inference,
-                    "llm_reasoning": narrative.reasoning,
-                    "llm_uncertainty": narrative.uncertainty,
-                    "narrative_priority_adjustment": narrative.priority_adjustment,
-                }
+            card = _merge_preview_narrative(card, narrative)
+            llm_used = any(
+                [
+                    narrative.summary,
+                    narrative.impact_inference,
+                    narrative.reasoning,
+                    narrative.uncertainty,
+                ]
             )
+    else:
+        card = _build_preview_notification_card(
+            runtime_config,
+            symbol=symbol,
+            watch_mode=watch_mode,
+            degraded_formal_mode=degraded_formal_mode,
+        )
+        insight = _build_preview_event_insight(card.symbol)
+        if settings.openai_api_key and settings.use_llm_narration:
+            narrator = OpenAINarrator(
+                api_key=settings.openai_api_key,
+                model=settings.openai_model,
+                base_url=settings.openai_base_url,
+            )
+            narrative = narrator.narrate(
+                insight=insight,
+                card=card,
+                market_regime=card.market_regime or "neutral",
+                rate_risk=card.rate_risk or "low",
+                geopolitical_risk=card.geopolitical_risk or "low",
+                theme_text=" / ".join(card.theme_tags) if card.theme_tags else "未标注",
+                chain_summary=card.chain_summary or "首次出现",
+            )
+            card = _merge_preview_narrative(card, narrative)
             llm_used = any(
                 [
                     narrative.summary,
@@ -3710,16 +4965,70 @@ def build_preview_alert_payload(
             )
     notifier = Notifier(store=store, transport=None, dry_run=True)
     transport = FeishuTransport("https://example.com/preview-webhook")
+    render_view = build_render_view(card)
     return {
         "symbol": card.symbol,
         "watch_mode": watch_mode,
         "prewatch_light": prewatch_light,
+        "exit_pool_mode": exit_pool_mode,
+        "degraded_formal_mode": degraded_formal_mode,
         "llm_enabled": bool(settings.openai_api_key and settings.use_llm_narration),
         "llm_used": llm_used,
         "title": f"[预备池] {notifier._title(card)}" if prewatch_light else notifier._title(card),
         "body": notifier._body(card),
         "delivery_view": build_delivery_view_from_record(card.to_record()),
+        "render_view": {
+            "card_type": render_view["card_type"],
+            "action_label": render_view["action_label"],
+            "downgraded_to_watch": render_view["downgraded_to_watch"],
+            "downgrade_reason": render_view["downgrade_reason"],
+            "render_warning": render_view["render_warning"],
+            "chain_summary": render_view["chain_summary"],
+        },
         "feishu_card": transport._build_interactive_payload(card),
+    }
+
+
+def _preview_mode_metadata(
+    *,
+    watch_mode: bool = False,
+    prewatch_light: bool = False,
+    exit_pool_mode: bool = False,
+    degraded_formal_mode: bool = False,
+) -> dict[str, str]:
+    if prewatch_light:
+        return {
+            "mode_label": "观察提醒",
+            "use_case": "预备池分数已经够高，但还没到正式执行阶段，适合用低打扰方式提醒你先盯住。",
+            "not_for": "不适合拿来直接开仓，也不适合替代完整观察卡做深度判断。",
+            "operator_hint": "先看催化是否继续落地，再决定是否升级成确认机会。",
+        }
+    if exit_pool_mode:
+        return {
+            "mode_label": "兑现池管理卡",
+            "use_case": "已有浮盈仓位进入止盈或利润保护阶段，适合用来管理仓位和兑现节奏。",
+            "not_for": "不适合当成新的开仓信号，也不适合在没有持仓时单独使用。",
+            "operator_hint": "优先结合原目标区和当前强弱，决定分批止盈还是先锁定大部分利润。",
+        }
+    if degraded_formal_mode:
+        return {
+            "mode_label": "自动降级观察卡",
+            "use_case": "事件强度已接近正式卡，但因为盈亏比、结构或量能条件不够，被系统自动降级为观察卡。",
+            "not_for": "不适合把高事件分误当成可直接执行的正式机会，也不适合忽略降级原因盲目追单。",
+            "operator_hint": "重点看降级原因和次日量价是否改善，只有条件补齐后再重新升级为正式机会。",
+        }
+    if watch_mode:
+        return {
+            "mode_label": "预备池观察卡",
+            "use_case": "事件或结构开始有苗头，但确认度还不够，适合先纳入观察名单。",
+            "not_for": "不适合把这张卡直接当成执行依据，也不适合在信号尚弱时追价。",
+            "operator_hint": "重点盯后续催化、量能和结构确认，满足条件后再升级为正式操作卡。",
+        }
+    return {
+        "mode_label": "正式操作卡",
+        "use_case": "事件强度和市场确认已经基本过线，适合结合价格计划做执行判断。",
+        "not_for": "不适合脱离价格计划盲目追高，也不适合忽略失效位单独看多。",
+        "operator_hint": "把它当成可执行机会，但仍要按入场区、止盈区和失效位来处理仓位。",
     }
 
 
@@ -3755,15 +5064,26 @@ def format_test_notification_result(payload: dict) -> str:
 
 
 def format_preview_alert_result(payload: dict) -> str:
-    if payload.get("prewatch_light"):
-        mode_text = "预备池轻推送"
-    else:
-        mode_text = "预备池观察卡" if payload.get("watch_mode") else "正式操作卡"
+    mode_text = _preview_mode_metadata(
+        watch_mode=bool(payload.get("watch_mode")),
+        prewatch_light=bool(payload.get("prewatch_light")),
+        exit_pool_mode=bool(payload.get("exit_pool_mode")),
+        degraded_formal_mode=bool(payload.get("degraded_formal_mode")),
+    )["mode_label"]
+    render_view = payload.get("render_view") or {}
+    card_type = str(render_view.get("card_type") or "-")
+    action_label = str(render_view.get("action_label") or "-")
+    downgraded = bool(render_view.get("downgraded_to_watch"))
+    downgrade_reason = str(render_view.get("downgrade_reason") or "")
     return "\n".join(
         [
             "本地预览卡片：",
             f"模式：{mode_text}",
             f"标的：{payload.get('symbol', '-')}",
+            f"最终卡型：{card_type}",
+            f"最终动作：{action_label}",
+            f"自动降级：{'是' if downgraded else '否'}",
+            *( [f"降级原因：{downgrade_reason}"] if downgrade_reason else [] ),
             f"LLM 已启用：{'是' if payload.get('llm_enabled') else '否'}",
             f"LLM 实际参与：{'是' if payload.get('llm_used') else '否'}",
             "",
@@ -3792,6 +5112,8 @@ def build_demo_flow_payload(
     batch_spec_path = batch_spec_path.resolve()
     replay_report_path = workspace_dir / "demo_replay_report.md"
     replay_json_path = workspace_dir / "demo_replay_payload.json"
+    preview_report_path = workspace_dir / "demo_preview_cards.md"
+    preview_json_path = workspace_dir / "demo_preview_cards.json"
     batch_spec_copy_path = workspace_dir / "demo_batch_spec.json"
     batch_index_path = workspace_dir / "batch_index.md"
     batch_output_dir = workspace_dir / "batch_runs"
@@ -3841,6 +5163,64 @@ def build_demo_flow_payload(
     )
     _write_json(promoted_config_path, promoted_config_payload)
 
+    preview_store = Store(workspace_dir / "demo_preview.db")
+    preview_store.initialize()
+    preview_specs = [
+        ("formal", {"symbol": "PLTR", "watch_mode": False, "prewatch_light": False, "exit_pool_mode": False}),
+        (
+            "formal_downgraded",
+            {"symbol": "AMD", "watch_mode": False, "prewatch_light": False, "exit_pool_mode": False, "degraded_formal_mode": True},
+        ),
+        ("watch", {"symbol": "NVDA", "watch_mode": True, "prewatch_light": False, "exit_pool_mode": False}),
+        ("prewatch_light", {"symbol": "NBIS", "watch_mode": False, "prewatch_light": True, "exit_pool_mode": False}),
+        ("exit_pool", {"symbol": "NVDA", "watch_mode": False, "prewatch_light": False, "exit_pool_mode": True}),
+    ]
+    preview_payloads: list[dict[str, Any]] = []
+    preview_lines = ["卡片预览联调："]
+    try:
+        for mode_name, spec in preview_specs:
+            preview_payload = build_preview_alert_payload(
+                settings,
+                runtime_config,
+                preview_store,
+                symbol=spec["symbol"],
+                watch_mode=spec["watch_mode"],
+                prewatch_light=spec["prewatch_light"],
+                exit_pool_mode=spec["exit_pool_mode"],
+                degraded_formal_mode=spec.get("degraded_formal_mode", False),
+            )
+            mode_metadata = _preview_mode_metadata(
+                watch_mode=spec["watch_mode"],
+                prewatch_light=spec["prewatch_light"],
+                exit_pool_mode=spec["exit_pool_mode"],
+                degraded_formal_mode=spec.get("degraded_formal_mode", False),
+            )
+            preview_payload["mode_name"] = mode_name
+            preview_payload.update(mode_metadata)
+            preview_payloads.append(preview_payload)
+            render_view = preview_payload.get("render_view") or {}
+            preview_lines.extend(
+                [
+                    "",
+                    f"[{mode_name}] {preview_payload.get('title', '')}",
+                    f"模式：{mode_metadata['mode_label']}",
+                    f"标的：{preview_payload.get('symbol', '-')}",
+                    f"最终卡型：{render_view.get('card_type', '-')}",
+                    f"最终动作：{render_view.get('action_label', '-')}",
+                    f"自动降级：{'是' if render_view.get('downgraded_to_watch') else '否'}",
+                    *([f"降级原因：{render_view.get('downgrade_reason', '')}"] if render_view.get("downgrade_reason") else []),
+                    f"适用场景：{mode_metadata['use_case']}",
+                    f"不适用场景：{mode_metadata['not_for']}",
+                    f"使用提示：{mode_metadata['operator_hint']}",
+                    "正文：",
+                    str(preview_payload.get("body", "")),
+                ]
+            )
+    finally:
+        preview_store.close()
+    _write_report(preview_report_path, "\n".join(preview_lines))
+    _write_json(preview_json_path, {"items": preview_payloads})
+
     recommendation = batch_payload.get("recommendation") or {}
     next_step = batch_payload.get("next_step") or {}
     replay_run = replay_payload.get("run") or {}
@@ -3851,6 +5231,11 @@ def build_demo_flow_payload(
             "status": replay_run.get("status", ""),
             "report_path": str(replay_report_path),
             "payload_path": str(replay_json_path),
+        },
+        "preview": {
+            "report_path": str(preview_report_path),
+            "payload_path": str(preview_json_path),
+            "mode_count": len(preview_payloads),
         },
         "batch": {
             "batch_id": batch_payload.get("batch_id", ""),
@@ -3868,6 +5253,7 @@ def build_demo_flow_payload(
 
 def format_demo_flow(payload: dict) -> str:
     replay = payload.get("replay", {})
+    preview = payload.get("preview", {})
     batch = payload.get("batch", {})
     lines = [
         "初版流程联调：",
@@ -3875,6 +5261,9 @@ def format_demo_flow(payload: dict) -> str:
         f"Replay 运行：run_id={replay.get('run_id', '-')} status={replay.get('status', '-')}",
         f"Replay 报告：{replay.get('report_path', '-')}",
         f"Replay 数据：{replay.get('payload_path', '-')}",
+        f"卡片预览：{preview.get('report_path', '-')}",
+        f"预览数据：{preview.get('payload_path', '-')}",
+        f"预览模式数：{preview.get('mode_count', '-')}",
         f"Batch 批次：{batch.get('batch_id', '-')}",
         f"Batch 规格：{batch.get('spec_path', '-')}",
         f"Batch 推荐：{batch.get('recommendation_name', '-')} ({batch.get('recommendation_config', '-')})",
@@ -3978,6 +5367,7 @@ def main() -> None:
     performance_report_parser.add_argument("--days", type=int, default=RECENT_PERFORMANCE_WINDOW_DAYS)
     performance_report_parser.add_argument("--start-date", default="", help="历史效果复盘起始日期，格式 YYYY-MM-DD")
     performance_report_parser.add_argument("--end-date", default="", help="历史效果复盘结束日期，格式 YYYY-MM-DD")
+    performance_report_parser.add_argument("--month", default="", help="活的月报月份，格式 YYYY-MM")
     performance_report_parser.add_argument("--limit", type=int, default=10)
     performance_report_parser.add_argument("--json", action="store_true")
 
@@ -4071,6 +5461,8 @@ def main() -> None:
     preview_alert_parser.add_argument("--symbol", default="NVDA")
     preview_alert_parser.add_argument("--watch", action="store_true")
     preview_alert_parser.add_argument("--prewatch-light", action="store_true")
+    preview_alert_parser.add_argument("--exit-pool", action="store_true")
+    preview_alert_parser.add_argument("--formal-downgraded", action="store_true")
     preview_alert_parser.add_argument("--json", action="store_true")
 
     promote_batch_parser = subparsers.add_parser("promote-batch")
@@ -4266,6 +5658,7 @@ def main() -> None:
             limit=args.limit,
             start_date=args.start_date,
             end_date=args.end_date,
+            month=args.month,
         )
         if args.json:
             print(json.dumps(payload, indent=2, sort_keys=True))
@@ -4511,6 +5904,8 @@ def main() -> None:
             symbol=args.symbol,
             watch_mode=args.watch,
             prewatch_light=args.prewatch_light,
+            exit_pool_mode=args.exit_pool,
+            degraded_formal_mode=args.formal_downgraded,
         )
         if args.json:
             print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))

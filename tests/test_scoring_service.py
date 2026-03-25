@@ -21,8 +21,10 @@ from satellite_agent.models import Bar, SourceEvent
 from satellite_agent.models import EventInsight, IndicatorSnapshot, OpportunityCard, PrewatchCandidate, PriceRange, utcnow
 from satellite_agent.notifier import Notifier
 from satellite_agent.observability import RunContext, StructuredLogger
+from satellite_agent.prewatch import build_prewatch_candidate
 from satellite_agent.scoring import SignalScorer
 from satellite_agent.service import (
+    SATELLITE_STRATEGY_VERSION,
     SatelliteAgentService,
     THEME_CONFIRMATION_CHAIN_BONUS,
     THEME_MEMORY_STATE_KEY,
@@ -409,6 +411,120 @@ class ScoringServiceTests(unittest.TestCase):
             self.assertEqual(result["events_processed"], 1)
             self.assertEqual(result["cards_generated"], 2)
             self.assertGreaterEqual(result["alerts_sent"], 1)
+            latest_run = store.load_latest_run()
+            self.assertIsNotNone(latest_run)
+            config_snapshot = json.loads(latest_run["config_snapshot_json"])
+            self.assertEqual(config_snapshot["strategy_version"], SATELLITE_STRATEGY_VERSION)
+            decision_rows = store.load_decision_records(latest_run["run_id"])
+            self.assertGreaterEqual(len(decision_rows), 1)
+            first_packet = json.loads(decision_rows[0]["packet_json"])
+            self.assertEqual(first_packet["strategy_version"], SATELLITE_STRATEGY_VERSION)
+            confirmation_rows = store.load_candidate_evaluations(latest_run["run_id"], stage="confirmation")
+            self.assertEqual(len(confirmation_rows), 2)
+            self.assertTrue(all(row["outcome"] == "selected" for row in confirmation_rows))
+            self.assertTrue(all(row["reason"] == "confirmation_opportunity" for row in confirmation_rows))
+            self.assertTrue(all(row["strategy_version"] == SATELLITE_STRATEGY_VERSION for row in confirmation_rows))
+
+    def test_confirmation_candidate_evaluations_capture_rejected_suppressed_cards(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = Store(Path(temp_dir) / "agent.db")
+            store.initialize()
+            store.seed_watchlist(["NVDA"], "stock")
+            settings = Settings(
+                dry_run=True,
+                database_path=Path(temp_dir) / "agent.db",
+                normal_alert_min_final_score=0.0,
+            ).with_strategy_overrides(
+                event_score_threshold=95.0,
+                horizons={
+                    "swing": {
+                        "market_score_threshold": 50.0,
+                        "priority_threshold": 60.0,
+                    },
+                    "position": {
+                        "market_score_threshold": 50.0,
+                        "priority_threshold": 60.0,
+                    },
+                },
+            )
+
+            class StaticMarketData:
+                def snapshot(self, symbol: str, horizon: str, include_intraday: bool = True):
+                    thresholds = {
+                        "swing": {
+                            "rsi": 66.0,
+                            "relative_volume": 1.45,
+                            "atr": 3.2,
+                            "support_20": 110.8,
+                            "resistance_20": 126.5,
+                            "support_60": 106.0,
+                            "resistance_60": 132.0,
+                            "intraday_breakout": True,
+                            "is_pullback": False,
+                        },
+                        "position": {
+                            "rsi": 63.0,
+                            "relative_volume": 1.28,
+                            "atr": 3.6,
+                            "support_20": 110.8,
+                            "resistance_20": 126.5,
+                            "support_60": 106.0,
+                            "resistance_60": 136.0,
+                            "intraday_breakout": False,
+                            "is_pullback": True,
+                        },
+                    }[horizon]
+                    return IndicatorSnapshot(
+                        symbol=symbol,
+                        horizon=horizon,
+                        as_of=utcnow(),
+                        last_price=113.5,
+                        rsi_14=thresholds["rsi"],
+                        atr_14=thresholds["atr"],
+                        sma_20=111.6,
+                        sma_60=108.2,
+                        relative_volume=thresholds["relative_volume"],
+                        support_20=thresholds["support_20"],
+                        resistance_20=thresholds["resistance_20"],
+                        support_60=thresholds["support_60"],
+                        resistance_60=thresholds["resistance_60"],
+                        gap_percent=0.0,
+                        intraday_breakout=thresholds["intraday_breakout"],
+                        is_pullback=thresholds["is_pullback"],
+                        trend_state="bullish",
+                        atr_percent=(thresholds["atr"] / 113.5) * 100,
+                    )
+
+            event = SourceEvent(
+                event_id="evt-nvda-suppressed",
+                source="Reuters",
+                source_type="news",
+                symbol="NVDA",
+                headline="Nvidia rises after analysts cite stronger AI server demand",
+                summary="Several desks lifted expectations after supply checks pointed to stronger near-term data center demand.",
+                published_at=utcnow() - timedelta(hours=2),
+                url="https://example.com/nvda-suppressed",
+            )
+            service = SatelliteAgentService(
+                settings=settings,
+                store=store,
+                source_adapter=StaticSourceAdapter([event]),
+                normalizer=EventNormalizer(),
+                extractor=RuleBasedExtractor(),
+                market_data=StaticMarketData(),
+                scorer=SignalScorer(settings),
+                entry_exit=EntryExitEngine(),
+                notifier=Notifier(store=store, transport=None, dry_run=True),
+            )
+
+            result = service.run_once()
+            self.assertEqual(result["alerts_sent"], 0)
+            latest_run = store.load_latest_run()
+            self.assertIsNotNone(latest_run)
+            confirmation_rows = store.load_candidate_evaluations(latest_run["run_id"], stage="confirmation")
+            self.assertEqual(len(confirmation_rows), 2)
+            self.assertTrue(all(row["outcome"] == "rejected" for row in confirmation_rows))
+            self.assertTrue(all(row["reason"] == "threshold_not_met" for row in confirmation_rows))
 
     def test_run_once_generates_degraded_event_only_card_when_market_data_fails_for_strong_event(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -533,6 +649,9 @@ class ScoringServiceTests(unittest.TestCase):
             self.assertTrue(promoted["promoted_from_prewatch"])
             self.assertEqual(promoted["prewatch_setup_type"], "breakout_watch")
             self.assertAlmostEqual(promoted["prewatch_score"], 81.5, places=2)
+            self.assertEqual(promoted["prewatch_observation_count"], 1)
+            self.assertEqual(promoted["prewatch_alert_sent_count"], 0)
+            self.assertIn("累计观察 1 次", promoted["prewatch_promotion_reason"])
             self.assertIn("此前已进入预备池", promoted["reason_to_watch"])
             self.assertIn("正式确认", promoted["positioning_hint"])
             self.assertAlmostEqual(
@@ -605,6 +724,163 @@ class ScoringServiceTests(unittest.TestCase):
                 )
             )
             self.assertGreater(nbis_candidate["score"], settings.prewatch_min_score)
+
+    def test_prewatch_scan_records_candidate_evaluation_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+            store.seed_watchlist(["AAA", "BBB", "CCC"], "stock")
+            settings = Settings(
+                dry_run=True,
+                database_path=db_path,
+                max_prewatch_candidates_per_run=5,
+                max_prewatch_scan_symbols_per_run=3,
+            )
+
+            class StaticMarketData:
+                def snapshot(self, symbol: str, horizon: str, include_intraday: bool = True):
+                    snapshots = {
+                        "AAA": IndicatorSnapshot(
+                            symbol="AAA",
+                            horizon=horizon,
+                            as_of=utcnow(),
+                            last_price=100.0,
+                            rsi_14=58.0,
+                            atr_14=2.0,
+                            sma_20=98.0,
+                            sma_60=95.0,
+                            relative_volume=1.8,
+                            support_20=97.0,
+                            resistance_20=103.0,
+                            support_60=94.0,
+                            resistance_60=108.0,
+                            gap_percent=0.0,
+                            intraday_breakout=True,
+                            is_pullback=False,
+                            trend_state="bullish",
+                            atr_percent=2.0,
+                        ),
+                        "BBB": IndicatorSnapshot(
+                            symbol="BBB",
+                            horizon=horizon,
+                            as_of=utcnow(),
+                            last_price=100.0,
+                            rsi_14=40.0,
+                            atr_14=2.0,
+                            sma_20=99.0,
+                            sma_60=96.0,
+                            relative_volume=0.9,
+                            support_20=97.0,
+                            resistance_20=103.0,
+                            support_60=94.0,
+                            resistance_60=108.0,
+                            gap_percent=0.0,
+                            intraday_breakout=False,
+                            is_pullback=False,
+                            trend_state="bullish",
+                            atr_percent=2.0,
+                        ),
+                    }
+                    return snapshots[symbol]
+
+            service = SatelliteAgentService(
+                settings=settings,
+                store=store,
+                source_adapter=StaticSourceAdapter([]),
+                normalizer=EventNormalizer(),
+                extractor=RuleBasedExtractor(),
+                market_data=StaticMarketData(),
+                scorer=SignalScorer(settings),
+                entry_exit=EntryExitEngine(),
+                notifier=Notifier(store=store, transport=None, dry_run=True),
+                prewatch_symbols=["AAA", "BBB", "CCC"],
+            )
+            def fake_build_single(symbol: str, horizon: str, horizon_settings, snapshot_cache):
+                snapshots = {
+                    "AAA": IndicatorSnapshot(
+                        symbol="AAA",
+                        horizon=horizon,
+                        as_of=utcnow(),
+                        last_price=100.0,
+                        rsi_14=58.0,
+                        atr_14=2.0,
+                        sma_20=98.0,
+                        sma_60=95.0,
+                        relative_volume=1.8,
+                        support_20=97.0,
+                        resistance_20=103.0,
+                        support_60=94.0,
+                        resistance_60=108.0,
+                        gap_percent=0.0,
+                        intraday_breakout=True,
+                        is_pullback=False,
+                        trend_state="bullish",
+                        atr_percent=2.0,
+                    ),
+                    "BBB": IndicatorSnapshot(
+                        symbol="BBB",
+                        horizon=horizon,
+                        as_of=utcnow(),
+                        last_price=100.0,
+                        rsi_14=40.0,
+                        atr_14=2.0,
+                        sma_20=99.0,
+                        sma_60=96.0,
+                        relative_volume=0.9,
+                        support_20=97.0,
+                        resistance_20=103.0,
+                        support_60=94.0,
+                        resistance_60=108.0,
+                        gap_percent=0.0,
+                        intraday_breakout=False,
+                        is_pullback=False,
+                        trend_state="bullish",
+                        atr_percent=2.0,
+                    ),
+                }
+                if symbol == "CCC":
+                    raise ValueError("simulated prewatch failure")
+                snapshot = snapshots[symbol]
+                candidate = build_prewatch_candidate(
+                    snapshot,
+                    horizon_settings,
+                    min_score=settings.prewatch_min_score,
+                )
+                return snapshot, candidate
+
+            service._build_single_prewatch_candidate = fake_build_single  # type: ignore[method-assign]
+
+            result = service.run_once()
+            latest_run = store.load_latest_run()
+            self.assertIsNotNone(latest_run)
+            latest_summary = json.loads(latest_run["summary_json"])
+            rows = store.load_candidate_evaluations(latest_run["run_id"], stage="prewatch")
+            self.assertEqual(result["prewatch_candidates"], 1)
+            self.assertEqual(latest_summary["prewatch_candidates_count"], 1)
+            self.assertEqual(len(rows), 3)
+
+            by_symbol = {row["symbol"]: row for row in rows}
+            aaa_payload = json.loads(by_symbol["AAA"]["payload_json"])
+            bbb_payload = json.loads(by_symbol["BBB"]["payload_json"])
+            ccc_payload = json.loads(by_symbol["CCC"]["payload_json"])
+
+            self.assertEqual(by_symbol["AAA"]["outcome"], "selected")
+            self.assertEqual(by_symbol["AAA"]["reason"], "ranked_in_run")
+            self.assertEqual(by_symbol["AAA"]["strategy_version"], SATELLITE_STRATEGY_VERSION)
+            self.assertEqual(aaa_payload["selected_rank"], 1)
+            self.assertGreater(float(aaa_payload["prewatch_score"]), settings.prewatch_min_score)
+
+            self.assertEqual(by_symbol["BBB"]["outcome"], "rejected")
+            self.assertEqual(by_symbol["BBB"]["reason"], "below_min_score")
+            self.assertAlmostEqual(float(by_symbol["BBB"]["score"]), 59.0, places=2)
+            self.assertEqual(bbb_payload["rejection_reason"], "below_min_score")
+            self.assertEqual(bbb_payload["score_breakdown"]["trend"], 32.0)
+            self.assertEqual(bbb_payload["score_breakdown"]["structure"], 14.0)
+
+            self.assertEqual(by_symbol["CCC"]["outcome"], "error")
+            self.assertEqual(by_symbol["CCC"]["reason"], "build_failed:ValueError")
+            self.assertEqual(ccc_payload["error"], "ValueError")
 
     def test_theme_confirmed_peer_can_pull_near_threshold_symbol_into_prewatch(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

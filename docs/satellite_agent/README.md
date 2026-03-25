@@ -5,6 +5,7 @@
 ## 你最常看的文档
 
 - 交接文档：[HANDOFF.md](/Users/linxun/CodeSpace/asset_allocation_system/docs/satellite_agent/HANDOFF.md)
+- 常用命令速查：[commands.zh-CN.md](/Users/chenxi/CodeSpace/asset_allocation_system/docs/satellite_agent/commands.zh-CN.md)
 - 决策链路说明：[decision_logic.zh-CN.md](/Users/linxun/CodeSpace/asset_allocation_system/docs/satellite_agent/decision_logic.zh-CN.md)
 - 评分体系说明：[scoring_guide.zh-CN.md](/Users/linxun/CodeSpace/asset_allocation_system/docs/satellite_agent/scoring_guide.zh-CN.md)
 

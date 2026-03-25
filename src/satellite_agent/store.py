@@ -221,6 +221,24 @@ class Store:
             exit_subreason TEXT NOT NULL DEFAULT '',
             updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS candidate_evaluations (
+            evaluation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            horizon TEXT NOT NULL,
+            event_id TEXT NOT NULL DEFAULT '',
+            outcome TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            score REAL,
+            strategy_version TEXT NOT NULL DEFAULT '',
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_candidate_evaluations_run_stage
+        ON candidate_evaluations (run_id, stage, created_at ASC);
+        CREATE INDEX IF NOT EXISTS idx_candidate_evaluations_symbol
+        ON candidate_evaluations (symbol, created_at DESC);
         CREATE TABLE IF NOT EXISTS agent_state (
             state_key TEXT PRIMARY KEY,
             state_value TEXT NOT NULL
@@ -1655,6 +1673,80 @@ class Store:
             ),
         )
         self.connection.commit()
+
+    def record_candidate_evaluation(
+        self,
+        *,
+        run_id: str,
+        stage: str,
+        symbol: str,
+        horizon: str,
+        outcome: str,
+        reason: str = "",
+        event_id: str = "",
+        score: float | None = None,
+        strategy_version: str = "",
+        payload: dict[str, Any] | None = None,
+        created_at: str,
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO candidate_evaluations
+            (run_id, stage, symbol, horizon, event_id, outcome, reason, score, strategy_version, payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                stage,
+                symbol,
+                horizon,
+                event_id,
+                outcome,
+                reason,
+                score,
+                strategy_version,
+                json.dumps(payload or {}, sort_keys=True),
+                created_at,
+            ),
+        )
+        self.connection.commit()
+
+    def load_candidate_evaluations(self, run_id: str, *, stage: str = "") -> list[sqlite3.Row]:
+        query = """
+            SELECT *
+            FROM candidate_evaluations
+            WHERE run_id = ?
+        """
+        params: list[Any] = [run_id]
+        if stage:
+            query += " AND stage = ?"
+            params.append(stage)
+        query += " ORDER BY created_at ASC, evaluation_id ASC"
+        cursor = self.connection.execute(query, tuple(params))
+        return cursor.fetchall()
+
+    def load_candidate_evaluations_for_window(
+        self,
+        *,
+        since: str,
+        until: str = "",
+        stage: str = "",
+    ) -> list[sqlite3.Row]:
+        query = """
+            SELECT *
+            FROM candidate_evaluations
+            WHERE created_at >= ?
+        """
+        params: list[Any] = [since]
+        if until:
+            query += " AND created_at < ?"
+            params.append(until)
+        if stage:
+            query += " AND stage = ?"
+            params.append(stage)
+        query += " ORDER BY created_at ASC, evaluation_id ASC"
+        cursor = self.connection.execute(query, tuple(params))
+        return cursor.fetchall()
 
     def _bar_table(self, timeframe: str) -> str:
         if timeframe == "5m":
