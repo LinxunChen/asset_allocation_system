@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>卫星 Agent 主链路</title>
+    <style>
+      body {
+        margin: 0;
+        background: #f5f6f8;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      .page {
+        padding: 24px;
+      }
+
+      .card {
+        width: max-content;
+        min-width: 2200px;
+        background: #ffffff;
+        border-radius: 20px;
+        box-shadow: 0 16px 50px rgba(15, 23, 42, 0.12);
+        padding: 24px;
+      }
+
+      .title {
+        margin: 0 0 16px 0;
+        font-size: 28px;
+        font-weight: 700;
+        color: #0f172a;
+      }
+
+      .subtitle {
+        margin: 0 0 16px 0;
+        font-size: 14px;
+        color: #475569;
+      }
+
+      .legend {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin: 0 0 20px 0;
+      }
+
+      .legend-item {
+        padding: 8px 12px;
+        border-radius: 999px;
+        background: #eef2ff;
+        color: #312e81;
+        font-size: 13px;
+        font-weight: 600;
+      }
+
+      .note {
+        margin: 0 0 24px 0;
+        font-size: 13px;
+        line-height: 1.6;
+        color: #64748b;
+      }
+
+      .logic-card {
+        margin: 0 0 20px 0;
+        padding: 16px 18px;
+        border-radius: 16px;
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
+      }
+
+      .logic-title {
+        margin: 0 0 10px 0;
+        font-size: 14px;
+        font-weight: 700;
+        color: #0f172a;
+      }
+
+      .logic-body {
+        margin: 0;
+        font-size: 13px;
+        line-height: 1.8;
+        color: #334155;
+        white-space: pre-line;
+      }
+
+      .mermaid {
+        font-size: 20px;
+      }
+    </style>
+    <script type="module">
+      import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+
+      mermaid.initialize({
+        startOnLoad: true,
+        theme: "default",
+        flowchart: {
+          htmlLabels: true,
+          curve: "linear",
+          nodeSpacing: 44,
+          rankSpacing: 56
+        }
+      });
+    </script>
+  </head>
+  <body>
+    <div class="page">
+      <div class="card">
+        <h1 class="title">卫星 Agent 主链路</h1>
+        <p class="subtitle">基于最新代码抽象出的系统骨架图，突出三池流转与复盘闭环</p>
+        <div class="legend">
+          <div class="legend-item">关注名单 = 系统持续跟踪的标的范围</div>
+          <div class="legend-item">候选池 = 短期记忆层，默认静默记录</div>
+          <div class="legend-item">确认池 = 正式机会，会推送飞书正式卡</div>
+          <div class="legend-item">持仓管理 = 持仓后的统一退出管理</div>
+        </div>
+        <p class="note">阅读方式：先看关注名单内如何发现机会，再看三池流转，最后看复盘闭环。说明：图中的成交、退出、结算均为策略后验评估口径，不代表真实自动下单；其中“窗口到期结算”用于给复盘提供统一截止时间，不等于真实卖出。</p>
+        <div class="logic-card">
+          <p class="logic-title">归池逻辑</p>
+          <p class="logic-body">if 不值得继续跟踪
+-&gt; 丢弃
+
+elif 值得跟踪，但暂不适合正式出手
+-&gt; 进入<b>候选池</b>
+
+elif 消息强，盘面也支持，且适合执行
+-&gt; 进入<b>确认池</b>
+
+if 候选近期再次增强
+-&gt; 候选升级到确认池</p>
+        </div>
+        <pre class="mermaid">
+flowchart TD
+    subgraph Discovery["阶段一：机会发现"]
+        direction TB
+        W["<b>关注名单</b>"] --&gt; E["关注名单内的事件发现"]
+        W --&gt; S["关注名单内的行情扫描"]
+        E --&gt; R{"<b>归池决策</b>"}
+        S --&gt; R
+    end
+
+    subgraph Lifecycle["阶段二：三池与交易生命周期"]
+        direction TB
+
+        R -- "先跟踪，暂不正式出手" --&gt; C["<b>第一池：候选池</b>&lt;br/&gt;跨轮次短期记忆（默认 72h）&lt;br/&gt;<b>默认静默记录</b>"]
+        R -- "消息强，盘面也支持" --&gt; F["<b>第二池：确认池</b>&lt;br/&gt;正式机会&lt;br/&gt;<b>推送飞书正式卡</b>"]
+
+        C -. "重点候选时，可选发送观察卡" .-&gt; CL["观察卡（可选）&lt;br/&gt;<b>可选推送飞书观察卡</b>"]
+        C -. "后续出现新催化，可升级" .-&gt; F
+
+        F --&gt; O["等待成交"]
+        O -- "触发买点" --&gt; H["持仓中"]
+        O -. "触发失效价" .-&gt; X_PRICE["本次机会结束&lt;br/&gt;失效未成交"]
+        O -. "窗口到期仍未成交" .-&gt; X_TIMEOUT["本次机会结束&lt;br/&gt;窗口内未成交"]
+
+        H --&gt; P["<b>第三池：持仓管理</b>&lt;br/&gt;统一处理止盈 / 失效 / 窗口到期"]
+        P -- "达到目标 / 利润保护" --&gt; EXIT_WIN["退出操作&lt;br/&gt;利润保护退出&lt;br/&gt;<b>推送飞书退出卡</b>"]
+        P -- "触发失效价" --&gt; EXIT_LOSS["退出操作&lt;br/&gt;失效价退出&lt;br/&gt;<b>推送飞书退出卡</b>"]
+        P -- "窗口到期" --&gt; EXIT_TIME["退出操作&lt;br/&gt;窗口到期结算&lt;br/&gt;<b>只落盘复盘，不推送</b>"]
+    end
+
+    subgraph Review["阶段三：复盘闭环"]
+        direction LR
+        C --&gt; DB[("后验数据库")]
+        H --&gt; DB
+        X_PRICE --&gt; DB
+        X_TIMEOUT --&gt; DB
+        EXIT_WIN --&gt; DB
+        EXIT_LOSS --&gt; DB
+        EXIT_TIME --&gt; DB
+
+        DB --&gt; RUN["运行复盘"]
+        DB --&gt; HIST["历史复盘&lt;br/&gt;30d / 90d / 路径质量 / 候选转化"]
+    end
+
+    Discovery ==&gt; Lifecycle
+    Lifecycle ==&gt; Review
+        </pre>
+      </div>
+    </div>
+  </body>
+</html>

@@ -1,0 +1,45 @@
+flowchart TD
+    subgraph Discovery["阶段一：机会发现"]
+        direction TB
+        W["<b>关注名单</b>"] --> E["关注名单内的事件发现"]
+        W --> S["关注名单内的行情扫描"]
+        E --> R{"<b>归池决策</b>"}
+        S --> R
+    end
+
+    subgraph Lifecycle["阶段二：三池与交易生命周期"]
+        direction TB
+
+        R -- "先跟踪，暂不正式出手" --> C["<b>第一池：候选池</b><br/>跨轮次短期记忆（默认 72h）<br/><b>默认静默记录</b>"]
+        R -- "消息强，盘面也支持" --> F["<b>第二池：确认池</b><br/>正式机会<br/><b>推送飞书正式卡</b>"]
+
+        C -. "重点候选时，可选发送观察卡" .-> CL["观察卡（可选）<br/><b>可选推送飞书观察卡</b>"]
+        C -. "后续出现新催化，可升级" .-> F
+
+        F --> O["等待成交"]
+        O -- "触发买点" --> H["持仓中"]
+        O -. "触发失效价" .-> X_PRICE["本次机会结束<br/>失效未成交"]
+        O -. "窗口到期仍未成交" .-> X_TIMEOUT["本次机会结束<br/>窗口内未成交"]
+
+        H --> P["<b>第三池：持仓管理</b><br/>统一处理止盈 / 失效 / 窗口到期"]
+        P -- "达到目标 / 利润保护" --> EXIT_WIN["退出操作<br/>利润保护退出<br/><b>推送飞书退出卡</b>"]
+        P -- "触发失效价" --> EXIT_LOSS["退出操作<br/>失效价退出<br/><b>推送飞书退出卡</b>"]
+        P -- "窗口到期" --> EXIT_TIME["退出操作<br/>窗口到期结算<br/><b>只落盘复盘，不推送</b>"]
+    end
+
+    subgraph Review["阶段三：复盘闭环"]
+        direction LR
+        C --> DB[("后验数据库")]
+        H --> DB
+        X_PRICE --> DB
+        X_TIMEOUT --> DB
+        EXIT_WIN --> DB
+        EXIT_LOSS --> DB
+        EXIT_TIME --> DB
+
+        DB --> RUN["运行复盘"]
+        DB --> HIST["历史复盘<br/>30d / 90d / 路径质量 / 候选转化"]
+    end
+
+    Discovery ==> Lifecycle
+    Lifecycle ==> Review
