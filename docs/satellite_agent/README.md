@@ -2,6 +2,8 @@
 
 这是当前仓库里已经真正落地并持续运行的 agent。
 
+这个 `README.md` 只负责卫星仓位 agent 自己的入口说明；仓库级导航仍以根目录 [README.md](/Users/chenxi/CodeSpace/asset_allocation_system/README.md) 为准。
+
 ## 你最常看的文档
 
 - 交接文档：[HANDOFF.md](/Users/linxun/CodeSpace/asset_allocation_system/docs/satellite_agent/HANDOFF.md)

@@ -45,6 +45,7 @@ from .reporting import (
     format_runs,
     format_source_health,
     format_strategy_report,
+    summarize_external_connectivity_issues,
     serialize_batch_comparison,
     serialize_batch_index,
     serialize_batch_replay,
@@ -84,6 +85,9 @@ SEC_EXCLUDED_SYMBOLS = {
     "NBIS",
 }
 RECENT_PERFORMANCE_WINDOW_DAYS = 30
+BASELINE_PERFORMANCE_WINDOW_DAYS = 90
+SHORT_TERM_RECOMMENDATION_MIN_SAMPLES = 3
+BASELINE_RECOMMENDATION_MIN_SAMPLES = 5
 OUTCOME_SAMPLE_AUDIT_LIMIT = 10
 DEFAULT_ARCHIVE_DB_PATH = Path("./data/satellite_agent/archive/decision_history.db")
 HISTORICAL_EFFECT_REVIEW_VERSION = "v1"
@@ -529,13 +533,13 @@ def _historical_effect_exit_reason_label(reason: str) -> str:
         "hit_invalidation": "失效退出",
         "window_complete": "复盘窗口结算",
         "insufficient_lookahead": "观察中",
-        "not_entered": "未进场",
+        "not_entered": "未成交",
     }.get(reason, reason or "未回补")
 
 
 def _historical_effect_status_label(*, entered: bool, close_reason: str) -> str:
     if not entered:
-        return "未进场"
+        return "未成交"
     return _historical_effect_exit_reason_label(close_reason)
 
 
@@ -764,6 +768,419 @@ def _percentage(numerator: int, denominator: int) -> float | None:
     if denominator <= 0:
         return None
     return round((numerator / denominator) * 100.0, 2)
+
+
+def _parse_iso_datetime_safe(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+def _days_since_timestamp(value: Any, *, reference: datetime) -> float | None:
+    parsed = _parse_iso_datetime_safe(value)
+    if parsed is None:
+        return None
+    return (reference - parsed).total_seconds() / 86400.0
+
+
+def _rounded_float(value: Any, *, digits: int = 4) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return round(float(value), digits)
+    except (TypeError, ValueError):
+        return None
+
+
+def _representative_outcome_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        str(row.get("run_id") or ""),
+        str(row.get("symbol") or "").strip().upper(),
+        str(row.get("action") or "").strip(),
+        str(row.get("event_type") or "").strip(),
+        str(row.get("pool") or "").strip(),
+        str(row.get("created_at") or "").strip(),
+        str(row.get("entered_at") or "").strip(),
+        _rounded_float(row.get("entry_price")),
+        _rounded_float(row.get("exit_price")),
+        _rounded_float(row.get("max_runup")),
+        _rounded_float(row.get("max_drawdown")),
+        _rounded_float(row.get("realized_return")),
+        str(row.get("close_reason") or "").strip(),
+    )
+
+
+def _dedupe_representative_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    merged_count = 0
+    for row in rows:
+        key = _representative_outcome_key(row)
+        if key in seen:
+            merged_count += 1
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return deduped, merged_count
+
+
+def _select_unique_top_rows(
+    rows: list[dict[str, Any]],
+    *,
+    key_fn: Callable[[dict[str, Any]], tuple[Any, ...]],
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for row in rows:
+        dedupe_key = key_fn(row)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        selected.append(row)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _timing_days_from_row(row: dict[str, Any]) -> tuple[float | None, bool]:
+    created_at_dt = _parse_iso_datetime_safe(row.get("created_at"))
+    entered_at_dt = _parse_iso_datetime_safe(row.get("entered_at"))
+    if created_at_dt is None or entered_at_dt is None:
+        return None, False
+    days = (entered_at_dt - created_at_dt).total_seconds() / 86400.0
+    if days < 0:
+        return None, True
+    return days, False
+
+
+def _observation_to_confirmation_days(
+    observation_rows: list[dict[str, Any]],
+    promoted_rows: list[dict[str, Any]],
+) -> list[float]:
+    earliest_observation_by_symbol: dict[str, datetime] = {}
+    for row in observation_rows:
+        symbol = str(row.get("symbol") or "").strip().upper()
+        created_at_dt = _parse_iso_datetime_safe(row.get("created_at"))
+        if not symbol or created_at_dt is None:
+            continue
+        current = earliest_observation_by_symbol.get(symbol)
+        if current is None or created_at_dt < current:
+            earliest_observation_by_symbol[symbol] = created_at_dt
+    deltas: list[float] = []
+    for row in promoted_rows:
+        symbol = str(row.get("symbol") or "").strip().upper()
+        promoted_at_dt = _parse_iso_datetime_safe(row.get("created_at"))
+        observed_at_dt = earliest_observation_by_symbol.get(symbol)
+        if not symbol or promoted_at_dt is None or observed_at_dt is None:
+            continue
+        delta_days = (promoted_at_dt - observed_at_dt).total_seconds() / 86400.0
+        if delta_days < 0:
+            continue
+        deltas.append(delta_days)
+    return deltas
+
+
+def _locked_checkpoint_return(
+    row: dict[str, Any],
+    *,
+    day: int,
+    review_until_dt: datetime,
+) -> float | None:
+    field = f"t_plus_{day}_return"
+    elapsed_days = _days_since_timestamp(row.get("entered_at"), reference=review_until_dt)
+    raw_value = row.get(field)
+    if raw_value is not None and elapsed_days is not None and elapsed_days >= float(day):
+        return float(raw_value)
+    close_reason = str(row.get("close_reason") or "").strip()
+    realized_return = row.get("realized_return")
+    holding_days = row.get("holding_days")
+    if (
+        realized_return is not None
+        and close_reason in {"exit_pool", "hit_take_profit", "hit_invalidation", "window_complete"}
+        and holding_days is not None
+        and float(holding_days) <= float(day)
+    ):
+        return float(realized_return)
+    return None
+
+
+def _build_path_quality_summary(
+    rows: list[dict[str, Any]],
+    *,
+    review_until_dt: datetime,
+) -> dict[str, Any]:
+    raw_entered_rows = [row for row in rows if bool(row.get("entered"))]
+    entered_rows, deduped_merge_count = _dedupe_representative_rows(raw_entered_rows)
+    runup_values = [float(row["max_runup"]) for row in entered_rows if row.get("max_runup") is not None]
+    drawdown_values = [float(row["max_drawdown"]) for row in entered_rows if row.get("max_drawdown") is not None]
+    elapsed_days_values = [
+        float(days_elapsed)
+        for row in entered_rows
+        for days_elapsed in [_days_since_timestamp(row.get("entered_at"), reference=review_until_dt)]
+        if days_elapsed is not None and days_elapsed >= 0.0
+    ]
+    checkpoint_rows: list[dict[str, Any]] = []
+    for day in (7, 14, 30):
+        values = [
+            value
+            for row in entered_rows
+            for value in [_locked_checkpoint_return(row, day=day, review_until_dt=review_until_dt)]
+            if value is not None
+        ]
+        checkpoint_rows.append(
+            {
+                "day": day,
+                "label": f"T+{day}",
+                "sample_count": len(values),
+                "avg_return": _mean(values),
+                "median_return": _median(values),
+                "positive_rate": _percentage(sum(1 for value in values if value > 0), len(values)),
+            }
+        )
+    observation_line = "当前还没有足够的已成交样本来判断路径质量。"
+    if runup_values or drawdown_values:
+        observation_parts: list[str] = []
+        avg_runup = _mean(runup_values)
+        avg_drawdown = _mean(drawdown_values)
+        if avg_runup is not None and avg_runup > 0:
+            observation_parts.append("样本整体曾给出一定浮盈空间")
+        if avg_drawdown is not None and avg_drawdown <= -5.0:
+            observation_parts.append("平均回撤偏深")
+        mature_t14 = next((row for row in checkpoint_rows if int(row.get("day", 0) or 0) == 14), {})
+        mature_t30 = next((row for row in checkpoint_rows if int(row.get("day", 0) or 0) == 30), {})
+        if int(mature_t14.get("sample_count", 0) or 0) > 0 and (mature_t14.get("avg_return") or 0.0) < 0:
+            observation_parts.append("T+14 后续衰减明显")
+        if int(mature_t30.get("sample_count", 0) or 0) > 0 and (mature_t30.get("avg_return") or 0.0) < 0:
+            observation_parts.append("T+30 延续性不足")
+        if observation_parts:
+            observation_line = "；".join(observation_parts) + "。"
+        else:
+            observation_line = "路径质量整体中性，仍需继续观察更长样本。"
+
+    top_runup_rows = _select_unique_top_rows(
+        sorted(
+            [row for row in entered_rows if row.get("max_runup") is not None],
+            key=lambda row: (
+                float(row.get("max_runup") or 0.0),
+                str(row.get("created_at") or ""),
+            ),
+            reverse=True,
+        ),
+        key_fn=lambda row: (str(row.get("symbol") or "").strip().upper(),),
+        limit=3,
+    )
+    best_runup_samples = [
+        {
+            "symbol": str(row.get("symbol") or ""),
+            "event_type": str(row.get("event_type") or ""),
+            "event_type_display": _historical_effect_event_type_label(str(row.get("event_type") or "")),
+            "action": str(row.get("action") or ""),
+            "action_display": _historical_effect_action_label(str(row.get("action") or "")),
+            "max_runup": row.get("max_runup"),
+            "max_drawdown": row.get("max_drawdown"),
+            "created_at": str(row.get("created_at") or ""),
+        }
+        for row in top_runup_rows
+    ]
+    top_drawdown_rows = _select_unique_top_rows(
+        sorted(
+            [row for row in entered_rows if row.get("max_drawdown") is not None],
+            key=lambda row: (
+                float(row.get("max_drawdown") or 0.0),
+                str(row.get("created_at") or ""),
+            ),
+        ),
+        key_fn=lambda row: (str(row.get("symbol") or "").strip().upper(),),
+        limit=3,
+    )
+    worst_drawdown_samples = [
+        {
+            "symbol": str(row.get("symbol") or ""),
+            "event_type": str(row.get("event_type") or ""),
+            "event_type_display": _historical_effect_event_type_label(str(row.get("event_type") or "")),
+            "action": str(row.get("action") or ""),
+            "action_display": _historical_effect_action_label(str(row.get("action") or "")),
+            "max_runup": row.get("max_runup"),
+            "max_drawdown": row.get("max_drawdown"),
+            "created_at": str(row.get("created_at") or ""),
+        }
+        for row in top_drawdown_rows
+    ]
+    return {
+        "entered_sample_count": len(entered_rows),
+        "deduped_merge_count": deduped_merge_count,
+        "max_runup_sample_count": len(runup_values),
+        "avg_max_runup": _mean(runup_values),
+        "median_max_runup": _median(runup_values),
+        "max_drawdown_sample_count": len(drawdown_values),
+        "avg_max_drawdown": _mean(drawdown_values),
+        "median_max_drawdown": _median(drawdown_values),
+        "elapsed_days_sample_count": len(elapsed_days_values),
+        "avg_elapsed_days_since_entry": _mean(elapsed_days_values),
+        "checkpoints": checkpoint_rows,
+        "observation_line": observation_line,
+        "best_runup_samples": best_runup_samples,
+        "worst_drawdown_samples": worst_drawdown_samples,
+    }
+
+
+def _build_review_window_snapshot(
+    review: dict[str, Any],
+    *,
+    label: str,
+    role_label: str,
+    min_sample_size: int,
+) -> dict[str, Any]:
+    overview = dict(review.get("overview") or {})
+    execution_quality = dict(review.get("execution_quality") or {})
+    pool_funnel = dict(review.get("pool_funnel_summary") or {})
+    simulation_funnel = dict(review.get("simulation_funnel_summary") or {})
+    trade_path = dict(review.get("trade_path_summary") or {})
+    path_quality = dict(review.get("path_quality_summary") or {})
+    decision_count = int(overview.get("decision_count", 0) or 0)
+    return {
+        "label": label,
+        "role_label": role_label,
+        "window_days": int((review.get("review_window") or {}).get("window_days") or 0),
+        "overview": overview,
+        "execution_quality": execution_quality,
+        "pool_funnel_summary": pool_funnel,
+        "simulation_funnel_summary": simulation_funnel,
+        "trade_path_summary": trade_path,
+        "path_quality_summary": path_quality,
+        "sample_gate": {
+            "decision_count": decision_count,
+            "min_sample_size": min_sample_size,
+            "sufficient": decision_count >= min_sample_size,
+            "status_label": "样本足够" if decision_count >= min_sample_size else "样本不足",
+        },
+    }
+
+
+def _comparison_metric_status(
+    primary_value: Any,
+    baseline_value: Any,
+    *,
+    higher_is_better: bool = True,
+    tolerance: float = 0.05,
+) -> str:
+    if primary_value is None or baseline_value is None:
+        return "样本不足"
+    try:
+        primary = float(primary_value)
+        baseline = float(baseline_value)
+    except (TypeError, ValueError):
+        return "样本不足"
+    if abs(primary - baseline) <= tolerance:
+        return "基本持平"
+    if higher_is_better:
+        return "短期改善" if primary > baseline else "短期回撤"
+    return "短期改善" if primary < baseline else "短期承压"
+
+
+def _build_dual_window_comparison_summary(primary: dict[str, Any], baseline: dict[str, Any]) -> dict[str, Any]:
+    primary_overview = primary.get("overview") or {}
+    baseline_overview = baseline.get("overview") or {}
+    primary_execution = primary.get("execution_quality") or {}
+    baseline_execution = baseline.get("execution_quality") or {}
+    primary_path = primary.get("path_quality_summary") or {}
+    baseline_path = baseline.get("path_quality_summary") or {}
+    metrics = [
+        {
+            "label": "决策总数",
+            "primary_value": primary_overview.get("decision_count"),
+            "baseline_value": baseline_overview.get("decision_count"),
+            "value_type": "count",
+            "status": _comparison_metric_status(primary_overview.get("decision_count"), baseline_overview.get("decision_count")),
+        },
+        {
+            "label": "模拟成交率",
+            "primary_value": primary_execution.get("entry_hit_rate"),
+            "baseline_value": baseline_execution.get("entry_hit_rate"),
+            "value_type": "rate",
+            "status": _comparison_metric_status(primary_execution.get("entry_hit_rate"), baseline_execution.get("entry_hit_rate")),
+        },
+        {
+            "label": "胜率",
+            "primary_value": primary_overview.get("win_rate"),
+            "baseline_value": baseline_overview.get("win_rate"),
+            "value_type": "rate",
+            "status": _comparison_metric_status(primary_overview.get("win_rate"), baseline_overview.get("win_rate")),
+        },
+        {
+            "label": "平均最大浮盈",
+            "primary_value": primary_path.get("avg_max_runup"),
+            "baseline_value": baseline_path.get("avg_max_runup"),
+            "value_type": "percent",
+            "status": _comparison_metric_status(primary_path.get("avg_max_runup"), baseline_path.get("avg_max_runup")),
+        },
+        {
+            "label": "平均最大回撤",
+            "primary_value": primary_path.get("avg_max_drawdown"),
+            "baseline_value": baseline_path.get("avg_max_drawdown"),
+            "value_type": "percent",
+            "status": _comparison_metric_status(primary_path.get("avg_max_drawdown"), baseline_path.get("avg_max_drawdown"), higher_is_better=False),
+        },
+    ]
+    summary_lines: list[str] = []
+    if not primary.get("sample_gate", {}).get("sufficient", False):
+        summary_lines.append("近 30 天样本量不足，短期波动暂不支持直接调参数。")
+    elif not baseline.get("sample_gate", {}).get("sufficient", False):
+        summary_lines.append("近 90 天样本量仍偏少，短期变化暂时不能视为稳定结论。")
+    else:
+        win_rate_status = _comparison_metric_status(
+            primary_overview.get("win_rate"),
+            baseline_overview.get("win_rate"),
+        )
+        entry_rate_status = _comparison_metric_status(
+            primary_execution.get("entry_hit_rate"),
+            baseline_execution.get("entry_hit_rate"),
+        )
+        if win_rate_status == "短期回撤" and entry_rate_status == "短期回撤":
+            summary_lines.append("近 30 天胜率和进场质量都弱于 90 天基准，短期表现明显转差。")
+        elif win_rate_status == "短期改善" and entry_rate_status == "短期改善":
+            summary_lines.append("近 30 天胜率和进场质量都好于 90 天基准，短期表现有改善。")
+        else:
+            summary_lines.append("近 30 天和 90 天表现存在分化，建议先看路径质量，不要只盯单一收益结果。")
+    return {
+        "metrics": metrics,
+        "summary_lines": summary_lines,
+    }
+
+
+def _apply_dual_window_recommendation_guard(
+    review: dict[str, Any],
+    *,
+    primary_snapshot: dict[str, Any],
+    baseline_snapshot: dict[str, Any],
+) -> None:
+    primary_gate = primary_snapshot.get("sample_gate") or {}
+    baseline_gate = baseline_snapshot.get("sample_gate") or {}
+    if bool(primary_gate.get("sufficient")) and bool(baseline_gate.get("sufficient")):
+        return
+    if not bool(primary_gate.get("sufficient")):
+        text = (
+            f"近 30 天只有 {int(primary_gate.get('decision_count', 0) or 0)} 条可执行样本，样本量不足，"
+            "近期表现即使偏弱或偏强，也不足以支持直接调整参数，不建议直接调整参数，建议先观察。"
+        )
+    else:
+        text = (
+            f"近 90 天只有 {int(baseline_gate.get('decision_count', 0) or 0)} 条可执行样本，样本量不足，"
+            "当前中期基准仍偏薄，短期变化先以观察和排查为主，不建议直接调整参数。"
+        )
+    review["recommendations"] = [text]
+    review["recommendation_details"] = [
+        _build_recommendation_item(
+            text=text,
+            priority=5,
+            source="sample_gate",
+        )
+    ]
 
 
 def build_watchlist_config_review_payload(runtime_config: AgentRuntimeConfig, *, config_path: Path) -> dict[str, Any]:
@@ -1176,6 +1593,7 @@ def _build_historical_effect_review_data(
     limit: int,
     start_date: str = "",
     end_date: str = "",
+    include_comparison: bool = True,
 ) -> dict[str, Any]:
     window = _resolve_review_window(days=days, start_date=start_date, end_date=end_date)
     archive_store, archive_db_path = _open_archive_store_if_available()
@@ -1260,6 +1678,7 @@ def _build_historical_effect_review_data(
             continue
         historical_alert_rows.append(row)
     entered_rows = [row for row in rows if bool(row.get("entered"))]
+    entered_rows, auxiliary_deduped_merge_count = _dedupe_representative_rows(entered_rows)
     not_entered_rows = [row for row in rows if not bool(row.get("entered"))]
     take_profit_rows = [row for row in entered_rows if _is_profit_exit_reason(str(row.get("close_reason") or ""))]
     invalidation_rows = [row for row in entered_rows if str(row.get("close_reason") or "") == "hit_invalidation"]
@@ -1273,16 +1692,27 @@ def _build_historical_effect_review_data(
     negative_values = [value for value in realized_values if value < 0]
     holding_days = [int(row["holding_days"]) for row in exited_rows if row.get("holding_days") is not None]
     auxiliary_metrics = []
-    for field, label in (
-        ("t_plus_1_return", "T+1"),
-        ("t_plus_3_return", "T+3"),
-        ("t_plus_7_return", "T+7"),
-        ("t_plus_14_return", "T+14"),
-        ("t_plus_30_return", "T+30"),
-        ("max_runup", "最大浮盈"),
-        ("max_drawdown", "最大回撤"),
+    for field, label, maturity_days in (
+        ("t_plus_1_return", "T+1", 1),
+        ("t_plus_3_return", "T+3", 3),
+        ("t_plus_7_return", "T+7", 7),
+        ("t_plus_14_return", "T+14", 14),
+        ("t_plus_30_return", "T+30", 30),
+        ("max_runup", "最大浮盈", None),
+        ("max_drawdown", "最大回撤", None),
     ):
-        values = [float(row[field]) for row in rows if row.get(field) is not None]
+        values = []
+        metric_rows = entered_rows
+        for row in metric_rows:
+            if maturity_days is not None:
+                locked_value = _locked_checkpoint_return(row, day=maturity_days, review_until_dt=review_until_dt)
+                if locked_value is None:
+                    continue
+                values.append(float(locked_value))
+                continue
+            if row.get(field) is None:
+                continue
+            values.append(float(row[field]))
         auxiliary_metrics.append(
             {
                 "field": field,
@@ -1291,6 +1721,7 @@ def _build_historical_effect_review_data(
                 "avg_value": _mean(values),
             }
         )
+    path_quality_summary = _build_path_quality_summary(rows, review_until_dt=review_until_dt)
 
     event_breakdown = _aggregate_historical_effect_rows(
         rows,
@@ -1411,7 +1842,7 @@ def _build_historical_effect_review_data(
         if not_entered_rate >= 40.0:
             recommendation_items.append(
                 _build_recommendation_item(
-                    text="未进场样本偏多，说明入场区间可能偏保守，值得回看挂单区间。",
+                    text="未成交样本偏多，说明入场区间可能偏保守，值得回看挂单区间。",
                     priority=20,
                     parameter_hints=[("execution_entry_buffer_pct", "high")],
                     source="historical_outcome",
@@ -1640,6 +2071,7 @@ def _build_historical_effect_review_data(
         if bool(_load_json_dict(row.get("packet_json")).get("promoted_from_prewatch"))
         or str(row.get("trigger_mode") or "").strip() == "promoted"
     ]
+    promoted_confirmation_rows, promoted_confirmation_deduped_merge_count = _dedupe_representative_rows(promoted_confirmation_rows)
     promoted_after_light_push_rows = [
         row
         for row in promoted_confirmation_rows
@@ -1664,15 +2096,31 @@ def _build_historical_effect_review_data(
         for row in promoted_confirmation_rows
         if str(row.get("symbol") or "").strip()
     }
-    recent_observation_samples = []
-    for row in sorted(
+    observation_symbols = {
+        str(row.get("symbol") or "").strip().upper()
+        for row in observation_rows_merged
+        if str(row.get("symbol") or "").strip()
+    }
+    still_observing_symbols = observation_symbols - promoted_confirmation_symbols
+    observation_to_confirmation_days = _observation_to_confirmation_days(
         observation_rows_merged,
-        key=lambda item: (
-            str(item.get("created_at") or ""),
-            str(item.get("symbol") or ""),
+        promoted_confirmation_rows,
+    )
+    recent_observation_rows = _select_unique_top_rows(
+        sorted(
+            observation_rows_merged,
+            key=lambda item: (
+                str(item.get("created_at") or ""),
+                str(item.get("symbol") or ""),
+                float(item.get("final_score") or 0.0),
+            ),
+            reverse=True,
         ),
-        reverse=True,
-    )[:5]:
+        key_fn=lambda row: (str(row.get("symbol") or "").strip().upper(),),
+        limit=5,
+    )
+    recent_observation_samples = []
+    for row in recent_observation_rows:
         symbol = str(row.get("symbol") or "").strip().upper()
         packet = _load_json_dict(row.get("packet_json"))
         lifecycle = packet.get("prewatch_lifecycle") if isinstance(packet.get("prewatch_lifecycle"), dict) else {}
@@ -1689,6 +2137,34 @@ def _build_historical_effect_review_data(
                 "alert_sent_count": int(lifecycle.get("alert_sent_count") or 0),
                 "observation_status": "已触发观察提醒" if symbol in prewatch_alert_symbols else "仅后台观察",
                 "confirmation_status": "已形成确认机会" if symbol in promoted_confirmation_symbols else "仍在观察",
+            }
+        )
+    observation_after_samples = []
+    promoted_sample_rows = _select_unique_top_rows(
+        sorted(
+            promoted_confirmation_rows,
+            key=lambda row: (
+                str(row.get("created_at") or ""),
+                str(row.get("symbol") or ""),
+            ),
+            reverse=True,
+        ),
+        key_fn=lambda row: (str(row.get("symbol") or "").strip().upper(),),
+        limit=3,
+    )
+    for row in promoted_sample_rows:
+        symbol = str(row.get("symbol") or "").strip().upper()
+        packet = _load_json_dict(row.get("packet_json"))
+        observation_after_samples.append(
+            {
+                "symbol": symbol,
+                "created_at": str(row.get("created_at") or ""),
+                "action": str(row.get("action") or ""),
+                "action_display": _historical_effect_action_label(str(row.get("action") or "")),
+                "prewatch_score": float(packet.get("prewatch_score") or 0.0),
+                "prewatch_setup_type": str(packet.get("prewatch_setup_type") or ""),
+                "prewatch_alert_sent_count": int(packet.get("prewatch_alert_sent_count") or 0),
+                "prewatch_observation_count": int(packet.get("prewatch_observation_count") or 0),
             }
         )
     exit_from_promoted_rows = [
@@ -1727,17 +2203,14 @@ def _build_historical_effect_review_data(
         ),
     }
     confirmation_to_entry_days = []
+    confirmation_to_entry_timing_anomaly_count = 0
     for row in simulated_entry_rows:
-        created_at_text = str(row.get("created_at") or "").strip()
-        entered_at_text = str(row.get("entered_at") or "").strip()
-        if not created_at_text or not entered_at_text:
+        timing_days, has_anomaly = _timing_days_from_row(row)
+        if has_anomaly:
+            confirmation_to_entry_timing_anomaly_count += 1
             continue
-        try:
-            created_at_dt = datetime.fromisoformat(created_at_text)
-            entered_at_dt = datetime.fromisoformat(entered_at_text)
-        except ValueError:
-            continue
-        confirmation_to_entry_days.append((entered_at_dt - created_at_dt).total_seconds() / 86400.0)
+        if timing_days is not None:
+            confirmation_to_entry_days.append(timing_days)
     entry_to_completed_exit_days = [
         float(row.get("holding_days"))
         for row in simulated_completed_exit_rows
@@ -1750,16 +2223,9 @@ def _build_historical_effect_review_data(
         for row in simulated_entry_rows:
             if str(row.get("action") or "").strip() != action:
                 continue
-            created_at_text = str(row.get("created_at") or "").strip()
-            entered_at_text = str(row.get("entered_at") or "").strip()
-            if not created_at_text or not entered_at_text:
-                continue
-            try:
-                created_at_dt = datetime.fromisoformat(created_at_text)
-                entered_at_dt = datetime.fromisoformat(entered_at_text)
-            except ValueError:
-                continue
-            action_entry_days.append((entered_at_dt - created_at_dt).total_seconds() / 86400.0)
+            timing_days, _ = _timing_days_from_row(row)
+            if timing_days is not None:
+                action_entry_days.append(timing_days)
         if action_entry_days:
             entry_timing_by_action.append(
                 {
@@ -1804,6 +2270,7 @@ def _build_historical_effect_review_data(
         "prewatch_candidate_count": len(observation_rows_merged),
         "prewatch_light_push_count": len(prewatch_alert_rows),
         "promoted_confirmation_count": len(promoted_confirmation_rows),
+        "promoted_confirmation_deduped_merge_count": promoted_confirmation_deduped_merge_count,
         "simulated_entry_count": len(simulated_entry_rows),
         "simulated_pending_entry_count": len(simulated_pending_entry_rows),
         "exit_pool_transition_count": len(exit_from_promoted_rows),
@@ -1816,13 +2283,14 @@ def _build_historical_effect_review_data(
         "entry_to_completed_exit_rate": _percentage(len(simulated_completed_exit_rows), len(simulated_entry_rows)),
         "avg_confirmation_to_entry_days": _mean(confirmation_to_entry_days),
         "median_confirmation_to_entry_days": _median(confirmation_to_entry_days),
+        "confirmation_to_entry_timing_anomaly_count": confirmation_to_entry_timing_anomaly_count,
         "avg_entry_to_completed_exit_days": _mean(entry_to_completed_exit_days),
         "median_entry_to_completed_exit_days": _median(entry_to_completed_exit_days),
         "entry_timing_by_action": entry_timing_by_action,
         "completed_exit_timing_by_action": completed_exit_timing_by_action,
         "completed_exit_breakdown": simulated_exit_breakdown,
     }
-    return {
+    review = {
         "status": "正式" if formal_ready else "草稿",
         "status_label": "历史效果复盘（正式）" if formal_ready else "历史效果复盘（草稿）",
         "review_version": HISTORICAL_EFFECT_REVIEW_VERSION,
@@ -1901,9 +2369,28 @@ def _build_historical_effect_review_data(
         },
         "pool_funnel_summary": pool_funnel_summary,
         "simulation_funnel_summary": simulation_funnel_summary,
+        "path_quality_summary": path_quality_summary,
+        "auxiliary_path_quality_deduped_merge_count": auxiliary_deduped_merge_count,
         "candidate_evaluation_summary": candidate_evaluation_summary,
         "candidate_evaluation_trend_summary": candidate_evaluation_trend_summary,
         "recent_observation_samples": recent_observation_samples,
+        "observation_after_summary": {
+            "observation_count": len(observation_rows_merged),
+            "observation_alert_count": len(prewatch_alert_rows),
+            "promoted_confirmation_count": len(promoted_confirmation_rows),
+            "promoted_after_alert_count": len(promoted_after_light_push_rows),
+            "promoted_without_alert_count": max(
+                len(promoted_confirmation_rows) - len(promoted_after_light_push_rows),
+                0,
+            ),
+            "still_observing_symbol_count": len(still_observing_symbols),
+            "observation_to_alert_rate": _percentage(len(prewatch_alert_rows), len(observation_rows_merged)),
+            "observation_to_confirmation_rate": _percentage(len(promoted_confirmation_rows), len(observation_rows_merged)),
+            "alert_to_confirmation_rate": _percentage(len(promoted_after_light_push_rows), len(prewatch_alert_rows)),
+            "avg_days_to_confirmation": _mean(observation_to_confirmation_days),
+            "median_days_to_confirmation": _median(observation_to_confirmation_days),
+            "representative_samples": observation_after_samples,
+        },
         "auxiliary_observation": auxiliary_metrics,
         "breakdowns": {
             "event_type": event_breakdown,
@@ -1955,7 +2442,37 @@ def _build_historical_effect_review_data(
         "recommendations": deduped_recommendations[:6],
         "recommendation_details": prioritized_recommendations[:6],
     }
-
+    should_attach_comparison = include_comparison and int(days) == RECENT_PERFORMANCE_WINDOW_DAYS
+    if should_attach_comparison:
+        baseline_review = _build_historical_effect_review_data(
+            store,
+            days=BASELINE_PERFORMANCE_WINDOW_DAYS,
+            limit=limit,
+            include_comparison=False,
+        )
+        primary_snapshot = _build_review_window_snapshot(
+            review,
+            label=f"近 {RECENT_PERFORMANCE_WINDOW_DAYS} 天",
+            role_label="调参",
+            min_sample_size=SHORT_TERM_RECOMMENDATION_MIN_SAMPLES,
+        )
+        baseline_snapshot = _build_review_window_snapshot(
+            baseline_review,
+            label=f"近 {BASELINE_PERFORMANCE_WINDOW_DAYS} 天",
+            role_label="基准",
+            min_sample_size=BASELINE_RECOMMENDATION_MIN_SAMPLES,
+        )
+        review["comparison_windows"] = {
+            "primary": primary_snapshot,
+            "baseline": baseline_snapshot,
+            "summary": _build_dual_window_comparison_summary(primary_snapshot, baseline_snapshot),
+        }
+        _apply_dual_window_recommendation_guard(
+            review,
+            primary_snapshot=primary_snapshot,
+            baseline_snapshot=baseline_snapshot,
+        )
+    return review
 
 def _load_json_dict(value: Any) -> dict[str, Any]:
     if not value:
@@ -2174,7 +2691,7 @@ def _sample_status_label(row: dict[str, Any]) -> str:
         "hit_invalidation": "失效退出",
         "window_complete": "复盘窗口结算",
         "insufficient_lookahead": "观察中",
-        "not_entered": "未进场",
+        "not_entered": "未成交",
     }
     return mapping.get(str(row.get("close_reason") or "").strip(), "未回补")
 
@@ -2935,9 +3452,21 @@ def build_strategy_report_payload(
     event_types = store.aggregate_event_type_performance(since=since, until=until, limit=limit)
     source_stability = store.aggregate_source_stability(since=since, until=until, limit=limit)
     alert_volume = store.aggregate_alert_volume(since=since, until=until, limit=window["window_days"])
-    main_event_outcomes = store.aggregate_decision_outcomes_by_event_type(since=since, until=until, limit=limit)
-    main_pool_outcomes = store.aggregate_decision_outcomes_by_pool(since=since, until=until, limit=limit)
-    main_summary = _row_to_outcome_summary(store.summarize_decision_outcomes(since, until))
+    main_event_outcomes = store.aggregate_decision_outcomes_by_event_type(
+        since=since,
+        until=until,
+        limit=limit,
+        actions=EXECUTABLE_DECISION_ACTIONS,
+    )
+    main_pool_outcomes = store.aggregate_decision_outcomes_by_pool(
+        since=since,
+        until=until,
+        limit=limit,
+        actions=EXECUTABLE_DECISION_ACTIONS,
+    )
+    main_summary = _row_to_outcome_summary(
+        store.summarize_decision_outcomes(since, until, actions=EXECUTABLE_DECISION_ACTIONS)
+    )
     archive_event_outcomes: list[dict] | list[object] = []
     archive_pool_outcomes: list[dict] | list[object] = []
     archive_summary = {
@@ -2947,9 +3476,21 @@ def build_strategy_report_payload(
         "completed_count": 0,
     }
     if archive_store is not None:
-        archive_event_outcomes = archive_store.aggregate_decision_outcomes_by_event_type(since=since, until=until, limit=limit)
-        archive_pool_outcomes = archive_store.aggregate_decision_outcomes_by_pool(since=since, until=until, limit=limit)
-        archive_summary = _row_to_outcome_summary(archive_store.summarize_decision_outcomes(since, until))
+        archive_event_outcomes = archive_store.aggregate_decision_outcomes_by_event_type(
+            since=since,
+            until=until,
+            limit=limit,
+            actions=EXECUTABLE_DECISION_ACTIONS,
+        )
+        archive_pool_outcomes = archive_store.aggregate_decision_outcomes_by_pool(
+            since=since,
+            until=until,
+            limit=limit,
+            actions=EXECUTABLE_DECISION_ACTIONS,
+        )
+        archive_summary = _row_to_outcome_summary(
+            archive_store.summarize_decision_outcomes(since, until, actions=EXECUTABLE_DECISION_ACTIONS)
+        )
     decision_outcomes_by_event_type = _merge_outcome_rows(
         list(main_event_outcomes),
         list(archive_event_outcomes),
@@ -2990,8 +3531,16 @@ def build_strategy_report_payload(
 def _build_run_scoped_strategy_report(store: Store, *, run_id: str, limit: int) -> dict:
     event_type_rows = store.aggregate_event_type_performance_for_run(run_id, limit=limit)
     alert_rows = store.aggregate_alert_volume_for_run(run_id)
-    decision_outcomes_by_event_type = store.aggregate_decision_outcomes_by_event_type_for_run(run_id, limit=limit)
-    decision_outcomes_by_pool = store.aggregate_decision_outcomes_by_pool_for_run(run_id, limit=limit)
+    decision_outcomes_by_event_type = store.aggregate_decision_outcomes_by_event_type_for_run(
+        run_id,
+        limit=limit,
+        actions=EXECUTABLE_DECISION_ACTIONS,
+    )
+    decision_outcomes_by_pool = store.aggregate_decision_outcomes_by_pool_for_run(
+        run_id,
+        limit=limit,
+        actions=EXECUTABLE_DECISION_ACTIONS,
+    )
     source_health_rows = serialize_source_health(store.load_source_health(run_id))
     source_stability = []
     for row in source_health_rows:
@@ -3053,13 +3602,13 @@ def _build_historical_outcome_context(store: Store, *, days: int, limit: int) ->
     archive_store, _archive_db_path = _open_archive_store_if_available()
     try:
         event_type_context_rows = _merge_outcome_rows(
-            list(store.aggregate_decision_outcomes_by_event_type(since=since, limit=limit)),
-            list(archive_store.aggregate_decision_outcomes_by_event_type(since=since, limit=limit)) if archive_store is not None else [],
+            list(store.aggregate_decision_outcomes_by_event_type(since=since, limit=limit, actions=EXECUTABLE_DECISION_ACTIONS)),
+            list(archive_store.aggregate_decision_outcomes_by_event_type(since=since, limit=limit, actions=EXECUTABLE_DECISION_ACTIONS)) if archive_store is not None else [],
             key_field="event_type",
         )[:limit]
         pool_context_rows = _merge_outcome_rows(
-            list(store.aggregate_decision_outcomes_by_pool(since=since, limit=limit)),
-            list(archive_store.aggregate_decision_outcomes_by_pool(since=since, limit=limit)) if archive_store is not None else [],
+            list(store.aggregate_decision_outcomes_by_pool(since=since, limit=limit, actions=EXECUTABLE_DECISION_ACTIONS)),
+            list(archive_store.aggregate_decision_outcomes_by_pool(since=since, limit=limit, actions=EXECUTABLE_DECISION_ACTIONS)) if archive_store is not None else [],
             key_field="pool",
         )[:limit]
     finally:
@@ -3298,6 +3847,8 @@ def _build_decision_diagnostics(
         except json.JSONDecodeError:
             theme_ids = []
         event_type = str(row["event_type"] or packet.get("event_assessment", {}).get("event_type") or "").strip()
+        action = str(row["action"] or "").strip()
+        executable_action = action in EXECUTABLE_DECISION_ACTIONS
         items.append(
             {
                 "decision_id": row["decision_id"],
@@ -3309,7 +3860,7 @@ def _build_decision_diagnostics(
                     "confirmation": "确认池",
                     "exit": "兑现池",
                 }.get(row["pool"], row["pool"]),
-                "action": row["action"],
+                "action": action,
                 "priority": row["priority"],
                 "confidence": row["confidence"],
                 "event_score": row["event_score"],
@@ -3331,24 +3882,24 @@ def _build_decision_diagnostics(
                 "prewatch_last_alert_sent_at": str(packet.get("prewatch_last_alert_sent_at") or ""),
                 "prewatch_promotion_reason": str(packet.get("prewatch_promotion_reason") or ""),
                 "created_at": row["created_at"],
-                "entered": bool(row["entered"]) if row["entered"] is not None else False,
-                "entered_at": row["entered_at"],
-                "entry_price": row["entry_price"],
-                "exit_price": row["exit_price"],
-                "realized_return": row["realized_return"],
-                "holding_days": row["holding_days"],
-                "t_plus_1_return": row["t_plus_1_return"],
-                "t_plus_3_return": row["t_plus_3_return"],
-                "t_plus_5_return": row["t_plus_5_return"],
-                "t_plus_7_return": row["t_plus_7_return"],
-                "t_plus_10_return": row["t_plus_10_return"],
-                "t_plus_14_return": row["t_plus_14_return"],
-                "t_plus_30_return": row["t_plus_30_return"],
-                "max_runup": row["max_runup"],
-                "max_drawdown": row["max_drawdown"],
-                "hit_take_profit": bool(row["hit_take_profit"]) if row["hit_take_profit"] is not None else False,
-                "hit_invalidation": bool(row["hit_invalidation"]) if row["hit_invalidation"] is not None else False,
-                "close_reason": row["close_reason"] or "",
+                "entered": bool(row["entered"]) if executable_action and row["entered"] is not None else False,
+                "entered_at": row["entered_at"] if executable_action else "",
+                "entry_price": row["entry_price"] if executable_action else None,
+                "exit_price": row["exit_price"] if executable_action else None,
+                "realized_return": row["realized_return"] if executable_action else None,
+                "holding_days": row["holding_days"] if executable_action else None,
+                "t_plus_1_return": row["t_plus_1_return"] if executable_action else None,
+                "t_plus_3_return": row["t_plus_3_return"] if executable_action else None,
+                "t_plus_5_return": row["t_plus_5_return"] if executable_action else None,
+                "t_plus_7_return": row["t_plus_7_return"] if executable_action else None,
+                "t_plus_10_return": row["t_plus_10_return"] if executable_action else None,
+                "t_plus_14_return": row["t_plus_14_return"] if executable_action else None,
+                "t_plus_30_return": row["t_plus_30_return"] if executable_action else None,
+                "max_runup": row["max_runup"] if executable_action else None,
+                "max_drawdown": row["max_drawdown"] if executable_action else None,
+                "hit_take_profit": bool(row["hit_take_profit"]) if executable_action and row["hit_take_profit"] is not None else False,
+                "hit_invalidation": bool(row["hit_invalidation"]) if executable_action and row["hit_invalidation"] is not None else False,
+                "close_reason": (row["close_reason"] or "") if executable_action else "",
                 "event_type_outcome_context": event_type_context.get(event_type, {}),
                 "pool_outcome_context": pool_context.get(str(row["pool"] or ""), {}),
             }
@@ -3460,6 +4011,75 @@ def format_decision_history_archive(payload: dict) -> str:
         lines.append(f"已删除：记录 {payload.get('deleted_records', 0)} / 后验 {payload.get('deleted_outcomes', 0)}")
     else:
         lines.append("当前仅做预演统计，未修改主库。")
+    return "\n".join(lines)
+
+
+def build_non_executable_outcome_cleanup_payload(
+    store: Store,
+    *,
+    actions: tuple[str, ...] | list[str] = (OBSERVATION_DECISION_ACTION,),
+    since: str = "",
+    until: str = "",
+    limit: int = 0,
+    apply: bool = False,
+) -> dict[str, Any]:
+    rows = [dict(row) for row in store.load_decision_outcomes_for_actions(actions=actions, since=since, until=until, limit=limit)]
+    decision_ids = [str(row.get("decision_id") or "").strip() for row in rows if str(row.get("decision_id") or "").strip()]
+    deleted_count = store.delete_decision_outcomes(decision_ids) if apply and decision_ids else 0
+    sample_rows = []
+    for row in rows[:10]:
+        sample_rows.append(
+            {
+                "decision_id": str(row.get("decision_id") or ""),
+                "run_id": str(row.get("run_id") or ""),
+                "symbol": str(row.get("symbol") or ""),
+                "pool": str(row.get("pool") or ""),
+                "action": str(row.get("action") or ""),
+                "created_at": str(row.get("created_at") or ""),
+                "entered": bool(row.get("entered")),
+                "close_reason": str(row.get("close_reason") or ""),
+                "realized_return": row.get("realized_return"),
+                "outcome_updated_at": str(row.get("outcome_updated_at") or ""),
+            }
+        )
+    return {
+        "mode": "apply" if apply else "dry_run",
+        "target_actions": [str(item) for item in actions if str(item).strip()],
+        "since": since,
+        "until": until,
+        "matched_outcomes": len(rows),
+        "deleted_outcomes": deleted_count,
+        "sample_rows": sample_rows,
+    }
+
+
+def format_non_executable_outcome_cleanup(payload: dict[str, Any]) -> str:
+    lines = [
+        "历史后验清理：",
+        f"模式：{'正式清理' if payload.get('mode') == 'apply' else '预演'}",
+        f"目标动作：{'、'.join(payload.get('target_actions') or []) or '-'}",
+        f"命中 outcome：{payload.get('matched_outcomes', 0)}",
+    ]
+    if payload.get("since") or payload.get("until"):
+        lines.append(
+            "时间范围："
+            f"{payload.get('since') or '-'} ~ {payload.get('until') or '-'}"
+        )
+    if payload.get("mode") == "apply":
+        lines.append(f"已删除 outcome：{payload.get('deleted_outcomes', 0)}")
+    else:
+        lines.append("当前仅预演统计，未修改数据库。")
+    sample_rows = payload.get("sample_rows") or []
+    if sample_rows:
+        lines.append("样本：")
+        for row in sample_rows:
+            lines.append(
+                "  "
+                f"{row.get('created_at', '-')} | {row.get('symbol', '-')} | "
+                f"{row.get('action', '-')} | entered={row.get('entered', False)} | "
+                f"close_reason={row.get('close_reason', '-') or '-'} | "
+                f"realized_return={row.get('realized_return', '-')}"
+            )
     return "\n".join(lines)
 
 
@@ -4186,6 +4806,7 @@ def build_performance_review_payload(
             limit=limit,
             start_date=review_start,
             end_date=review_end,
+            include_comparison=target_paths["review_scope"] == "rolling",
         )
         historical_effect_review["review_scope"] = target_paths["review_scope"]
         historical_effect_review["review_scope_label"] = target_paths["review_scope_label"]
@@ -4323,6 +4944,7 @@ def write_live_run_artifacts(
     )
     _write_report(review_path, review_text)
     _write_json(payload_path, payload)
+    connectivity_issues = summarize_external_connectivity_issues(payload["source_health"])
     should_refresh_historical_effect = _should_refresh_historical_effect_review(
         workspace_dir=workspace_dir,
         min_interval_seconds=historical_effect_min_interval_seconds,
@@ -4361,6 +4983,7 @@ def write_live_run_artifacts(
         "llm_usage_report_path": llm_usage_report_path,
         "llm_usage_report_refreshed": should_refresh_llm_usage,
         "payload_path": str(payload_path),
+        "external_connectivity_issues": connectivity_issues,
     }
 
 
@@ -4386,6 +5009,10 @@ def format_live_run_artifacts(payload: dict) -> str:
         f"运行过程复盘：{payload.get('review_path', '-')}",
         historical_effect_line,
     ]
+    connectivity_issues = payload.get("external_connectivity_issues") or {}
+    if connectivity_issues.get("has_issue"):
+        sources = "、".join(connectivity_issues.get("sources") or []) or "外部数据源"
+        lines.append(f"外网提醒：检测到 {sources} 连通性异常，请先检查 VPN/当前网络。")
     if monthly_outputs:
         lines.append(f"同步月报：{len(monthly_outputs)} 份")
         for item in monthly_outputs:
@@ -5399,6 +6026,13 @@ def main() -> None:
     outcome_parser.add_argument("--recompute-existing", action="store_true")
     outcome_parser.add_argument("--json", action="store_true")
 
+    cleanup_outcome_parser = subparsers.add_parser("cleanup-decision-outcomes")
+    cleanup_outcome_parser.add_argument("--since", default="")
+    cleanup_outcome_parser.add_argument("--until", default="")
+    cleanup_outcome_parser.add_argument("--limit", type=int, default=0)
+    cleanup_outcome_parser.add_argument("--apply", action="store_true")
+    cleanup_outcome_parser.add_argument("--json", action="store_true")
+
     archive_parser = subparsers.add_parser("archive-decision-history")
     archive_parser.add_argument("--before", required=True, help="Archive decision history created before this ISO timestamp/date")
     archive_parser.add_argument("--archive-db-path", default=str(DEFAULT_ARCHIVE_DB_PATH))
@@ -5769,6 +6403,20 @@ def main() -> None:
             print(json.dumps(payload, indent=2, sort_keys=True))
             return
         print(format_decision_outcome_backfill(payload))
+        return
+    if args.command == "cleanup-decision-outcomes":
+        payload = build_non_executable_outcome_cleanup_payload(
+            store,
+            actions=(OBSERVATION_DECISION_ACTION,),
+            since=args.since,
+            until=args.until,
+            limit=args.limit,
+            apply=args.apply,
+        )
+        if args.json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+            return
+        print(format_non_executable_outcome_cleanup(payload))
         return
     if args.command == "archive-decision-history":
         archive_db_path = Path(args.archive_db_path).resolve()

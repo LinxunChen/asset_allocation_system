@@ -453,6 +453,42 @@ def serialize_source_health(rows: Iterable[object]) -> list[dict[str, Any]]:
     ]
 
 
+def _is_external_connectivity_issue(detail: str) -> bool:
+    normalized = (detail or "").lower()
+    markers = (
+        "urlerror",
+        "nodename nor servname provided",
+        "temporary failure in name resolution",
+        "name or service not known",
+        "getaddrinfo failed",
+        "network is unreachable",
+        "no route to host",
+        "failed to establish a new connection",
+    )
+    return any(marker in normalized for marker in markers)
+
+
+def _external_connectivity_hint(source_name: str) -> str:
+    return f"{source_name}：检测到外网连通性异常，请先检查 VPN 或当前网络。"
+
+
+def summarize_external_connectivity_issues(source_health: list[dict[str, Any]] | Iterable[object]) -> dict[str, Any]:
+    rows = list(source_health)
+    affected_sources: list[str] = []
+    for row in rows:
+        detail = str(getattr(row, "get", lambda _k, _d=None: _d)("detail", "") if hasattr(row, "get") else row["detail"])
+        status = str(getattr(row, "get", lambda _k, _d=None: _d)("status", "") if hasattr(row, "get") else row["status"])
+        source_name = str(getattr(row, "get", lambda _k, _d=None: _d)("source_name", "") if hasattr(row, "get") else row["source_name"])
+        if status != "healthy" and _is_external_connectivity_issue(detail):
+            affected_sources.append(source_name)
+    unique_sources = sorted({item for item in affected_sources if item})
+    return {
+        "count": len(unique_sources),
+        "sources": unique_sources,
+        "has_issue": bool(unique_sources),
+    }
+
+
 def serialize_strategy_report(
     event_types: Iterable[object],
     source_stability: Iterable[object],
@@ -1057,13 +1093,391 @@ def _format_breakdown_section(
             "  "
             f"{row.get('label', row.get('key', '-'))}："
             f"样本 {row.get('decision_count', 0)} 条，"
-            f"已进场 {row.get('entered_count', 0)} 条，"
+        f"已成交 {row.get('entered_count', 0)} 条，"
             f"止盈 {row.get('take_profit_exit_count', 0)} 条，"
             f"失效 {row.get('invalidation_exit_count', 0)} 条，"
             f"复盘窗口结算 {row.get('window_complete_count', 0)} 条，"
             f"平均真实收益 {_format_metric_value(row.get('avg_realized_return'), suffix='%')}，"
             f"胜率 {_format_rate_value(row.get('win_rate'))}"
         )
+    return lines
+
+
+def _format_comparison_cell(value: Any, *, value_type: str = "metric") -> str:
+    if value_type == "rate":
+        return _format_rate_value(value)
+    if value_type == "percent":
+        return _format_metric_value(value, suffix="%")
+    return _format_metric_value(value)
+
+
+def _format_dual_window_comparison_lines(comparison_windows: dict[str, Any]) -> list[str]:
+    primary = comparison_windows.get("primary") or {}
+    baseline = comparison_windows.get("baseline") or {}
+    summary = comparison_windows.get("summary") or {}
+    primary_label = f"{primary.get('label', '近30天')}（{primary.get('role_label', '调参')}）"
+    baseline_label = f"{baseline.get('label', '近90天')}（{baseline.get('role_label', '基准')}）"
+    lines = ["核心指标摘要："]
+    lines.append(f"| 指标 | {primary_label} | {baseline_label} | 状态 |")
+    lines.append("| --- | --- | --- | --- |")
+    for row in summary.get("metrics") or []:
+        lines.append(
+            "| "
+            f"{row.get('label', '-')} | "
+            f"{_format_comparison_cell(row.get('primary_value'), value_type=str(row.get('value_type') or 'metric'))} | "
+            f"{_format_comparison_cell(row.get('baseline_value'), value_type=str(row.get('value_type') or 'metric'))} | "
+            f"{row.get('status', '样本不足')} |"
+        )
+    if not (summary.get("metrics") or []):
+        lines.append("| 暂无可比较指标 | 暂无 | 暂无 | 样本不足 |")
+    for line in summary.get("summary_lines") or []:
+        lines.append(f"状态判断：{line}")
+    return lines
+
+
+def _format_simulation_snapshot_lines(snapshot: dict[str, Any]) -> list[str]:
+    role_label = str(snapshot.get("role_label") or "").strip()
+    label = str(snapshot.get("label") or "-")
+    if role_label:
+        label = f"{label}（{role_label}）"
+    funnel = snapshot.get("simulation_funnel_summary") or {}
+    lines = [f"  {label}："]
+    if int(funnel.get("promoted_confirmation_count", 0) or 0) <= 0:
+        lines.append("    当前窗口内还没有形成可计算的模拟闭环样本。")
+        return lines
+    lines.append(
+        "    "
+        f"观察 {funnel.get('prewatch_candidate_count', 0)} 条 -> "
+        f"观察提醒 {funnel.get('prewatch_light_push_count', 0)} 条 -> "
+        f"确认机会 {funnel.get('promoted_confirmation_count', 0)} 条"
+    )
+    lines.append(
+        "    "
+        f"模拟成交 {funnel.get('simulated_entry_count', 0)} 条 "
+        f"（确认机会 -> 模拟成交 {_format_rate_value(funnel.get('confirmation_to_entry_rate'))}）"
+    )
+    lines.append(
+        "    "
+        f"进入兑现池 {funnel.get('exit_pool_transition_count', 0)} 条 / "
+        f"模拟退出完成 {funnel.get('simulated_completed_exit_count', 0)} 条"
+    )
+    lines.append(
+        "    "
+        f"另有未成交 {funnel.get('simulated_pending_entry_count', 0)} 条，"
+        f"已成交未结束 {funnel.get('simulated_open_count', 0)} 条。"
+    )
+    return lines
+
+
+def _format_path_quality_snapshot_lines(snapshot: dict[str, Any]) -> list[str]:
+    role_label = str(snapshot.get("role_label") or "").strip()
+    label = str(snapshot.get("label") or "-")
+    if role_label:
+        label = f"{label}（{role_label}）"
+    summary = snapshot.get("path_quality_summary") or {}
+    lines = [f"  {label}："]
+    lines.append(
+        "    "
+        f"路径极值：平均最大浮盈 {_format_metric_value(summary.get('avg_max_runup'), suffix='%')} "
+        f"（样本 {int(summary.get('max_runup_sample_count', 0) or 0)} 条） / "
+        f"平均最大回撤 {_format_metric_value(summary.get('avg_max_drawdown'), suffix='%')} "
+        f"（样本 {int(summary.get('max_drawdown_sample_count', 0) or 0)} 条）"
+    )
+    checkpoint_rows = list(summary.get("checkpoints") or [])
+    if checkpoint_rows:
+        lines.append("    固定观察日：")
+        for row in checkpoint_rows:
+            lines.append(
+                "      "
+                f"{row.get('label', '-')}：样本 {int(row.get('sample_count', 0) or 0)} 条，"
+                f"平均 {_format_metric_value(row.get('avg_return'), suffix='%')}，"
+                f"正收益占比 {_format_rate_value(row.get('positive_rate'))}"
+            )
+    else:
+        lines.append("    固定观察日：暂无已成熟样本。")
+    best_runup_samples = list(summary.get("best_runup_samples") or [])
+    if best_runup_samples:
+        lines.append("    最大浮盈 Top3：")
+        for row in best_runup_samples:
+            lines.append(
+                "      "
+                f"{row.get('symbol', '-')}（{row.get('action_display', row.get('action', '-'))}）"
+                f" | 最大浮盈 {_format_metric_value(row.get('max_runup'), suffix='%')}"
+            )
+    worst_drawdown_samples = list(summary.get("worst_drawdown_samples") or [])
+    if worst_drawdown_samples:
+        lines.append("    最大回撤 Top3：")
+        for row in worst_drawdown_samples:
+            lines.append(
+                "      "
+                f"{row.get('symbol', '-')}（{row.get('action_display', row.get('action', '-'))}）"
+                f" | 最大回撤 {_format_metric_value(row.get('max_drawdown'), suffix='%')}"
+            )
+    if int(summary.get("deduped_merge_count", 0) or 0) > 0:
+        lines.append(
+            "    "
+            f"补充：已按代表样本合并 {int(summary.get('deduped_merge_count', 0) or 0)} 条重复路径记录。"
+        )
+    lines.append(f"    状态判断：{summary.get('observation_line') or '路径质量样本仍不足。'}")
+    lines.append("    说明：截至目前路径统计，不等于完整持有周期结果。")
+    return lines
+
+
+def _comparison_status_for_counts(primary_value: Any, baseline_value: Any) -> str:
+    if primary_value is None or baseline_value is None:
+        return "样本不足"
+    try:
+        primary = float(primary_value)
+        baseline = float(baseline_value)
+    except (TypeError, ValueError):
+        return "样本不足"
+    if baseline <= 0:
+        return "样本不足"
+    tolerance = max(baseline * 0.1, 1.0)
+    if abs(primary - baseline) <= tolerance:
+        return "基本持平"
+    return "样本增多" if primary > baseline else "样本减少"
+
+
+def _comparison_status_for_quality(primary_value: Any, baseline_value: Any, *, higher_is_better: bool = True) -> str:
+    if primary_value is None or baseline_value is None:
+        return "样本不足"
+    try:
+        primary = float(primary_value)
+        baseline = float(baseline_value)
+    except (TypeError, ValueError):
+        return "样本不足"
+    if abs(primary - baseline) <= 0.05:
+        return "基本持平"
+    if higher_is_better:
+        return "短期改善" if primary > baseline else "短期转弱"
+    return "短期改善" if primary < baseline else "短期转弱"
+
+
+def _build_review_glossary(review: dict[str, Any]) -> list[str]:
+    terms = []
+    if review.get("comparison_windows"):
+        terms.extend(
+            [
+                "完整模拟闭环：看一笔信号有没有走完整个模拟交易流程。",
+                "路径质量 / 浮盈浮亏摘要：看已模拟成交样本在持有过程中的利润空间、回撤和延续性。",
+                "三池漏斗：看观察、确认、兑现这条筛选链路顺不顺。",
+                "模拟退出完成：包含止盈退出、失效退出、窗口结算，不是只指止盈。",
+            ]
+        )
+    return terms
+
+
+def _build_core_metric_rows(review: dict[str, Any]) -> list[dict[str, Any]]:
+    comparison = review.get("comparison_windows") or {}
+    primary = comparison.get("primary") or {}
+    baseline = comparison.get("baseline") or {}
+    primary_overview = primary.get("overview") or review.get("overview") or {}
+    baseline_overview = baseline.get("overview") or {}
+    primary_execution = primary.get("execution_quality") or review.get("execution_quality") or {}
+    baseline_execution = baseline.get("execution_quality") or {}
+    primary_sim = primary.get("simulation_funnel_summary") or review.get("simulation_funnel_summary") or {}
+    baseline_sim = baseline.get("simulation_funnel_summary") or {}
+    if not comparison:
+        return []
+    return [
+        {
+            "label": "决策总数",
+            "primary": primary_overview.get("decision_count"),
+            "baseline": baseline_overview.get("decision_count"),
+            "status": _comparison_status_for_counts(primary_overview.get("decision_count"), baseline_overview.get("decision_count")),
+            "type": "count",
+        },
+        {
+            "label": "模拟成交率",
+            "primary": primary_execution.get("entry_hit_rate"),
+            "baseline": baseline_execution.get("entry_hit_rate"),
+            "status": _comparison_status_for_quality(primary_execution.get("entry_hit_rate"), baseline_execution.get("entry_hit_rate")),
+            "type": "rate",
+        },
+        {
+            "label": "模拟退出完成率",
+            "primary": primary_sim.get("entry_to_completed_exit_rate"),
+            "baseline": baseline_sim.get("entry_to_completed_exit_rate"),
+            "status": _comparison_status_for_quality(primary_sim.get("entry_to_completed_exit_rate"), baseline_sim.get("entry_to_completed_exit_rate")),
+            "type": "rate",
+        },
+        {
+            "label": "已完成闭环样本数",
+            "primary": primary_sim.get("simulated_completed_exit_count"),
+            "baseline": baseline_sim.get("simulated_completed_exit_count"),
+            "status": _comparison_status_for_counts(primary_sim.get("simulated_completed_exit_count"), baseline_sim.get("simulated_completed_exit_count")),
+            "type": "count",
+        },
+        {
+            "label": "平均模拟已实现收益",
+            "primary": primary_overview.get("avg_realized_return"),
+            "baseline": baseline_overview.get("avg_realized_return"),
+            "status": _comparison_status_for_quality(primary_overview.get("avg_realized_return"), baseline_overview.get("avg_realized_return")),
+            "type": "percent",
+        },
+        {
+            "label": "模拟已实现胜率",
+            "primary": primary_overview.get("win_rate"),
+            "baseline": baseline_overview.get("win_rate"),
+            "status": _comparison_status_for_quality(primary_overview.get("win_rate"), baseline_overview.get("win_rate")),
+            "type": "rate",
+        },
+    ]
+
+
+def _format_core_metric_summary_lines(review: dict[str, Any]) -> list[str]:
+    rows = _build_core_metric_rows(review)
+    if not rows:
+        return []
+    lines = ["核心指标摘要：", "定位：看近30天相对90天有没有偏离基准。", "| 指标 | 近 30 天（调参） | 近 90 天（基准） | 状态 |", "| --- | --- | --- | --- |"]
+    for row in rows:
+        lines.append(
+            "| "
+            f"{row['label']} | "
+            f"{_format_comparison_cell(row['primary'], value_type=row['type'])} | "
+            f"{_format_comparison_cell(row['baseline'], value_type=row['type'])} | "
+            f"{row['status']} |"
+        )
+    lines.append("说明：状态表示近30天相对近90天的变化，不是绝对好坏结论。")
+    return lines
+
+
+def _summarize_simulation_bottleneck(primary: dict[str, Any], baseline: dict[str, Any]) -> str:
+    primary_funnel = primary.get("simulation_funnel_summary") or {}
+    baseline_funnel = baseline.get("simulation_funnel_summary") or {}
+    rate_rows = [
+        ("确认机会 -> 模拟成交", primary_funnel.get("confirmation_to_entry_rate"), baseline_funnel.get("confirmation_to_entry_rate")),
+        ("模拟成交 -> 进入兑现池", primary_funnel.get("entry_to_exit_pool_rate"), baseline_funnel.get("entry_to_exit_pool_rate")),
+        ("模拟成交 -> 模拟退出完成", primary_funnel.get("entry_to_completed_exit_rate"), baseline_funnel.get("entry_to_completed_exit_rate")),
+    ]
+    available = []
+    for label, primary_value, baseline_value in rate_rows:
+        if primary_value is None:
+            continue
+        baseline_gap = None
+        if baseline_value is not None:
+            try:
+                baseline_gap = float(primary_value) - float(baseline_value)
+            except (TypeError, ValueError):
+                baseline_gap = None
+        available.append((label, float(primary_value), baseline_gap))
+    if not available:
+        return "当前样本还不足以判断主要瓶颈。"
+    available.sort(key=lambda item: (item[1], item[2] if item[2] is not None else 0.0))
+    label, primary_rate, baseline_gap = available[0]
+    if baseline_gap is not None and baseline_gap < -0.05:
+        return f"当前瓶颈：{label}转化率低于90天基准。"
+    return f"当前瓶颈：{label}转化率是当前闭环里最弱的一段。"
+
+
+def _format_main_simulation_lines(review: dict[str, Any]) -> list[str]:
+    comparison = review.get("comparison_windows") or {}
+    primary = comparison.get("primary") or {}
+    baseline = comparison.get("baseline") or {}
+    if not comparison:
+        return []
+    primary_funnel = primary.get("simulation_funnel_summary") or {}
+    baseline_funnel = baseline.get("simulation_funnel_summary") or {}
+    lines = ["完整模拟闭环：", "定位：看机会从观察到模拟退出，主要卡在哪一段。"]
+    lines.append(
+        "近30天（调参）："
+        f" 确认机会 -> 模拟成交 {_format_rate_value(primary_funnel.get('confirmation_to_entry_rate'))}"
+        f" / 模拟成交 -> 进入兑现池 {_format_rate_value(primary_funnel.get('entry_to_exit_pool_rate'))}"
+        f" / 模拟成交 -> 模拟退出完成 {_format_rate_value(primary_funnel.get('entry_to_completed_exit_rate'))}"
+    )
+    lines.append(
+        "近90天（基准）："
+        f" 确认机会 -> 模拟成交 {_format_rate_value(baseline_funnel.get('confirmation_to_entry_rate'))}"
+        f" / 模拟成交 -> 进入兑现池 {_format_rate_value(baseline_funnel.get('entry_to_exit_pool_rate'))}"
+        f" / 模拟成交 -> 模拟退出完成 {_format_rate_value(baseline_funnel.get('entry_to_completed_exit_rate'))}"
+    )
+    completed_exit_breakdown = primary_funnel.get("completed_exit_breakdown") or {}
+    parts = []
+    if int(completed_exit_breakdown.get("exit_pool", 0) or 0) > 0:
+        parts.append(f"止盈/兑现 {completed_exit_breakdown.get('exit_pool', 0)}")
+    if int(completed_exit_breakdown.get("hit_take_profit", 0) or 0) > 0:
+        parts.append(f"止盈位 {completed_exit_breakdown.get('hit_take_profit', 0)}")
+    if int(completed_exit_breakdown.get("hit_invalidation", 0) or 0) > 0:
+        parts.append(f"失效退出 {completed_exit_breakdown.get('hit_invalidation', 0)}")
+    if int(completed_exit_breakdown.get("window_complete", 0) or 0) > 0:
+        parts.append(f"窗口结算 {completed_exit_breakdown.get('window_complete', 0)}")
+    lines.append(_summarize_simulation_bottleneck(primary, baseline))
+    if parts:
+        lines.append(f"说明：近30天模拟退出完成里包含 {' / '.join(parts)}。")
+    else:
+        lines.append("说明：模拟退出完成包含止盈退出、失效退出、窗口结算，不是只指止盈。")
+    anomaly_count = int(primary_funnel.get("confirmation_to_entry_timing_anomaly_count", 0) or 0)
+    if anomaly_count > 0:
+        lines.append(f"补充：已跳过 {anomaly_count} 条成交时间早于决策时间的异常样本。")
+    return lines
+
+
+def _format_main_path_quality_lines(review: dict[str, Any]) -> list[str]:
+    comparison = review.get("comparison_windows") or {}
+    if comparison:
+        primary = comparison.get("primary") or {}
+        baseline = comparison.get("baseline") or {}
+        lines = ["路径质量 / 浮盈浮亏摘要：", "定位：看已模拟成交样本在持有过程中的利润空间、回撤和延续性，包含已退出与未退出样本。"]
+        lines.extend(_format_path_quality_snapshot_lines(primary))
+        lines.extend(_format_path_quality_snapshot_lines(baseline))
+        return lines
+    return [
+        "路径质量 / 浮盈浮亏摘要：",
+        "定位：看已模拟成交样本在持有过程中的利润空间、回撤和延续性，包含已退出与未退出样本。",
+        *_format_path_quality_snapshot_lines(
+            {
+                "label": "当前窗口",
+                "role_label": "",
+                "path_quality_summary": review.get("path_quality_summary") or {},
+            }
+        ),
+    ]
+
+
+def _build_action_conclusion(review: dict[str, Any]) -> tuple[str, list[str], str]:
+    comparison = review.get("comparison_windows") or {}
+    primary_gate = ((comparison.get("primary") or {}).get("sample_gate") or {})
+    baseline_gate = ((comparison.get("baseline") or {}).get("sample_gate") or {})
+    recommendations = list(review.get("recommendations") or [])
+    recommendation_details = list(review.get("recommendation_details") or [])
+    if not primary_gate.get("sufficient", True) or not baseline_gate.get("sufficient", True):
+        reason = recommendations[0] if recommendations else "当前样本量不足，先观察。"
+        return ("样本量不足，先观察，不建议直接调整参数", [], reason)
+    checklist = _build_recommendation_parameter_checklist(recommendation_details, limit=3)
+    has_adjustable = bool(checklist)
+    current = "可开始小步调参" if has_adjustable else "优先先排查"
+    reason_lines = recommendations[:2] if recommendations else ["当前样本还不足以形成明确建议，继续积累完整样本。"]
+    return (current, checklist, "；".join(reason_lines))
+
+
+def _format_executive_summary_lines(review: dict[str, Any]) -> list[str]:
+    comparison = review.get("comparison_windows") or {}
+    summary = comparison.get("summary") or {}
+    current_conclusion, _, why = _build_action_conclusion(review)
+    lines = ["执行摘要："]
+    for line in summary.get("summary_lines") or []:
+        lines.append(f"  近30天相对90天：{line}")
+    primary_gate = ((comparison.get("primary") or {}).get("sample_gate") or {})
+    baseline_gate = ((comparison.get("baseline") or {}).get("sample_gate") or {})
+    if primary_gate:
+        if primary_gate.get("sufficient"):
+            lines.append("  样本状态：30d 样本已达到调参观察门槛。")
+        else:
+            lines.append(
+                f"  样本状态：30d 样本不足（{int(primary_gate.get('decision_count', 0) or 0)} 条），先观察。"
+            )
+    if baseline_gate and not baseline_gate.get("sufficient", True):
+        lines.append(
+            f"  中期基准：90d 样本仍偏薄（{int(baseline_gate.get('decision_count', 0) or 0)} 条）。"
+        )
+    lines.append(f"  当前问题：{_summarize_simulation_bottleneck(comparison.get('primary') or {}, comparison.get('baseline') or {})}")
+    path_summary = ((comparison.get("primary") or {}).get("path_quality_summary") or review.get("path_quality_summary") or {})
+    if path_summary.get("observation_line"):
+        lines.append(f"  路径质量：{path_summary.get('observation_line')}")
+    lines.append(f"  当前建议：{current_conclusion}")
+    if why:
+        lines.append(f"  说明：{why}")
     return lines
 
 
@@ -1183,7 +1597,7 @@ def _format_exit_price_cell(row: dict[str, Any]) -> str:
     close_reason = str(row.get("close_reason") or "").strip()
     if not entered:
         if close_reason == "not_entered":
-            return "未进场"
+            return "未成交"
         if close_reason == "insufficient_lookahead":
             return "待更多后验"
         return "暂无"
@@ -2122,7 +2536,7 @@ def _summarize_batch(
     if not valid_returns:
         if top_ranked:
             line_items.append(
-                f"Top output: {top_ranked['name']}，已进场 {top_ranked['entered_count']}，当前还没有足够成熟样本做真实收益比较。"
+                f"Top output: {top_ranked['name']}，已成交 {top_ranked['entered_count']}，当前还没有足够成熟样本做真实收益比较。"
             )
         output_counts = {
             item["name"]: (
@@ -2449,8 +2863,11 @@ def format_source_health(rows: Iterable[object]) -> str:
     lines = ["source  status  checked_at  latency_ms  detail"]
     for row in items:
         latency = row["latency_ms"] if row["latency_ms"] is not None else "-"
+        detail = row["detail"]
+        if row["status"] != "healthy" and _is_external_connectivity_issue(str(detail)):
+            detail = "外网连通性异常，请检查 VPN/网络。"
         lines.append(
-            f"{row['source_name']}  {row['status']}  {format_beijing_minute(row['checked_at'])}  {latency}  {row['detail']}"
+            f"{row['source_name']}  {row['status']}  {format_beijing_minute(row['checked_at'])}  {latency}  {detail}"
         )
     return "\n".join(lines)
 
@@ -2628,55 +3045,102 @@ def format_recent_performance_review(review: dict[str, Any]) -> str:
     appendix = review.get("appendix") or {}
     formal_readiness = review.get("formal_readiness") or {}
     adjusted_status = review.get("adjusted_price_status") or {}
-    lines = [str(review.get("status_label") or "历史效果复盘")]
-    lines.append(f"状态：{review.get('status', '-')}")
-    lines.append(f"复盘口径版本：{review.get('review_version', '-')}")
-    lines.append(f"统计区间：{window.get('start_date', '-')} ~ {window.get('end_date', '-')}")
-    lines.append(f"历史回补截止：{format_beijing_minute(review.get('backfill_cutoff_at'))}")
-    lines.append(f"正式版门槛：{formal_readiness.get('status_label', '-')}")
+    lines = [f"# {str(review.get('status_label') or '历史效果复盘')}"]
+    lines.append(f"- 状态：{review.get('status', '-')}")
+    lines.append(f"- 复盘口径版本：{review.get('review_version', '-')}")
+    lines.append(f"- 统计区间：{window.get('start_date', '-')} ~ {window.get('end_date', '-')}")
+    lines.append(f"- 历史回补截止：{format_beijing_minute(review.get('backfill_cutoff_at'))}")
+    lines.append(f"- 正式版门槛：{formal_readiness.get('status_label', '-')}")
     if adjusted_status:
         lines.append(
-            f"复权状态：{'已满足' if review.get('adjusted_price_protection_ready') else '未满足'}"
+            f"- 复权状态：{'已满足' if review.get('adjusted_price_protection_ready') else '未满足'}"
             f"（覆盖 {len(adjusted_status.get('coverage') or [])} 个标的）"
         )
     sample_audit = review.get("sample_audit") or {}
     if sample_audit:
-        lines.append(f"程序抽检：{sample_audit.get('status', '-')}")
+        lines.append(f"- 程序抽检：{sample_audit.get('status', '-')}")
         if sample_audit.get("summary_line"):
-            lines.append(f"程序抽检说明：{sample_audit.get('summary_line')}")
+            lines.append(f"- 程序抽检说明：{sample_audit.get('summary_line')}")
     ai_review = review.get("ai_review") or review.get("manual_audit") or {}
     if ai_review:
-        lines.append(f"AI复核：{ai_review.get('status', '-')}")
+        lines.append(f"- AI复核：{ai_review.get('status', '-')}")
         if ai_review.get("summary_line"):
-            lines.append(f"AI复核说明：{ai_review.get('summary_line')}")
+            lines.append(f"- AI复核说明：{ai_review.get('summary_line')}")
     for blocker in formal_readiness.get("blockers", []):
-        lines.append(f"阻塞项：{blocker}")
+        lines.append(f"- 阻塞项：{blocker}")
     for reason in review.get("draft_reasons", []):
-        lines.append(f"说明：{reason}")
+        lines.append(f"- 说明：{reason}")
 
-    lines.append("总体效果：")
+    glossary = _build_review_glossary(review)
+    if glossary:
+        lines.append("## 阅读备注：")
+        for line in glossary:
+            lines.append(f"- {line}")
+        lines.append("")
+
+    lines.append("## 执行摘要：")
+    summary_lines = _format_executive_summary_lines(review)
+    if summary_lines:
+        for line in summary_lines[1:]:
+            stripped = str(line).strip()
+            if stripped:
+                lines.append(f"- {stripped}")
+    lines.append("")
+    lines.append("## 核心面板")
+    core_metric_lines = _format_core_metric_summary_lines(review)
+    if core_metric_lines:
+        lines.append("### 核心指标摘要：")
+        lines.extend(core_metric_lines[1:])
+        lines.append("")
+    simulation_lines = _format_main_simulation_lines(review)
+    if simulation_lines:
+        lines.append("### 完整模拟闭环：")
+        lines.extend(simulation_lines[1:])
+        lines.append("")
+    path_quality_lines = _format_main_path_quality_lines(review)
+    if path_quality_lines:
+        lines.append("### 路径质量 / 浮盈浮亏摘要：")
+        lines.extend(path_quality_lines[1:])
+        lines.append("")
+
+    current_conclusion, checklist, why = _build_action_conclusion(review)
+    lines.append("## 下一步建议：")
+    lines.append("定位：基于30d触发、90d校验，告诉你现在该调、该查，还是先观察。")
+    lines.append(f"当前结论：{current_conclusion}")
+    if checklist:
+        lines.append("优先检查项：")
+        for index, item in enumerate(checklist, start=1):
+            lines.append(f"  {index}. {item}")
+    else:
+        lines.append("优先检查项：当前没有建议直接动的参数，优先先观察或排查。")
+    if why:
+        lines.append(f"为什么是这个结论：{why}")
+    lines.append("")
+
+    lines.append("## 附录：")
+    lines.append("#### 总体效果：")
     lines.append(f"  决策总数：{overview.get('decision_count', 0)}")
-    lines.append(f"  已进场（试探建仓/确认做多）：{overview.get('entered_count', 0)}")
-    lines.append(f"  观察中（已进场后）：{overview.get('open_position_count', 0)}")
-    lines.append(f"  止盈退出（已进场后）：{overview.get('take_profit_exit_count', 0)}")
-    lines.append(f"  失效退出（已进场后）：{overview.get('invalidation_exit_count', 0)}")
-    lines.append(f"  复盘窗口结算（已进场后）：{overview.get('window_complete_count', 0)}")
-    lines.append(f"  未进场（试探建仓/确认做多，但未到入场区间）：{overview.get('not_entered_count', 0)}")
-    lines.append(f"  平均真实收益：{_format_metric_value(overview.get('avg_realized_return'), suffix='%')}")
-    lines.append(f"  中位数真实收益：{_format_metric_value(overview.get('median_realized_return'), suffix='%')}")
-    lines.append(f"  胜率：{_format_rate_value(overview.get('win_rate'))}")
+    lines.append(f"  已成交（试探建仓/确认做多）：{overview.get('entered_count', 0)}")
+    lines.append(f"  观察中（已成交后）：{overview.get('open_position_count', 0)}")
+    lines.append(f"  止盈退出（已成交后）：{overview.get('take_profit_exit_count', 0)}")
+    lines.append(f"  失效退出（已成交后）：{overview.get('invalidation_exit_count', 0)}")
+    lines.append(f"  复盘窗口结算（已成交后）：{overview.get('window_complete_count', 0)}")
+    lines.append(f"  未成交（试探建仓/确认做多，但未到入场区间）：{overview.get('not_entered_count', 0)}")
+    lines.append(f"  平均模拟已实现收益：{_format_metric_value(overview.get('avg_realized_return'), suffix='%')}")
+    lines.append(f"  中位数模拟已实现收益：{_format_metric_value(overview.get('median_realized_return'), suffix='%')}")
+    lines.append(f"  模拟已实现胜率：{_format_rate_value(overview.get('win_rate'))}")
     lines.append(f"  盈亏比：{_format_metric_value(overview.get('profit_loss_ratio'))}")
-
-    lines.append("执行质量：")
-    lines.append(f"  入场命中率：{_format_rate_value(quality.get('entry_hit_rate'))}")
+    lines.append("")
+    lines.append("#### 执行质量：")
+    lines.append(f"  模拟成交率：{_format_rate_value(quality.get('entry_hit_rate'))}")
     lines.append(f"  止盈命中率：{_format_rate_value(quality.get('take_profit_hit_rate'))}")
     lines.append(f"  失效率：{_format_rate_value(quality.get('invalidation_hit_rate'))}")
     lines.append(f"  复盘窗口结算率：{_format_rate_value(quality.get('window_complete_rate'))}")
     lines.append(f"  平均持有天数：{_format_metric_value(quality.get('avg_holding_days'), suffix=' 天')}")
     lines.append(f"  已完成复盘样本数（已走出最终结果）：{quality.get('completed_outcome_count', 0)}")
-    lines.append(f"  观察中样本数（含未进场与已进场未结束）：{quality.get('pending_outcome_count', 0)}")
-
-    lines.append("三池漏斗：")
+    lines.append(f"  观察中样本数（含未成交与已成交未结束）：{quality.get('pending_outcome_count', 0)}")
+    lines.append("")
+    lines.append("#### 三池漏斗：")
     if (
         int(pool_funnel_summary.get("prewatch_candidate_count", 0) or 0) <= 0
         and int(pool_funnel_summary.get("prewatch_light_push_count", 0) or 0) <= 0
@@ -2702,22 +3166,26 @@ def format_recent_performance_review(review: dict[str, Any]) -> str:
         )
         if int(pool_funnel_summary.get("promoted_without_light_push_count", 0) or 0) > 0:
             lines.append(
-                f"  另有 {pool_funnel_summary.get('promoted_without_light_push_count', 0)} 条未经过观察提醒，直接从观察进入确认机会。"
+                "  "
+                f"另有 {pool_funnel_summary.get('promoted_without_light_push_count', 0)} 条未经过观察提醒，直接从观察进入确认机会。"
             )
         lines.append(
             "  "
             f"进入兑现池：{pool_funnel_summary.get('exit_from_promoted_count', 0)} 条"
             f"（确认机会 -> 兑现转化率：{_format_rate_value(pool_funnel_summary.get('confirmation_to_exit_rate'))}）"
         )
-
-    lines.append("最近新增观察样本：")
-    lines.extend(_format_recent_observation_sample_lines(review.get("recent_observation_samples") or []))
-
-    lines.append("完整模拟闭环：")
+        if int(pool_funnel_summary.get("non_promoted_exit_count", 0) or 0) > 0:
+            lines.append(
+                "  "
+                f"另有 {pool_funnel_summary.get('non_promoted_exit_count', 0)} 条兑现池记录来自非预备池确认机会链路。"
+            )
+    lines.append("")
+    lines.append("#### 完整模拟闭环：")
     if (
         int(simulation_funnel_summary.get("prewatch_candidate_count", 0) or 0) <= 0
         and int(simulation_funnel_summary.get("prewatch_light_push_count", 0) or 0) <= 0
         and int(simulation_funnel_summary.get("promoted_confirmation_count", 0) or 0) <= 0
+        and int(simulation_funnel_summary.get("simulated_entry_count", 0) or 0) <= 0
     ):
         lines.append("  当前窗口内还没有形成可计算的完整模拟闭环。")
     else:
@@ -2734,91 +3202,93 @@ def format_recent_performance_review(review: dict[str, Any]) -> str:
         )
         lines.append(
             "  "
-            f"模拟进场：{simulation_funnel_summary.get('simulated_entry_count', 0)} 条"
-            f"（确认机会 -> 模拟进场转化率：{_format_rate_value(simulation_funnel_summary.get('confirmation_to_entry_rate'))}）"
+            f"模拟成交：{simulation_funnel_summary.get('simulated_entry_count', 0)} 条"
+            f"（确认机会 -> 模拟成交转化率：{_format_rate_value(simulation_funnel_summary.get('confirmation_to_entry_rate'))}）"
         )
         lines.append(
             "  "
             f"进入兑现池：{simulation_funnel_summary.get('exit_pool_transition_count', 0)} 条"
-            f"（模拟进场 -> 进入兑现池转化率：{_format_rate_value(simulation_funnel_summary.get('entry_to_exit_pool_rate'))}）"
+            f"（模拟成交 -> 进入兑现池转化率：{_format_rate_value(simulation_funnel_summary.get('entry_to_exit_pool_rate'))}）"
         )
         lines.append(
             "  "
             f"模拟退出完成：{simulation_funnel_summary.get('simulated_completed_exit_count', 0)} 条"
-            f"（模拟进场 -> 模拟退出完成率：{_format_rate_value(simulation_funnel_summary.get('entry_to_completed_exit_rate'))}）"
+            f"（模拟成交 -> 模拟退出完成率：{_format_rate_value(simulation_funnel_summary.get('entry_to_completed_exit_rate'))}）"
         )
         if simulation_funnel_summary.get("avg_confirmation_to_entry_days") is not None:
             lines.append(
                 "  "
-                f"确认机会 -> 模拟进场：平均等待 "
-                f"{_format_metric_value(simulation_funnel_summary.get('avg_confirmation_to_entry_days'), suffix=' 天')}"
-                f"，中位数 "
-                f"{_format_metric_value(simulation_funnel_summary.get('median_confirmation_to_entry_days'), suffix=' 天')}"
+                f"确认机会 -> 模拟成交：平均等待 {_format_metric_value(simulation_funnel_summary.get('avg_confirmation_to_entry_days'), suffix=' 天')}，"
+                f"中位数 {_format_metric_value(simulation_funnel_summary.get('median_confirmation_to_entry_days'), suffix=' 天')}"
+            )
+        if int(simulation_funnel_summary.get("confirmation_to_entry_timing_anomaly_count", 0) or 0) > 0:
+            lines.append(
+                "  "
+                f"已跳过 {int(simulation_funnel_summary.get('confirmation_to_entry_timing_anomaly_count', 0) or 0)} 条成交时间早于决策时间的异常样本。"
             )
         if simulation_funnel_summary.get("avg_entry_to_completed_exit_days") is not None:
             lines.append(
                 "  "
-                f"模拟进场 -> 模拟退出完成：平均持有 "
-                f"{_format_metric_value(simulation_funnel_summary.get('avg_entry_to_completed_exit_days'), suffix=' 天')}"
-                f"，中位数 "
-                f"{_format_metric_value(simulation_funnel_summary.get('median_entry_to_completed_exit_days'), suffix=' 天')}"
+                f"模拟成交 -> 模拟退出完成：平均持有 {_format_metric_value(simulation_funnel_summary.get('avg_entry_to_completed_exit_days'), suffix=' 天')}，"
+                f"中位数 {_format_metric_value(simulation_funnel_summary.get('median_entry_to_completed_exit_days'), suffix=' 天')}"
             )
-        for row in simulation_funnel_summary.get("entry_timing_by_action") or []:
+        for row in simulation_funnel_summary.get("entry_timing_by_action", []):
             lines.append(
                 "  "
                 f"按动作看成交等待：{row.get('action_display', row.get('action', '-'))}"
                 f"：样本 {row.get('sample_count', 0)} 条，平均等待 "
-                f"{_format_metric_value(row.get('avg_days_to_entry'), suffix=' 天')}"
-                f"，中位数 "
-                f"{_format_metric_value(row.get('median_days_to_entry'), suffix=' 天')}"
+                f"{_format_metric_value(row.get('avg_days_to_entry'), suffix=' 天')}，"
+                f"中位数 {_format_metric_value(row.get('median_days_to_entry'), suffix=' 天')}"
             )
-        for row in simulation_funnel_summary.get("completed_exit_timing_by_action") or []:
+        for row in simulation_funnel_summary.get("completed_exit_timing_by_action", []):
             lines.append(
                 "  "
                 f"按动作看持有时长：{row.get('action_display', row.get('action', '-'))}"
                 f"：样本 {row.get('sample_count', 0)} 条，平均持有 "
-                f"{_format_metric_value(row.get('avg_holding_days'), suffix=' 天')}"
-                f"，中位数 "
-                f"{_format_metric_value(row.get('median_holding_days'), suffix=' 天')}"
+                f"{_format_metric_value(row.get('avg_holding_days'), suffix=' 天')}，"
+                f"中位数 {_format_metric_value(row.get('median_holding_days'), suffix=' 天')}"
             )
         if int(simulation_funnel_summary.get("simulated_pending_entry_count", 0) or 0) > 0:
             lines.append(
-                f"  另有 {simulation_funnel_summary.get('simulated_pending_entry_count', 0)} 条确认机会尚未形成模拟进场。"
+                f"  另有 {simulation_funnel_summary.get('simulated_pending_entry_count', 0)} 条确认机会尚未形成模拟成交。"
             )
         if int(simulation_funnel_summary.get("simulated_open_count", 0) or 0) > 0:
             lines.append(
-                f"  另有 {simulation_funnel_summary.get('simulated_open_count', 0)} 条已模拟进场，但当前仍在持有观察中。"
+                f"  另有 {simulation_funnel_summary.get('simulated_open_count', 0)} 条已模拟成交，但当前仍在持有观察中。"
             )
         completed_exit_breakdown = simulation_funnel_summary.get("completed_exit_breakdown") or {}
-        parts = []
-        if int(completed_exit_breakdown.get("exit_pool", 0) or 0) > 0:
-            parts.append(f"兑现池 {completed_exit_breakdown.get('exit_pool', 0)} 条")
-        if int(completed_exit_breakdown.get("hit_take_profit", 0) or 0) > 0:
-            parts.append(f"止盈位 {completed_exit_breakdown.get('hit_take_profit', 0)} 条")
-        if int(completed_exit_breakdown.get("hit_invalidation", 0) or 0) > 0:
-            parts.append(f"失效退出 {completed_exit_breakdown.get('hit_invalidation', 0)} 条")
-        if int(completed_exit_breakdown.get("window_complete", 0) or 0) > 0:
-            parts.append(f"窗口结算 {completed_exit_breakdown.get('window_complete', 0)} 条")
-        if parts:
-            lines.append(f"  其中：{' / '.join(parts)}")
-
-    lines.append("候选诊断：")
+        if int(simulation_funnel_summary.get("simulated_completed_exit_count", 0) or 0) > 0:
+            parts = []
+            if int(completed_exit_breakdown.get("exit_pool", 0) or 0) > 0:
+                parts.append(f"兑现池 {completed_exit_breakdown.get('exit_pool', 0)} 条")
+            if int(completed_exit_breakdown.get("hit_take_profit", 0) or 0) > 0:
+                parts.append(f"止盈位 {completed_exit_breakdown.get('hit_take_profit', 0)} 条")
+            if int(completed_exit_breakdown.get("hit_invalidation", 0) or 0) > 0:
+                parts.append(f"失效退出 {completed_exit_breakdown.get('hit_invalidation', 0)} 条")
+            if int(completed_exit_breakdown.get("window_complete", 0) or 0) > 0:
+                parts.append(f"窗口结算 {completed_exit_breakdown.get('window_complete', 0)} 条")
+            if parts:
+                lines.append(f"  其中：{' / '.join(parts)}")
+    lines.append("")
+    lines.append("#### 最近新增观察样本：")
+    lines.extend(_format_recent_observation_sample_lines(review.get("recent_observation_samples") or []))
+    lines.append("")
+    lines.extend(_format_observation_after_summary_lines(review.get("observation_after_summary") or {}))
+    lines.append("")
+    lines.append("#### 候选诊断：")
     lines.extend(_format_candidate_evaluation_summary_lines(candidate_evaluation_summary))
-    lines.append("候选诊断趋势：")
+    lines.append("")
+    lines.append("#### 候选诊断趋势：")
     lines.extend(_format_candidate_evaluation_trend_lines(candidate_evaluation_trend_summary))
-
-    lines.append("交易轨迹摘要：")
+    lines.append("")
+    lines.append("#### 交易轨迹摘要：")
     transition_count = int(trade_path_summary.get("exit_pool_transition_count", 0) or 0)
     if transition_count <= 0:
-        lines.append("  当前窗口内还没有形成从进攻逻辑走到兑现池的已进场样本。")
+        lines.append("  当前窗口内还没有形成从进攻逻辑走到兑现池的已模拟成交样本。")
     else:
         lines.append(f"  确认机会后进入兑现池：{transition_count} 条")
-        lines.append(
-            f"  平均历时：{_format_metric_value(trade_path_summary.get('avg_days_to_exit_pool'), suffix=' 天')}"
-        )
-        lines.append(
-            f"  中位数历时：{_format_metric_value(trade_path_summary.get('median_days_to_exit_pool'), suffix=' 天')}"
-        )
+        lines.append(f"  平均历时：{_format_metric_value(trade_path_summary.get('avg_days_to_exit_pool'), suffix=' 天')}")
+        lines.append(f"  中位数历时：{_format_metric_value(trade_path_summary.get('median_days_to_exit_pool'), suffix=' 天')}")
         for row in trade_path_summary.get("by_action", []):
             lines.append(
                 "  "
@@ -2829,17 +3299,15 @@ def format_recent_performance_review(review: dict[str, Any]) -> str:
         if fastest_sample:
             lines.append(
                 "  "
-                f"最快样本：{fastest_sample.get('symbol', '-')}（{fastest_sample.get('action_display', fastest_sample.get('action', '-'))}）"
-                f"，{_format_metric_value(fastest_sample.get('holding_days'), suffix=' 天')}，"
-                f"{format_beijing_minute(fastest_sample.get('created_at'))}"
+                f"最快样本：{fastest_sample.get('symbol', '-')}（{fastest_sample.get('action_display', fastest_sample.get('action', '-'))}），"
+                f"{_format_metric_value(fastest_sample.get('holding_days'), suffix=' 天')}"
             )
         slowest_sample = trade_path_summary.get("slowest_sample") or {}
         if slowest_sample:
             lines.append(
                 "  "
-                f"最慢样本：{slowest_sample.get('symbol', '-')}（{slowest_sample.get('action_display', slowest_sample.get('action', '-'))}）"
-                f"，{_format_metric_value(slowest_sample.get('holding_days'), suffix=' 天')}，"
-                f"{format_beijing_minute(slowest_sample.get('created_at'))}"
+                f"最慢样本：{slowest_sample.get('symbol', '-')}（{slowest_sample.get('action_display', slowest_sample.get('action', '-'))}），"
+                f"{_format_metric_value(slowest_sample.get('holding_days'), suffix=' 天')}"
             )
         recent_samples = list(trade_path_summary.get("recent_samples") or [])
         if recent_samples:
@@ -2856,95 +3324,66 @@ def format_recent_performance_review(review: dict[str, Any]) -> str:
             lines.append("  收益最差轨迹样本：")
             for row in worst_samples:
                 lines.append(f"  {_format_trade_path_sample_line(row)}")
-
-    lines.extend(_format_breakdown_section("分组效果 - 按事件类型：", list((review.get("breakdowns") or {}).get("event_type") or [])))
-    lines.extend(_format_breakdown_section("分组效果 - 按池子：", list((review.get("breakdowns") or {}).get("pool") or [])))
-    lines.extend(_format_breakdown_section("分组效果 - 按动作：", list((review.get("breakdowns") or {}).get("action") or [])))
-    lines.extend(_format_breakdown_section("分组效果 - 按触发模式：", list((review.get("breakdowns") or {}).get("trigger_mode") or [])))
-    lines.extend(_format_breakdown_section("分组效果 - 按优先级：", list((review.get("breakdowns") or {}).get("priority") or [])))
-
-    lines.append("辅助观察收益（均值=平均收益率）：")
+    lines.append("")
+    lines.extend(_format_breakdown_section("#### 分组效果 - 按事件类型：", list((review.get("breakdowns") or {}).get("event_type") or [])))
+    lines.append("")
+    lines.extend(_format_breakdown_section("#### 分组效果 - 按池子：", list((review.get("breakdowns") or {}).get("pool") or [])))
+    lines.append("")
+    lines.extend(_format_breakdown_section("#### 分组效果 - 按动作：", list((review.get("breakdowns") or {}).get("action") or [])))
+    lines.append("")
+    lines.extend(_format_breakdown_section("#### 分组效果 - 按触发模式：", list((review.get("breakdowns") or {}).get("trigger_mode") or [])))
+    lines.append("")
+    lines.extend(_format_breakdown_section("#### 分组效果 - 按优先级：", list((review.get("breakdowns") or {}).get("priority") or [])))
+    lines.append("")
+    lines.append("#### 辅助观察收益（均值=平均收益率）：")
+    lines.append("  说明：其中最大浮盈 / 最大回撤已与主路径质量口径对齐，仅统计已模拟成交样本。")
     for row in review.get("auxiliary_observation", []):
         lines.append(
             f"  {row.get('label', row.get('field', '-'))}：样本 {row.get('sample_count', 0)} 条，均值 {_format_metric_value(row.get('avg_value'), suffix='%')}"
         )
-
-    lines.append("下一步建议：")
-    recommendations = list(review.get("recommendations") or [])
-    recommendation_details = list(review.get("recommendation_details") or [])
-    if not recommendations:
-        lines.append("  1. 当前样本还不足以形成明确建议，继续积累完整样本。")
-    else:
-        grouped_items = {
-            "优先先调": [],
-            "优先先排查": [],
-        }
-        for index, line in enumerate(recommendations):
-            detail = recommendation_details[index] if index < len(recommendation_details) else {}
-            parameter_details = list((detail or {}).get("parameter_details") or [])
-            bucket = "优先先排查"
-            if any(str(item.get("direction") or "").strip() in {"high", "low"} for item in parameter_details):
-                bucket = "优先先调"
-            grouped_items[bucket].append((line, detail))
-
-        adjustment_checklist = _build_recommendation_parameter_checklist(recommendation_details)
-        if adjustment_checklist:
-            lines.append("  参数检查清单：")
-            for index, item in enumerate(adjustment_checklist, start=1):
-                lines.append(f"    {index}. {item}")
-
-        for bucket_label in ("优先先调", "优先先排查"):
-            bucket_items = grouped_items[bucket_label]
-            if not bucket_items:
-                continue
-            lines.append(f"  {bucket_label}：")
-            for index, (line, detail) in enumerate(bucket_items, start=1):
-                lines.append(f"    {index}. {line}")
-                parameter_details = list((detail or {}).get("parameter_details") or [])
-                if parameter_details:
-                    parts = []
-                    for item in parameter_details:
-                        label = str(item.get("label") or item.get("key") or "-")
-                        key = str(item.get("key") or "-")
-                        direction_label = str(item.get("direction_label") or "先排查")
-                        parts.append(f"{label}（{key}，{direction_label}）")
-                    lines.append(f"       对应参数：{' / '.join(parts)}")
-
+    lines.append("")
     lines.extend(
         _format_ranked_decision_table(
-            "效果最好 Top3（已完成样本）：",
+            "#### 效果最好 Top3（已完成样本）：",
             list(review.get("best_completed_decisions") or []),
             metric_field="realized_return",
-            metric_label="真实收益",
+            metric_label="模拟已实现收益",
         )
     )
+    lines.append("")
     lines.extend(
         _format_ranked_decision_table(
-            "效果最差 Top3（已完成样本）：",
+            "#### 效果最差 Top3（已完成样本）：",
             list(review.get("worst_completed_decisions") or []),
             metric_field="realized_return",
-            metric_label="真实收益",
+            metric_label="模拟已实现收益",
         )
     )
+    lines.append("")
     lines.extend(
         _format_ranked_decision_table(
-            "T+7 表现最好 Top3：",
+            "#### T+7 表现最好 Top3：",
             list(review.get("best_t7_decisions") or []),
             metric_field="t_plus_7_return",
             metric_label="T+7收益",
         )
     )
+    lines.append("")
     lines.extend(
         _format_ranked_decision_table(
-            "T+7 表现最差 Top3：",
+            "#### T+7 表现最差 Top3：",
             list(review.get("worst_t7_decisions") or []),
             metric_field="t_plus_7_return",
             metric_label="T+7收益",
         )
     )
-    lines.extend(_format_decision_detail_table(list(review.get("decision_details") or [])))
-    lines.append("附录：")
-    lines.append(f"  加入观察信号数：{appendix.get('observation_signal_count', 0)}")
+    lines.append("")
+    detail_lines = _format_decision_detail_table(list(review.get("decision_details") or []))
+    if detail_lines:
+        lines.append(f"#### {detail_lines[0]}")
+        lines.extend(detail_lines[1:])
+    lines.append("")
+    lines.append(f"加入观察信号数：{appendix.get('observation_signal_count', 0)}")
     return "\n".join(lines)
 
 
@@ -3040,6 +3479,7 @@ def summarize_run_health(
     summary = run_detail.get("summary", {})
     diagnostics = card_diagnostics or []
     unhealthy_sources = [row for row in source_health if row.get("status") != "healthy"]
+    connectivity_issues = summarize_external_connectivity_issues(source_health)
     source_health_failures = int(summary.get("source_health_failures", 0))
     extraction_failures = int(summary.get("extraction_failures", 0))
     market_data_failures = int(summary.get("market_data_failures", 0))
@@ -3066,7 +3506,11 @@ def summarize_run_health(
             lines.append(f"最接近市场阈值的卡片距离为 {closest_market:+.2f}。")
         if closest_priority is not None:
             lines.append(f"最接近高优先级阈值的卡片距离为 {closest_priority:+.2f}。")
-    if unhealthy_sources or source_health_failures:
+    if connectivity_issues["has_issue"]:
+        lines.append(
+            "检测到外网连通性异常，建议先检查 VPN 或当前网络；相关原始报错已不在复盘正文展开。"
+        )
+    elif unhealthy_sources or source_health_failures:
         lines.append(
             f"数据源健康告警 {len(unhealthy_sources) + source_health_failures} 次，需要留意数据链路稳定性。"
         )
@@ -3522,6 +3966,63 @@ def _format_recent_observation_sample_lines(rows: list[dict[str, Any]]) -> list[
             detail_parts.append(f"题材 {' / '.join(row['theme_ids'])}")
         if detail_parts:
             lines.append(f"    {' / '.join(detail_parts)}")
+    return lines
+
+
+def _format_observation_after_summary_lines(summary: dict[str, Any]) -> list[str]:
+    lines = ["#### 观察后表现：", "  定位：看加入观察的标的，后续值不值得继续盯。"]
+    observation_count = int(summary.get("observation_count", 0) or 0)
+    if observation_count <= 0:
+        lines.append("  当前窗口内还没有观察样本。")
+        return lines
+    lines.append(f"  观察样本：{observation_count} 条")
+    lines.append(
+        "  "
+        f"观察提醒：{int(summary.get('observation_alert_count', 0) or 0)} 条"
+        f"（观察 -> 观察提醒转化率：{_format_rate_value(summary.get('observation_to_alert_rate'))}）"
+    )
+    lines.append(
+        "  "
+        f"确认机会：{int(summary.get('promoted_confirmation_count', 0) or 0)} 条"
+        f"（观察 -> 确认机会转化率：{_format_rate_value(summary.get('observation_to_confirmation_rate'))}）"
+    )
+    if int(summary.get("observation_alert_count", 0) or 0) > 0:
+        lines.append(
+            "  "
+            f"观察提醒后升级：{int(summary.get('promoted_after_alert_count', 0) or 0)} 条"
+            f"（观察提醒 -> 确认机会转化率：{_format_rate_value(summary.get('alert_to_confirmation_rate'))}）"
+        )
+    if int(summary.get("promoted_without_alert_count", 0) or 0) > 0:
+        lines.append(
+            "  "
+            f"另有 {int(summary.get('promoted_without_alert_count', 0) or 0)} 条未经过观察提醒，直接升级为确认机会。"
+        )
+    lines.append(f"  仍在观察：{int(summary.get('still_observing_symbol_count', 0) or 0)} 个标的")
+    if summary.get("avg_days_to_confirmation") is not None:
+        lines.append(
+            "  "
+            f"观察 -> 确认：平均 {_format_metric_value(summary.get('avg_days_to_confirmation'), suffix=' 天')}，"
+            f"中位数 {_format_metric_value(summary.get('median_days_to_confirmation'), suffix=' 天')}"
+        )
+    representative_samples = list(summary.get("representative_samples") or [])
+    if representative_samples:
+        lines.append("  代表样本：")
+        for row in representative_samples:
+            detail_parts = []
+            if row.get("prewatch_setup_type"):
+                detail_parts.append(_display_prewatch_setup(str(row.get("prewatch_setup_type") or "")))
+            if row.get("prewatch_score") is not None:
+                detail_parts.append(f"预备池 {float(row.get('prewatch_score') or 0.0):.2f} 分")
+            if int(row.get("prewatch_observation_count", 0) or 0) > 0:
+                detail_parts.append(f"累计观察 {int(row.get('prewatch_observation_count', 0) or 0)} 次")
+            if int(row.get("prewatch_alert_sent_count", 0) or 0) > 0:
+                detail_parts.append(f"观察提醒 {int(row.get('prewatch_alert_sent_count', 0) or 0)} 次")
+            lines.append(
+                "  "
+                f"- {format_beijing_minute(row.get('created_at'))} | {row.get('symbol', '-')} | "
+                f"{row.get('action_display', row.get('action', '-'))}"
+                + (f" | {' / '.join(detail_parts)}" if detail_parts else "")
+            )
     return lines
 
 
@@ -4033,15 +4534,15 @@ def _format_simulation_funnel_lines(
     )
     lines.append(
         "  "
-        f"模拟进场：{simulated_entry_count} 条 | 确认机会 -> 模拟进场转化率 {_format_funnel_rate(simulated_entry_count, promoted_confirmation_count)}"
+        f"模拟成交：{simulated_entry_count} 条 | 确认机会 -> 模拟成交转化率 {_format_funnel_rate(simulated_entry_count, promoted_confirmation_count)}"
     )
     lines.append(
         "  "
-        f"进入兑现池：{exit_pool_transition_count} 条 | 模拟进场 -> 进入兑现池转化率 {_format_funnel_rate(exit_pool_transition_count, simulated_entry_count)}"
+        f"进入兑现池：{exit_pool_transition_count} 条 | 模拟成交 -> 进入兑现池转化率 {_format_funnel_rate(exit_pool_transition_count, simulated_entry_count)}"
     )
     lines.append(
         "  "
-        f"模拟退出完成：{simulated_completed_exit_count} 条 | 模拟进场 -> 模拟退出完成率 {_format_funnel_rate(simulated_completed_exit_count, simulated_entry_count)}"
+        f"模拟退出完成：{simulated_completed_exit_count} 条 | 模拟成交 -> 模拟退出完成率 {_format_funnel_rate(simulated_completed_exit_count, simulated_entry_count)}"
     )
     if confirmation_to_entry_days:
         avg_days_to_entry = sum(confirmation_to_entry_days) / len(confirmation_to_entry_days)
@@ -4053,7 +4554,7 @@ def _format_simulation_funnel_lines(
             median_days_to_entry = sorted_days_to_entry[middle_index]
         lines.append(
             "  "
-            f"确认机会 -> 模拟进场：平均等待 {_format_metric_value(avg_days_to_entry, suffix=' 天')}，"
+            f"确认机会 -> 模拟成交：平均等待 {_format_metric_value(avg_days_to_entry, suffix=' 天')}，"
             f"中位数 {_format_metric_value(median_days_to_entry, suffix=' 天')}"
         )
     if entry_to_completed_exit_days:
@@ -4068,7 +4569,7 @@ def _format_simulation_funnel_lines(
             median_days_to_completed_exit = sorted_days_to_completed_exit[middle_index]
         lines.append(
             "  "
-            f"模拟进场 -> 模拟退出完成：平均持有 {_format_metric_value(avg_days_to_completed_exit, suffix=' 天')}，"
+            f"模拟成交 -> 模拟退出完成：平均持有 {_format_metric_value(avg_days_to_completed_exit, suffix=' 天')}，"
             f"中位数 {_format_metric_value(median_days_to_completed_exit, suffix=' 天')}"
         )
     for line in entry_timing_by_action:
@@ -4076,9 +4577,9 @@ def _format_simulation_funnel_lines(
     for line in completed_exit_timing_by_action:
         lines.append(f"  按动作看持有时长：{line}")
     if pending_entry_count > 0:
-        lines.append(f"  另有 {pending_entry_count} 条确认机会尚未形成模拟进场。")
+        lines.append(f"  另有 {pending_entry_count} 条确认机会尚未形成模拟成交。")
     if simulated_open_count > 0:
-        lines.append(f"  另有 {simulated_open_count} 条已模拟进场，但当前仍在持有观察中。")
+        lines.append(f"  另有 {simulated_open_count} 条已模拟成交，但当前仍在持有观察中。")
     if simulated_completed_exit_count > 0:
         parts = []
         if exit_pool_completed_count > 0:
@@ -4239,6 +4740,10 @@ def format_run_review(
         latency = row["latency_ms"] if row["latency_ms"] is not None else "-"
         if row["status"] == "healthy":
             lines.append(f"  {row['source_name']}：正常，检查时间 {format_beijing_minute(row['checked_at'])}。{row['detail']}")
+        elif _is_external_connectivity_issue(str(row["detail"])):
+            lines.append(
+                f"  {_external_connectivity_hint(row['source_name'])} 检查时间 {format_beijing_minute(row['checked_at'])}。"
+            )
         else:
             lines.append(f"  {row['source_name']}：异常，检查时间 {format_beijing_minute(row['checked_at'])}，latency_ms={latency}，{row['detail']}")
     lines.append("卡片解读：")
@@ -4341,7 +4846,7 @@ def format_batch_replay(payload: dict[str, Any]) -> str:
         metrics = item.get("metrics", {})
         lines.append(
             f"  {index}. {item['name']}：状态={item['status']}，run_id={item.get('run_id', '-')}，"
-            f"决策 {metrics.get('decision_count', 0)}，已进场 {metrics.get('entered_count', 0)}，"
+            f"决策 {metrics.get('decision_count', 0)}，已成交 {metrics.get('entered_count', 0)}，"
             f"平均真实收益 {metrics.get('avg_realized_return')}%，胜率 {metrics.get('win_rate')}%，"
             f"平均最大回撤 {metrics.get('avg_max_drawdown')}%，主导事件 {item.get('top_event', '-')}，"
             f"配置 {item.get('config_summary', '-')}，数据库 {item.get('db_path', '-')}"
@@ -4368,7 +4873,7 @@ def format_batch_replay(payload: dict[str, Any]) -> str:
         if "decision_count" in recommendation:
             lines.append(
                 f"  {recommendation['name']}：决策={recommendation['decision_count']}，"
-                f"已进场={recommendation['entered_count']}，止盈退出={recommendation['take_profit_exit_count']}，"
+                f"已成交={recommendation['entered_count']}，止盈退出={recommendation['take_profit_exit_count']}，"
                 f"失效退出={recommendation['invalidation_exit_count']}，平均真实收益={recommendation['avg_realized_return']}%，"
                 f"胜率={recommendation['win_rate']}%，平均最大回撤={recommendation['avg_max_drawdown']}%，"
                 f"盈亏比={recommendation['profit_loss_ratio']}，T+7={recommendation['avg_t_plus_7_return']}%，"

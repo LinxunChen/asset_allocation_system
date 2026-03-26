@@ -94,6 +94,26 @@ def _truncate_text(value: str, limit: int) -> str:
     return f"{text[: limit - 1].rstrip()}..."
 
 
+def _first_short_sentence(value: str) -> str:
+    text = " ".join((value or "").split()).strip()
+    if not text:
+        return ""
+    parts = re.split(r"(?<=[。！？!?])\s*", text)
+    for part in parts:
+        clean = part.strip()
+        if clean:
+            return clean
+    return text
+
+
+def _soft_trim_text(value: str, limit: int) -> str:
+    text = " ".join((value or "").split()).strip()
+    if len(text) <= limit:
+        return text
+    clipped = text[:limit].rstrip("，,；;：: ")
+    return f"{clipped}..."
+
+
 def _normalize_user_facing_text(value: str) -> str:
     text = (value or "").strip()
     if not text:
@@ -106,6 +126,14 @@ def _normalize_user_facing_text(value: str) -> str:
     text = text.replace("低赔率", "预期盈亏比不足")
     text = text.replace("赔率还不够舒服", "预期盈亏比还不够理想")
     text = re.sub(r"不足\s*1\.5R", "不足最低预期盈亏比要求", text)
+    text = re.sub(r"ATR 占比\s*0(?:\.0+)?%", "波动率极低", text)
+    text = re.sub(
+        r"量能略有抬升至\s*1\.0+\s*倍",
+        "量能回到常态附近（1.00 倍），但尚未形成放量确认",
+        text,
+    )
+    text = text.replace("TSM 触发新闻事件", "TSM 出现新闻催化")
+    text = text.replace("触发新闻事件", "出现新闻催化")
     return text
 
 
@@ -145,7 +173,11 @@ def _final_chain_summary(chain_summary: str, *, final_action: str, downgraded_to
     if len(steps) == 1:
         return _rewrite_terminal_chain_step(steps[0], final_action)
     steps[-1] = _rewrite_terminal_chain_step(steps[-1], final_action)
-    return " -> ".join(steps)
+    recompressed: list[str] = []
+    for step in steps:
+        if not recompressed or recompressed[-1] != step:
+            recompressed.append(step)
+    return recompressed[0] if len(recompressed) == 1 else " -> ".join(recompressed)
 
 
 def _source_kind(source_ref: str) -> str:
@@ -173,7 +205,7 @@ def _select_source_refs(source_refs: list[str], *, limit: int = 3) -> list[str]:
     seen_labels: set[str] = set()
     for _, source in ranked:
         label = _source_label(source)
-        dedupe_key = f"{_source_kind(source)}::{label}"
+        dedupe_key = label.strip().lower()
         if dedupe_key in seen_labels:
             continue
         seen_labels.add(dedupe_key)
@@ -181,6 +213,259 @@ def _select_source_refs(source_refs: list[str], *, limit: int = 3) -> list[str]:
         if len(selected) >= limit:
             break
     return selected
+
+
+def _formal_conflict_text(text: str) -> bool:
+    normalized = (text or "").strip()
+    if not normalized:
+        return False
+    markers = (
+        "未形成明确突破",
+        "仍需等待确认",
+        "仅作为预备观察",
+        "继续观察",
+        "等待成交量放大",
+        "等待价格企稳",
+    )
+    return any(marker in normalized for marker in markers)
+
+
+def _watch_conflict_text(text: str) -> bool:
+    normalized = (text or "").strip()
+    if not normalized:
+        return False
+    markers = (
+        "按价格计划执行",
+        "可按计划执行",
+        "适合按价格计划跟随",
+        "可执行机会",
+        "直接执行",
+    )
+    return any(marker in normalized for marker in markers)
+
+
+def _fallback_event_summary(card: OpportunityCard, delivery: dict) -> str:
+    summary = _normalize_user_facing_text(delivery["llm_summary"] or card.headline_summary or "")
+    if not summary:
+        if str(card.event_type or "").strip() == "news":
+            return f"{card.symbol} 当前以结构观察为主，新闻仅作背景参考。"
+        return "当前事件仍需结合价格结构与后续催化一起判断。"
+    generic_news = {
+        f"{card.symbol} 触发新闻事件",
+        f"{card.symbol} 出现新闻催化",
+        "新闻事件",
+    }
+    if (
+        summary in generic_news
+        or summary.endswith("触发新闻事件。")
+        or summary.startswith("模拟")
+        or "用于预览" in summary
+    ):
+        if card.headline_summary:
+            headline = _normalize_user_facing_text(card.headline_summary)
+            if not headline.startswith("模拟") and "用于预览" not in headline:
+                return headline
+        return f"{card.symbol} 当前以结构观察为主，新闻仅作背景参考。"
+    return summary
+
+
+def _watch_core_summary(card: OpportunityCard, delivery: dict, *, downgraded_to_watch: bool, downgrade_reason: str) -> str:
+    if downgraded_to_watch:
+        if "盈亏比不足" in downgrade_reason:
+            return "事件不差，但当前预期盈亏比不足，先观察比直接执行更稳。"
+        if "量能不足" in downgrade_reason:
+            return "事件有支撑，但当前量能不足，先观察比直接执行更稳。"
+        if "结构未确认" in downgrade_reason:
+            return "结构还没真正确认，先观察比贸然执行更稳。"
+        if "宏观风险压制" in downgrade_reason:
+            return "宏观风险仍在压制，先观察比直接执行更稳。"
+        return "当前执行条件还不够完整，先观察更稳。"
+    if card.relative_volume is not None and card.relative_volume < 1.15:
+        return "结构还行，但没有放量或突破确认，先观察更稳。"
+    if str(card.trend_state or "").strip().lower() in {"neutral", "bearish", "downtrend"}:
+        return "催化还需要更多结构确认，当前先观察更稳。"
+    base = _normalize_user_facing_text(card.positioning_hint or card.reason_to_watch or delivery["llm_reasoning"])
+    return _first_short_sentence(base) or "当前仍以观察为主，先等结构和催化更清楚。"
+
+
+def _watch_plan_focus(card: OpportunityCard, delivery: dict) -> str:
+    candidates = [
+        _normalize_user_facing_text(card.reason_to_watch),
+        _normalize_user_facing_text(delivery["llm_reasoning"]),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        if "当前文案读起来足够清楚" in candidate:
+            continue
+        if _watch_conflict_text(candidate):
+            continue
+        sentence = _first_short_sentence(candidate)
+        if sentence:
+            return sentence
+    if card.relative_volume is not None and card.relative_volume < 1.0:
+        return "先盯结构、量能和关键价位承接，再决定是否升级。"
+    return "先盯结构、催化和量价是否继续共振，再决定是否升级。"
+
+
+def _watch_upgrade_trigger(card: OpportunityCard, delivery: dict) -> str:
+    candidate = _normalize_user_facing_text(delivery["llm_impact_inference"])
+    if candidate and not _watch_conflict_text(candidate):
+        return _first_short_sentence(candidate)
+    if card.relative_volume is not None and card.relative_volume < 1.0:
+        return "需等待成交量放大或价格突破关键位，才更像正式机会。"
+    if str(card.trend_state or "").strip().lower() in {"neutral", "bearish", "downtrend"}:
+        return "需等待价格企稳或结构转强后，再考虑升级。"
+    return "需等待量价继续配合，才更适合升级为正式机会。"
+
+
+def _watch_positioning_hint(card: OpportunityCard, delivery: dict) -> str:
+    candidate = _normalize_user_facing_text(card.positioning_hint or "")
+    if candidate and not _watch_conflict_text(candidate):
+        return candidate
+    if card.relative_volume is not None and card.relative_volume < 1.0:
+        return "当前先放入观察名单，不追价，等结构和量价进一步确认后再升级。"
+    return "当前先放入观察名单，等催化和结构进一步确认后再升级。"
+
+
+def _event_summary_for_card(card: OpportunityCard, delivery: dict, *, final_type: str) -> str:
+    summary = _fallback_event_summary(card, delivery)
+    generic_news = {
+        f"{card.symbol} 触发新闻事件",
+        f"{card.symbol} 出现新闻催化",
+        "新闻事件",
+    }
+    if summary in generic_news:
+        if final_type == "watch":
+            return f"{card.symbol} 当前以结构观察为主，新闻仅作背景参考。"
+        return f"{card.symbol} 当前更适合把新闻当作背景催化，执行上仍以结构和量价确认为主。"
+    return summary
+
+
+def _watch_event_impact(card: OpportunityCard, delivery: dict) -> str:
+    candidate = _normalize_user_facing_text(delivery["llm_impact_inference"])
+    if candidate and not _watch_conflict_text(candidate):
+        return _first_short_sentence(candidate)
+    if card.relative_volume is not None and card.relative_volume <= 1.0:
+        return "需等待成交量放大或价格企稳，才更像正式机会。"
+    if str(card.trend_state or "").strip().lower() in {"neutral", "bearish", "downtrend"}:
+        return "需等待结构转强或价格脱离震荡区后，再考虑升级。"
+    return "需等待量价继续共振，才更适合升级为正式机会。"
+
+
+def _formal_event_impact(card: OpportunityCard, delivery: dict) -> str:
+    candidate = _normalize_user_facing_text(delivery["llm_impact_inference"])
+    sentence = _first_short_sentence(candidate) if candidate else ""
+    if sentence and not _formal_conflict_text(sentence):
+        return sentence
+    if card.relative_volume is not None and card.relative_volume < 1.15:
+        return "催化仍在发酵，执行上更适合严格按计划，不宜脱离入场区追高。"
+    return "当前更适合围绕既定入场区和失效价执行，不宜脱离计划追价。"
+
+
+def _exit_event_impact(card: OpportunityCard, delivery: dict) -> str:
+    reasoning = _normalize_user_facing_text(delivery["llm_reasoning"] or "")
+    if reasoning:
+        return _first_short_sentence(reasoning)
+    return "当前重点是管理已有利润，不再把这笔交易当成新的进攻机会。"
+
+
+def _event_impact_summary(card: OpportunityCard, delivery: dict, *, final_type: str) -> str:
+    if final_type == "watch":
+        return _watch_event_impact(card, delivery)
+    if final_type == "exit":
+        return _exit_event_impact(card, delivery)
+    return _formal_event_impact(card, delivery)
+
+
+def _watch_market_summary(card: OpportunityCard, delivery: dict) -> str:
+    trend_state = str(card.trend_state or "").strip().lower()
+    relative_volume = card.relative_volume
+    if trend_state in {"neutral", "bearish", "downtrend"}:
+        return "结构仍在等待方向确认，量价配合还不够扎实。"
+    if relative_volume is not None and relative_volume <= 1.0:
+        return "结构偏强，但量能尚未形成有效放大，先观察更稳。"
+    return _normalize_user_facing_text(delivery["market_reason_line"]) or "当前更适合先观察结构与量价是否继续共振。"
+
+
+def _formal_market_summary(card: OpportunityCard, delivery: dict) -> str:
+    trend_state = str(card.trend_state or "").strip().lower()
+    relative_volume = card.relative_volume
+    if trend_state in {"bullish", "uptrend"}:
+        if relative_volume is not None and relative_volume < 1.15:
+            return "结构仍偏强，但量能还不算充分，执行上更适合严格按计划。"
+        return "结构仍偏强，量价配合基本支持按计划执行。"
+    if trend_state in {"neutral", "bearish", "downtrend"}:
+        return "结构仍在整理中，执行上更适合严格围绕计划区间，不宜追价。"
+    return _normalize_user_facing_text(delivery["market_reason_line"]) or "当前更适合围绕既定计划区间执行。"
+
+
+def _exit_market_summary(card: OpportunityCard, delivery: dict) -> str:
+    return "已有浮盈已进入管理阶段，当前重点是控制回吐而不是继续进攻。"
+
+
+def _market_summary(card: OpportunityCard, delivery: dict, *, final_type: str) -> str:
+    if final_type == "watch":
+        return _watch_market_summary(card, delivery)
+    if final_type == "exit":
+        return _exit_market_summary(card, delivery)
+    return _formal_market_summary(card, delivery)
+
+
+def _formal_core_summary(card: OpportunityCard, delivery: dict) -> str:
+    reasoning = _normalize_user_facing_text(delivery["llm_reasoning"] or card.positioning_hint or "")
+    if not reasoning or _formal_conflict_text(reasoning):
+        if card.relative_volume is not None and card.relative_volume < 1.0:
+            return "事件有催化，但当前更适合按计划小步执行，不宜追高。"
+        if str(card.trend_state or "").strip().lower() in {"neutral", "bearish", "downtrend"}:
+            return "催化和结构基本同向，但更适合按计划执行，不宜脱离入场区追高。"
+        return "催化和结构基本同向，当前更像可按计划执行的机会。"
+    return _first_short_sentence(reasoning)
+
+
+def _exit_core_summary(card: OpportunityCard, delivery: dict) -> str:
+    base = _normalize_user_facing_text(delivery["llm_reasoning"] or card.positioning_hint or "")
+    if base:
+        return _first_short_sentence(base)
+    return "利润已进入管理阶段，当前更适合先保护已有浮盈。"
+
+
+def _core_summary(card: OpportunityCard, delivery: dict, *, final_type: str, downgraded_to_watch: bool, downgrade_reason: str) -> str:
+    if final_type == "exit":
+        return _exit_core_summary(card, delivery)
+    if final_type == "watch":
+        return _watch_core_summary(card, delivery, downgraded_to_watch=downgraded_to_watch, downgrade_reason=downgrade_reason)
+    return _formal_core_summary(card, delivery)
+
+
+def _max_risk_summary(card: OpportunityCard, delivery: dict, *, final_type: str) -> str:
+    base = _normalize_user_facing_text(delivery["llm_uncertainty"] or "")
+    if not base:
+        if final_type == "exit":
+            base = "若兑现过慢，已有浮盈可能继续回吐。"
+        elif final_type == "watch":
+            base = "若承接失败，观察逻辑可能很快失效。"
+        else:
+            base = "若量能无法跟上，当前信号可能很快失效。"
+    sentence = _first_short_sentence(base) or base
+    return _soft_trim_text(sentence, 34)
+
+
+def _final_score_copy(card: OpportunityCard, delivery: dict, *, final_type: str) -> tuple[str, str]:
+    if final_type == "watch":
+        return "观察处理", "代表当前仍按观察处理，不作为正式执行信号。"
+    if final_type == "exit":
+        return "兑现管理", "代表当前重点是管理已有利润，不是寻找新的开仓点。"
+    return delivery["final_score_label"], delivery["final_score_explainer"]
+
+
+def _relative_volume_copy(card: OpportunityCard, delivery: dict) -> tuple[str, str]:
+    value = card.relative_volume
+    if value is None:
+        return delivery["relative_volume_label"], delivery["relative_volume_explainer"]
+    if value < 1.15:
+        return "未放量", "说明资金跟随仍有限，走势延续性需要继续观察"
+    return delivery["relative_volume_label"], delivery["relative_volume_explainer"]
 
 
 def _visible_risk_notes(card: OpportunityCard, *, downgraded_to_watch: bool) -> list[str]:
@@ -221,6 +506,12 @@ def _downgrade_reason(card: OpportunityCard) -> str:
     return "降级观察：执行条件不满足"
 
 
+def _formal_structure_incompatible(card: OpportunityCard) -> bool:
+    trend_state = str(card.trend_state or "").strip().lower()
+    relative_volume = card.relative_volume
+    return trend_state in {"neutral", "bearish", "downtrend"} and relative_volume is not None and relative_volume < 1.0
+
+
 def _build_render_view(card: OpportunityCard) -> dict:
     delivery = build_delivery_view_from_card(card)
     current_action = str(delivery.get("action_label_effective") or card.action_label or "").strip()
@@ -232,6 +523,7 @@ def _build_render_view(card: OpportunityCard) -> dict:
         or not getattr(card, "execution_eligible", True)
         or card.priority == "suppressed"
         or (ratio is not None and ratio < 1.5)
+        or _formal_structure_incompatible(card)
     )
     downgraded_to_watch = not is_exit_card and formal_incompatible
     is_watch_card = downgraded_to_watch or current_action == "加入观察"
@@ -262,14 +554,19 @@ def _build_render_view(card: OpportunityCard) -> dict:
     source_line = " / ".join(
         f"[{_source_label(source)}]({source})" for source in source_refs if source.startswith(("http://", "https://"))
     ) or "、".join(source_labels[:4]) or "暂无"
-    core_reason = (
-        _normalize_user_facing_text(card.positioning_hint)
-        if downgraded_to_watch and card.positioning_hint
-        else _normalize_user_facing_text(
-            delivery["llm_reasoning"] or card.positioning_hint or card.reason_to_watch or delivery["event_reason_line"]
-        )
+    event_summary = _event_summary_for_card(card, delivery, final_type=final_type)
+    core_reason = _core_summary(
+        card,
+        delivery,
+        final_type=final_type,
+        downgraded_to_watch=downgraded_to_watch,
+        downgrade_reason=downgrade_reason,
     )
-    risk_reason = _normalize_user_facing_text(delivery["llm_uncertainty"] or (risk_notes[0] if risk_notes else ""))
+    risk_reason = _max_risk_summary(card, delivery, final_type=final_type)
+    final_score_label, final_score_explainer = _final_score_copy(card, delivery, final_type=final_type)
+    relative_volume_label, relative_volume_explainer = _relative_volume_copy(card, delivery)
+    event_impact_summary = _event_impact_summary(card, delivery, final_type=final_type)
+    market_summary = _market_summary(card, delivery, final_type=final_type)
     execution_plan_lines: list[str] = []
     if final_type == "formal" and card.market_data_complete:
         execution_plan_lines = [
@@ -295,6 +592,9 @@ def _build_render_view(card: OpportunityCard) -> dict:
         "source_labels": source_labels,
         "source_summary": "、".join(source_labels[:4]) if source_labels else "暂无",
         "source_line": source_line,
+        "event_summary": event_summary,
+        "event_impact_summary": event_impact_summary,
+        "market_summary": market_summary,
         "risk_text": risk_text,
         "risk_notes": risk_notes,
         "risk_reward_text": _display_risk_reward(card),
@@ -306,11 +606,15 @@ def _build_render_view(card: OpportunityCard) -> dict:
                 else ""
             )
         ),
-        "core_summary": _truncate_text(core_reason or "等待更明确的催化与结构确认。", 38),
-        "max_risk": _truncate_text(risk_reason or "需继续核对原文与价格结构。", 22),
+        "core_summary": _soft_trim_text(core_reason or "等待更明确的催化与结构确认。", 68),
+        "max_risk": risk_reason or "需继续核对原文与价格结构。",
         "execution_plan_lines": execution_plan_lines,
         "render_warning": "formal_render_conflict_auto_downgraded" if downgraded_to_watch else "",
         "macro_overlay_note": _visible_macro_overlay_note(card, final_action=final_action),
+        "final_score_label": final_score_label,
+        "final_score_explainer": final_score_explainer,
+        "relative_volume_label": relative_volume_label,
+        "relative_volume_explainer": relative_volume_explainer,
         "action_detail_text": (
             "已自动降级"
             if downgraded_to_watch
@@ -456,8 +760,6 @@ class FeishuTransport:
         priority_text = render["priority_text"]
         theme_text = delivery["theme_text"]
         peer_text = "、".join(delivery["confirmed_peers"][:3]) if delivery["confirmed_peers"] else "暂无"
-        event_line = delivery["event_reason_line"]
-        market_line = delivery["market_reason_line"]
         theme_line = delivery["theme_reason_line"]
         valid_until_text = delivery["valid_until_text"] or _display_valid_until(card)
         source_text = render["source_summary"]
@@ -475,14 +777,14 @@ class FeishuTransport:
         event_lines = [
             f"**事件类型**：{delivery['event_type_display']}",
             f"**事件倾向**：{delivery['event_bias_display']} | {delivery['event_bias_explainer']}",
-            f"**事实摘要**：{delivery['llm_summary']}",
+            f"**事实摘要**：{render['event_summary']}",
         ]
-        if delivery["llm_impact_inference"]:
-            event_lines.append(f"**影响推理**：{delivery['llm_impact_inference']}")
+        if render["event_impact_summary"]:
+            event_lines.append(f"**影响推理**：{render['event_impact_summary']}")
         market_lines = [
             f"**当前环境**：{market_env_line}",
             f"**结构状态**：{delivery['trend_state_display']} | {delivery['trend_state_explainer']}",
-            f"**量价状态**：{market_line}",
+            f"**量价状态**：{render['market_summary']}",
         ]
         if render["macro_overlay_note"]:
             market_lines.append(f"**宏观覆盖**：{render['macro_overlay_note']}")
@@ -524,8 +826,8 @@ class FeishuTransport:
                 "text": {
                     "tag": "lark_md",
                     "content": (
-                        f"**综合分**\n{card.final_score:.2f}（{delivery['final_score_label']}）\n"
-                        f"{delivery['final_score_explainer']}"
+                        f"**综合分**\n{card.final_score:.2f}（{render['final_score_label']}）\n"
+                        f"{render['final_score_explainer']}"
                     ),
                 },
             },
@@ -574,8 +876,8 @@ class FeishuTransport:
                     "text": {
                         "tag": "lark_md",
                         "content": (
-                            f"**相对量能**\n{card.relative_volume:.2f} 倍（{delivery['relative_volume_label']}）\n"
-                            f"{delivery['relative_volume_explainer']}"
+                            f"**相对量能**\n{card.relative_volume:.2f} 倍（{render['relative_volume_label']}）\n"
+                            f"{render['relative_volume_explainer']}"
                         ),
                     },
                 }
@@ -634,20 +936,20 @@ class FeishuTransport:
             )
         if is_watch_card:
             decision_lines = [
-                f"**为什么现在先观察**：{delivery['llm_reasoning'] or event_line}",
-                f"**当前处理**：{card.positioning_hint or '先放入观察名单，等待更明确的催化与结构确认。'}",
-                f"**最大风险**：{delivery['llm_uncertainty'] or risk_text}",
+                f"**一句话核心**：{render['core_summary']}",
+                f"**当前处理**：{_watch_positioning_hint(card, delivery)}",
+                f"**最大风险**：{render['max_risk']}",
             ]
             observation_lines = [
-                f"**关注重点**：{card.reason_to_watch or delivery['llm_reasoning'] or '先观察事件发酵与结构确认。'}",
-                f"**升级触发**：{delivery['llm_impact_inference'] or delivery['trend_state_explainer'] or '等待结构转强与量能进一步确认。'}",
+                f"**关注重点**：{_watch_plan_focus(card, delivery)}",
+                f"**升级触发**：{_watch_upgrade_trigger(card, delivery)}",
                 f"**观察周期**：{delivery['horizon_display']}",
             ]
         elif is_exit_card:
             exit_reason = _exit_pool_subreason_display(card.exit_pool_subreason)
             exit_explainer = _exit_pool_subreason_explainer(card.exit_pool_subreason)
             decision_lines = [
-                f"**为什么进入兑现池**：{delivery['llm_reasoning'] or event_line}",
+                f"**为什么进入兑现池**：{delivery['llm_reasoning'] or render['event_summary']}",
                 f"**兑现原因**：{exit_reason} | {exit_explainer}",
                 f"**来源链路**：{delivery['chain_summary']}",
                 f"**使用边界**：{_exit_pool_guardrail_text()}",
@@ -667,7 +969,7 @@ class FeishuTransport:
             ]
             observation_lines = [
                 f"**关注重点**：{card.positioning_hint or card.reason_to_watch or delivery['llm_reasoning'] or '先观察事件发酵与结构确认。'}",
-                f"**升级关注**：{delivery['llm_impact_inference'] or delivery['trend_state_explainer'] or '等待结构转强与量能进一步确认。'}",
+                f"**升级关注**：{render['event_impact_summary'] or delivery['trend_state_explainer'] or '等待结构转强与量能进一步确认。'}",
                 f"**关注周期**：{delivery['horizon_display']}",
             ]
         return {
@@ -911,8 +1213,6 @@ class Notifier:
         delivery = render["delivery"]
         is_watch_card = render["is_watch_card"]
         is_exit_card = render["is_exit_card"]
-        event_line = delivery["event_reason_line"]
-        market_line = delivery["market_reason_line"]
         theme_line = delivery["theme_reason_line"]
         confidence_text = render["confidence_text"]
         risk_reward_text = render["risk_reward_text"]
@@ -938,15 +1238,15 @@ class Notifier:
             "事件理解：",
             f"- 事件类型：{delivery['event_type_display']}",
             f"- 事件倾向：{delivery['event_bias_display']}（{delivery['event_bias_explainer']}）",
-            f"- 事实摘要：{delivery['llm_summary']}",
+            f"- 事实摘要：{render['event_summary']}",
         ]
-        if delivery["llm_impact_inference"]:
-            event_section.append(f"- 影响推理：{delivery['llm_impact_inference']}")
+        if render["event_impact_summary"]:
+            event_section.append(f"- 影响推理：{render['event_impact_summary']}")
         market_section = [
             "市场与结构：",
             f"- 当前环境：{market_env_line}",
             f"- 结构状态：{delivery['trend_state_display']}（{delivery['trend_state_explainer']}）",
-            f"- 量价状态：{market_line}",
+            f"- 量价状态：{render['market_summary']}",
         ]
         if render["macro_overlay_note"]:
             market_section.append(f"- 宏观覆盖：{render['macro_overlay_note']}")
@@ -954,32 +1254,32 @@ class Notifier:
             market_section.append(f"- RSI：{card.rsi_14:.1f}（{delivery['rsi_label']}）")
         if card.relative_volume is not None:
             market_section.append(
-                f"- 相对量能：{card.relative_volume:.2f} 倍（{delivery['relative_volume_label']}，{delivery['relative_volume_explainer']}）"
+                f"- 相对量能：{card.relative_volume:.2f} 倍（{render['relative_volume_label']}，{render['relative_volume_explainer']}）"
             )
         score_section = [
             "信号评分：",
             f"- 事件分：{card.event_score:.2f}（{delivery['event_score_label']}，{delivery['event_score_explainer']}）",
             f"- 市场分：{card.market_score:.2f}（{delivery['market_score_label']}，{delivery['market_score_explainer']}）",
-            f"- 综合分：{card.final_score:.2f}（{delivery['final_score_label']}，{delivery['final_score_explainer']}）",
+            f"- 综合分：{card.final_score:.2f}（{render['final_score_label']}，{render['final_score_explainer']}）",
             f"- 题材联动：{theme_line}",
         ]
         if is_watch_card:
             decision_section = [
                 "决策结论：",
-                f"- 为什么现在先观察：{delivery['llm_reasoning'] or event_line}",
-                f"- 当前处理：{card.positioning_hint or '先放入观察名单，等待更明确的催化与结构确认。'}",
-                f"- 最大风险：{delivery['llm_uncertainty'] or '需继续核对原文与价格结构'}",
+                f"- 一句话核心：{render['core_summary']}",
+                f"- 当前处理：{_watch_positioning_hint(card, delivery)}",
+                f"- 最大风险：{render['max_risk']}",
             ]
         elif is_exit_card:
             exit_reason = _exit_pool_subreason_display(card.exit_pool_subreason)
             exit_explainer = _exit_pool_subreason_explainer(card.exit_pool_subreason)
             decision_section = [
                 "兑现结论：",
-                f"- 为什么进入兑现池：{delivery['llm_reasoning'] or event_line}",
+                f"- 一句话核心：{render['core_summary']}",
                 f"- 兑现原因：{exit_reason}（{exit_explainer}）",
                 f"- 来源链路：{render['chain_summary']}",
                 f"- 使用边界：{_exit_pool_guardrail_text()}",
-                f"- 最大风险：{delivery['llm_uncertainty'] or '继续持有可能回吐利润，过早兑现也可能少赚。'}",
+                f"- 最大风险：{render['max_risk']}",
             ]
         else:
             decision_section = [
@@ -997,8 +1297,8 @@ class Notifier:
         elif is_watch_card:
             body_lines.extend(
                 [
-                    f"- 关注重点：{card.reason_to_watch or delivery['llm_reasoning']}",
-                    f"- 升级触发：{delivery['llm_impact_inference'] or delivery['trend_state_explainer']}",
+                    f"- 关注重点：{_watch_plan_focus(card, delivery)}",
+                    f"- 升级触发：{_watch_upgrade_trigger(card, delivery)}",
                 ]
             )
         else:

@@ -773,6 +773,7 @@ class Store:
         since: str = "",
         limit: int = 0,
         recompute_existing: bool = False,
+        actions: Iterable[str] | None = None,
     ) -> list[sqlite3.Row]:
         query = """
             SELECT dr.*
@@ -813,6 +814,11 @@ class Store:
         if run_id:
             query += " AND dr.run_id = ?"
             params.append(run_id)
+        normalized_actions = [str(item).strip() for item in (actions or []) if str(item).strip()]
+        if normalized_actions:
+            placeholders = ", ".join("?" for _ in normalized_actions)
+            query += f" AND dr.action IN ({placeholders})"
+            params.extend(normalized_actions)
         query += " ORDER BY dr.created_at ASC"
         if limit > 0:
             query += " LIMIT ?"
@@ -1099,7 +1105,13 @@ class Store:
         )
         return cursor.fetchall()
 
-    def aggregate_decision_outcomes_by_event_type(self, since: str, limit: int = 10, until: str = "") -> list[sqlite3.Row]:
+    def aggregate_decision_outcomes_by_event_type(
+        self,
+        since: str,
+        limit: int = 10,
+        until: str = "",
+        actions: Iterable[str] | None = None,
+    ) -> list[sqlite3.Row]:
         query = """
             SELECT
                 COALESCE(NULLIF(dr.event_type, ''), 'uncategorized') AS event_type,
@@ -1131,6 +1143,11 @@ class Store:
         if until:
             query += " AND dr.created_at < ?"
             params.append(until)
+        normalized_actions = [str(item).strip() for item in (actions or []) if str(item).strip()]
+        if normalized_actions:
+            placeholders = ", ".join("?" for _ in normalized_actions)
+            query += f" AND dr.action IN ({placeholders})"
+            params.extend(normalized_actions)
         query += """
             GROUP BY COALESCE(NULLIF(dr.event_type, ''), 'uncategorized')
             ORDER BY outcome_count DESC, avg_t_plus_3_return DESC, decision_count DESC
@@ -1140,9 +1157,13 @@ class Store:
         cursor = self.connection.execute(query, tuple(params))
         return cursor.fetchall()
 
-    def aggregate_decision_outcomes_by_event_type_for_run(self, run_id: str, limit: int = 10) -> list[sqlite3.Row]:
-        cursor = self.connection.execute(
-            """
+    def aggregate_decision_outcomes_by_event_type_for_run(
+        self,
+        run_id: str,
+        limit: int = 10,
+        actions: Iterable[str] | None = None,
+    ) -> list[sqlite3.Row]:
+        query = """
             SELECT
                 COALESCE(NULLIF(dr.event_type, ''), 'uncategorized') AS event_type,
                 COUNT(dr.decision_id) AS decision_count,
@@ -1167,12 +1188,24 @@ class Store:
             GROUP BY COALESCE(NULLIF(dr.event_type, ''), 'uncategorized')
             ORDER BY outcome_count DESC, avg_t_plus_3_return DESC, decision_count DESC
             LIMIT ?
-            """,
-            (run_id, limit),
-        )
+            """
+        params: list[Any] = [run_id]
+        normalized_actions = [str(item).strip() for item in (actions or []) if str(item).strip()]
+        if normalized_actions:
+            placeholders = ", ".join("?" for _ in normalized_actions)
+            query = query.replace("WHERE dr.run_id = ?", f"WHERE dr.run_id = ? AND dr.action IN ({placeholders})")
+            params.extend(normalized_actions)
+        params.append(limit)
+        cursor = self.connection.execute(query, tuple(params))
         return cursor.fetchall()
 
-    def aggregate_decision_outcomes_by_pool(self, since: str, limit: int = 10, until: str = "") -> list[sqlite3.Row]:
+    def aggregate_decision_outcomes_by_pool(
+        self,
+        since: str,
+        limit: int = 10,
+        until: str = "",
+        actions: Iterable[str] | None = None,
+    ) -> list[sqlite3.Row]:
         query = """
             SELECT
                 dr.pool AS pool,
@@ -1204,6 +1237,11 @@ class Store:
         if until:
             query += " AND dr.created_at < ?"
             params.append(until)
+        normalized_actions = [str(item).strip() for item in (actions or []) if str(item).strip()]
+        if normalized_actions:
+            placeholders = ", ".join("?" for _ in normalized_actions)
+            query += f" AND dr.action IN ({placeholders})"
+            params.extend(normalized_actions)
         query += """
             GROUP BY dr.pool
             ORDER BY outcome_count DESC, avg_t_plus_3_return DESC, decision_count DESC
@@ -1213,9 +1251,13 @@ class Store:
         cursor = self.connection.execute(query, tuple(params))
         return cursor.fetchall()
 
-    def aggregate_decision_outcomes_by_pool_for_run(self, run_id: str, limit: int = 10) -> list[sqlite3.Row]:
-        cursor = self.connection.execute(
-            """
+    def aggregate_decision_outcomes_by_pool_for_run(
+        self,
+        run_id: str,
+        limit: int = 10,
+        actions: Iterable[str] | None = None,
+    ) -> list[sqlite3.Row]:
+        query = """
             SELECT
                 dr.pool AS pool,
                 COUNT(dr.decision_id) AS decision_count,
@@ -1240,12 +1282,23 @@ class Store:
             GROUP BY dr.pool
             ORDER BY outcome_count DESC, avg_t_plus_3_return DESC, decision_count DESC
             LIMIT ?
-            """,
-            (run_id, limit),
-        )
+            """
+        params: list[Any] = [run_id]
+        normalized_actions = [str(item).strip() for item in (actions or []) if str(item).strip()]
+        if normalized_actions:
+            placeholders = ", ".join("?" for _ in normalized_actions)
+            query = query.replace("WHERE dr.run_id = ?", f"WHERE dr.run_id = ? AND dr.action IN ({placeholders})")
+            params.extend(normalized_actions)
+        params.append(limit)
+        cursor = self.connection.execute(query, tuple(params))
         return cursor.fetchall()
 
-    def summarize_decision_outcomes(self, since: str, until: str = "") -> sqlite3.Row:
+    def summarize_decision_outcomes(
+        self,
+        since: str,
+        until: str = "",
+        actions: Iterable[str] | None = None,
+    ) -> sqlite3.Row:
         query = """
             SELECT
                 COUNT(dr.decision_id) AS decision_count,
@@ -1277,6 +1330,11 @@ class Store:
         if until:
             query += " AND dr.created_at < ?"
             params.append(until)
+        normalized_actions = [str(item).strip() for item in (actions or []) if str(item).strip()]
+        if normalized_actions:
+            placeholders = ", ".join("?" for _ in normalized_actions)
+            query += f" AND dr.action IN ({placeholders})"
+            params.extend(normalized_actions)
         cursor = self.connection.execute(query, tuple(params))
         row = cursor.fetchone()
         if row is None:
@@ -1340,6 +1398,52 @@ class Store:
         cursor = self.connection.execute(query, tuple(params))
         return cursor.fetchall()
 
+    def load_decision_outcomes_for_actions(
+        self,
+        *,
+        actions: Iterable[str],
+        since: str = "",
+        until: str = "",
+        limit: int = 0,
+    ) -> list[sqlite3.Row]:
+        normalized_actions = [str(item).strip() for item in actions if str(item).strip()]
+        if not normalized_actions:
+            return []
+        placeholders = ", ".join("?" for _ in normalized_actions)
+        query = f"""
+            SELECT
+                dr.decision_id,
+                dr.run_id,
+                dr.symbol,
+                dr.pool,
+                dr.action,
+                dr.created_at,
+                do.entered,
+                do.entered_at,
+                do.entry_price,
+                do.exit_price,
+                do.realized_return,
+                do.holding_days,
+                do.close_reason,
+                do.updated_at AS outcome_updated_at
+            FROM decision_records dr
+            JOIN decision_outcomes do ON dr.decision_id = do.decision_id
+            WHERE dr.action IN ({placeholders})
+        """
+        params: list[Any] = list(normalized_actions)
+        if since:
+            query += " AND dr.created_at >= ?"
+            params.append(since)
+        if until:
+            query += " AND dr.created_at < ?"
+            params.append(until)
+        query += " ORDER BY dr.created_at DESC, dr.decision_id DESC"
+        if limit > 0:
+            query += " LIMIT ?"
+            params.append(limit)
+        cursor = self.connection.execute(query, tuple(params))
+        return cursor.fetchall()
+
     def delete_decision_history(self, decision_ids: list[str]) -> dict[str, int]:
         if not decision_ids:
             return {"deleted_records": 0, "deleted_outcomes": 0}
@@ -1362,6 +1466,22 @@ class Store:
             deleted_records += max(int(record_cursor.rowcount), 0)
         self.connection.commit()
         return {"deleted_records": deleted_records, "deleted_outcomes": deleted_outcomes}
+
+    def delete_decision_outcomes(self, decision_ids: list[str]) -> int:
+        if not decision_ids:
+            return 0
+        deleted = 0
+        chunk_size = 500
+        for start in range(0, len(decision_ids), chunk_size):
+            batch = decision_ids[start : start + chunk_size]
+            placeholders = ", ".join("?" for _ in batch)
+            cursor = self.connection.execute(
+                f"DELETE FROM decision_outcomes WHERE decision_id IN ({placeholders})",
+                tuple(batch),
+            )
+            deleted += max(int(cursor.rowcount), 0)
+        self.connection.commit()
+        return deleted
 
     def get_state(self, key: str) -> Optional[str]:
         cursor = self.connection.execute(

@@ -12,7 +12,12 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from satellite_agent.archive import archive_decision_history
-from satellite_agent.main import format_decision_history_archive, format_decision_outcome_backfill
+from satellite_agent.main import (
+    build_non_executable_outcome_cleanup_payload,
+    format_decision_history_archive,
+    format_decision_outcome_backfill,
+    format_non_executable_outcome_cleanup,
+)
 from satellite_agent.market_data import MultiSourceMarketDataError
 from satellite_agent.models import Bar
 from satellite_agent.outcomes import backfill_decision_outcomes, compute_decision_outcome
@@ -92,6 +97,118 @@ def build_open_below_invalidation_then_entry_overlap_bars() -> list[Bar]:
 
 
 class DecisionOutcomeTests(unittest.TestCase):
+    def test_compute_decision_outcome_uses_decision_timestamp_for_same_session_entry(self) -> None:
+        bars = build_daily_bars()
+        created_at = datetime(2026, 3, 1, 14, 0, tzinfo=timezone.utc).isoformat()
+
+        outcome = compute_decision_outcome(
+            {
+                "decision_id": "decision-same-session",
+                "created_at": created_at,
+                "entry_plan_json": '{"entry_range":{"low":99.0,"high":100.5},"take_profit_range":{"low":106.0,"high":110.0},"invalidation_level":98.0}',
+                "invalidation_json": '{"level":98.0}',
+                "packet_json": "{}",
+            },
+            bars,
+        )
+
+        self.assertIsNotNone(outcome)
+        assert outcome is not None
+        self.assertTrue(outcome.entered)
+        self.assertEqual(outcome.entered_at, created_at)
+
+    def test_cleanup_decision_outcomes_dry_run_and_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = Store(Path(temp_dir) / "agent.db")
+            store.initialize()
+            created_at = datetime(2026, 3, 2, 14, 0, tzinfo=timezone.utc).isoformat()
+            store.save_decision_record(
+                decision_id="decision-watch-cleanup",
+                run_id="run-cleanup",
+                event_id="evt-watch-cleanup",
+                symbol="NVDA",
+                event_type="product_launch",
+                pool="prewatch",
+                action="加入观察",
+                priority="normal",
+                confidence="中",
+                event_score=60.0,
+                market_score=55.0,
+                theme_score=5.0,
+                final_score=61.0,
+                trigger_mode="event",
+                llm_used=False,
+                theme_ids=["semiconductors_and_ai"],
+                entry_plan={},
+                invalidation={},
+                ttl=created_at,
+                packet={},
+                created_at=created_at,
+            )
+            store.save_decision_record(
+                decision_id="decision-exec-cleanup",
+                run_id="run-cleanup",
+                event_id="evt-exec-cleanup",
+                symbol="AAPL",
+                event_type="product_launch",
+                pool="confirmation",
+                action="确认做多",
+                priority="high",
+                confidence="高",
+                event_score=78.0,
+                market_score=69.0,
+                theme_score=7.0,
+                final_score=80.0,
+                trigger_mode="event",
+                llm_used=False,
+                theme_ids=["consumer_tech"],
+                entry_plan={},
+                invalidation={},
+                ttl=created_at,
+                packet={},
+                created_at=created_at,
+            )
+            store.save_decision_outcome(
+                decision_id="decision-watch-cleanup",
+                entered=True,
+                entered_at=created_at,
+                entry_price=100.0,
+                t_plus_3_return=1.0,
+                close_reason="insufficient_lookahead",
+                updated_at=created_at,
+            )
+            store.save_decision_outcome(
+                decision_id="decision-exec-cleanup",
+                entered=True,
+                entered_at=created_at,
+                entry_price=100.0,
+                t_plus_3_return=2.0,
+                close_reason="insufficient_lookahead",
+                updated_at=created_at,
+            )
+
+            dry_run = build_non_executable_outcome_cleanup_payload(store)
+            self.assertEqual(dry_run["mode"], "dry_run")
+            self.assertEqual(dry_run["matched_outcomes"], 1)
+            self.assertEqual(dry_run["deleted_outcomes"], 0)
+            self.assertEqual(dry_run["sample_rows"][0]["decision_id"], "decision-watch-cleanup")
+            formatted = format_non_executable_outcome_cleanup(dry_run)
+            self.assertIn("当前仅预演统计，未修改数据库。", formatted)
+            self.assertIn("加入观察", formatted)
+
+            applied = build_non_executable_outcome_cleanup_payload(store, apply=True)
+            self.assertEqual(applied["mode"], "apply")
+            self.assertEqual(applied["matched_outcomes"], 1)
+            self.assertEqual(applied["deleted_outcomes"], 1)
+
+            watch_rows = store.load_decision_outcomes_for_actions(actions=("加入观察",))
+            self.assertEqual(watch_rows, [])
+            summary = store.summarize_decision_outcomes(
+                "2026-03-01T00:00:00+00:00",
+                actions=("试探建仓", "确认做多"),
+            )
+            self.assertEqual(summary["decision_count"], 1)
+
     def test_archive_decision_history_dry_run_only_reports_counts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -137,7 +254,7 @@ class DecisionOutcomeTests(unittest.TestCase):
                 symbol="NVDA",
                 event_type="product_launch",
                 pool="prewatch",
-                action="加入观察",
+                action="试探建仓",
                 priority="normal",
                 confidence="中",
                 event_score=60.0,
@@ -223,7 +340,7 @@ class DecisionOutcomeTests(unittest.TestCase):
                 symbol="NVDA",
                 event_type="product_launch",
                 pool="prewatch",
-                action="加入观察",
+                action="试探建仓",
                 priority="normal",
                 confidence="中",
                 event_score=60.0,
@@ -406,16 +523,16 @@ class DecisionOutcomeTests(unittest.TestCase):
             self.assertIsNone(outcome.exit_price)
             self.assertIsNone(outcome.realized_return)
 
-    def test_backfill_decision_outcomes_writes_results(self) -> None:
+    def test_backfill_decision_outcomes_only_processes_executable_actions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = Store(Path(temp_dir) / "agent.db")
             store.initialize()
             store.upsert_price_bars("NVDA", "1d", build_daily_bars())
             created_at = datetime(2026, 3, 2, 14, 0, tzinfo=timezone.utc).isoformat()
             store.save_decision_record(
-                decision_id="decision-2",
+                decision_id="decision-watch",
                 run_id="run-2",
-                event_id="evt-2",
+                event_id="evt-watch",
                 symbol="NVDA",
                 event_type="product_launch",
                 pool="prewatch",
@@ -435,19 +552,137 @@ class DecisionOutcomeTests(unittest.TestCase):
                 packet={},
                 created_at=created_at,
             )
+            store.save_decision_record(
+                decision_id="decision-exec",
+                run_id="run-2",
+                event_id="evt-exec",
+                symbol="AAPL",
+                event_type="product_launch",
+                pool="confirmation",
+                action="确认做多",
+                priority="high",
+                confidence="高",
+                event_score=75.0,
+                market_score=68.0,
+                theme_score=7.0,
+                final_score=78.0,
+                trigger_mode="event",
+                llm_used=False,
+                theme_ids=["consumer_tech"],
+                entry_plan={},
+                invalidation={},
+                ttl=created_at,
+                packet={},
+                created_at=created_at,
+            )
+            store.upsert_price_bars("AAPL", "1d", build_daily_bars())
             payload = backfill_decision_outcomes(store, run_id="run-2")
             rows = store.load_decision_records("run-2")
+            by_id = {row["decision_id"]: row for row in rows}
             self.assertEqual(payload["updated"], 1)
             self.assertEqual(payload["scanned"], 1)
             self.assertEqual(payload["completed_window"], 1)
             self.assertEqual(payload["pending_lookahead"], 0)
             self.assertEqual(payload["take_profit_hits"], 0)
-            self.assertIsNotNone(rows[0]["t_plus_3_return"])
-            self.assertEqual(rows[0]["t_plus_10_return"], 10.78)
+            self.assertIsNone(by_id["decision-watch"]["t_plus_3_return"])
+            self.assertIsNone(by_id["decision-watch"]["entered"])
+            self.assertIsNotNone(by_id["decision-exec"]["t_plus_3_return"])
+            self.assertEqual(by_id["decision-exec"]["t_plus_10_return"], 10.78)
             formatted = format_decision_outcome_backfill({**payload, "run_id": "run-2"})
             self.assertIn("成功回写：1", formatted)
             self.assertIn("完整窗口 1 / 等待更多 bars 0", formatted)
             self.assertIn("命中情况：止盈 0 / 失效 0", formatted)
+
+    def test_decision_outcome_summaries_can_filter_to_executable_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = Store(Path(temp_dir) / "agent.db")
+            store.initialize()
+            created_at = datetime(2026, 3, 2, 14, 0, tzinfo=timezone.utc).isoformat()
+            store.save_decision_record(
+                decision_id="decision-watch-summary",
+                run_id="run-summary",
+                event_id="evt-watch-summary",
+                symbol="NVDA",
+                event_type="product_launch",
+                pool="prewatch",
+                action="加入观察",
+                priority="normal",
+                confidence="中",
+                event_score=60.0,
+                market_score=55.0,
+                theme_score=5.0,
+                final_score=61.0,
+                trigger_mode="event",
+                llm_used=False,
+                theme_ids=["semiconductors_and_ai"],
+                entry_plan={},
+                invalidation={},
+                ttl=created_at,
+                packet={},
+                created_at=created_at,
+            )
+            store.save_decision_record(
+                decision_id="decision-exec-summary",
+                run_id="run-summary",
+                event_id="evt-exec-summary",
+                symbol="AAPL",
+                event_type="product_launch",
+                pool="confirmation",
+                action="确认做多",
+                priority="high",
+                confidence="高",
+                event_score=78.0,
+                market_score=69.0,
+                theme_score=7.0,
+                final_score=80.0,
+                trigger_mode="resonance",
+                llm_used=False,
+                theme_ids=["consumer_tech"],
+                entry_plan={},
+                invalidation={},
+                ttl=created_at,
+                packet={},
+                created_at=created_at,
+            )
+            store.save_decision_outcome(
+                decision_id="decision-watch-summary",
+                entered=True,
+                entered_at=created_at,
+                entry_price=100.0,
+                t_plus_3_return=1.0,
+                close_reason="insufficient_lookahead",
+                updated_at=created_at,
+            )
+            store.save_decision_outcome(
+                decision_id="decision-exec-summary",
+                entered=True,
+                entered_at=created_at,
+                entry_price=100.0,
+                t_plus_3_return=2.0,
+                close_reason="insufficient_lookahead",
+                updated_at=created_at,
+            )
+
+            summary = store.summarize_decision_outcomes(
+                "2026-03-01T00:00:00+00:00",
+                actions=("试探建仓", "确认做多"),
+            )
+            event_rows = store.aggregate_decision_outcomes_by_event_type(
+                "2026-03-01T00:00:00+00:00",
+                actions=("试探建仓", "确认做多"),
+            )
+            pool_rows = store.aggregate_decision_outcomes_by_pool(
+                "2026-03-01T00:00:00+00:00",
+                actions=("试探建仓", "确认做多"),
+            )
+
+            self.assertEqual(summary["decision_count"], 1)
+            self.assertEqual(summary["entered_count"], 1)
+            self.assertEqual(len(event_rows), 1)
+            self.assertEqual(event_rows[0]["decision_count"], 1)
+            self.assertEqual(event_rows[0]["entered_count"], 1)
+            self.assertEqual(len(pool_rows), 1)
+            self.assertEqual(pool_rows[0]["pool"], "confirmation")
 
     def test_backfill_decision_outcomes_revisits_incomplete_rows(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -507,7 +742,7 @@ class DecisionOutcomeTests(unittest.TestCase):
                 symbol="NVDA",
                 event_type="product_launch",
                 pool="prewatch",
-                action="加入观察",
+                action="试探建仓",
                 priority="normal",
                 confidence="中",
                 event_score=60.0,

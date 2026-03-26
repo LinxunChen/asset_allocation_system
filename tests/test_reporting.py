@@ -411,14 +411,14 @@ class ReportingTests(unittest.TestCase):
         self.assertIn("主要未通过原因：未达到确认阈值 1 条 / 不满足执行条件 1 条", review_text)
         self.assertIn("完整模拟闭环：", review_text)
         self.assertIn("观察：3 条", review_text)
-        self.assertIn("模拟进场：1 条 | 确认机会 -> 模拟进场转化率 50.0%", review_text)
-        self.assertIn("进入兑现池：1 条 | 模拟进场 -> 进入兑现池转化率 100.0%", review_text)
-        self.assertIn("模拟退出完成：1 条 | 模拟进场 -> 模拟退出完成率 100.0%", review_text)
-        self.assertIn("确认机会 -> 模拟进场：平均等待 1.00 天，中位数 1.00 天", review_text)
-        self.assertIn("模拟进场 -> 模拟退出完成：平均持有 2.00 天，中位数 2.00 天", review_text)
+        self.assertIn("模拟成交：1 条 | 确认机会 -> 模拟成交转化率 50.0%", review_text)
+        self.assertIn("进入兑现池：1 条 | 模拟成交 -> 进入兑现池转化率 100.0%", review_text)
+        self.assertIn("模拟退出完成：1 条 | 模拟成交 -> 模拟退出完成率 100.0%", review_text)
+        self.assertIn("确认机会 -> 模拟成交：平均等待 1.00 天，中位数 1.00 天", review_text)
+        self.assertIn("模拟成交 -> 模拟退出完成：平均持有 2.00 天，中位数 2.00 天", review_text)
         self.assertIn("按动作看成交等待：确认做多：样本 1 条，平均等待 1.00 天，中位数 1.00 天", review_text)
         self.assertIn("按动作看持有时长：确认做多：样本 1 条，平均持有 2.00 天，中位数 2.00 天", review_text)
-        self.assertIn("另有 1 条确认机会尚未形成模拟进场。", review_text)
+        self.assertIn("另有 1 条确认机会尚未形成模拟成交。", review_text)
         self.assertIn("其中：兑现池 1 条", review_text)
         self.assertIn("新增观察标的：", review_text)
         self.assertIn("本轮新增观察标的 3 个，其中 1 个当前仍处于后台观察。", review_text)
@@ -886,9 +886,9 @@ class ReportingTests(unittest.TestCase):
             self.assertEqual(review["overview"]["entered_count"], 1)
             self.assertEqual(review["overview"]["not_entered_count"], 1)
             self.assertEqual(review["overview"]["open_position_count"], 0)
-            self.assertIn("已进场（试探建仓/确认做多）：1", report_text)
-            self.assertIn("未进场（试探建仓/确认做多，但未到入场区间）：1", report_text)
-            self.assertIn("观察中（已进场后）：0", report_text)
+            self.assertIn("已成交（试探建仓/确认做多）：1", report_text)
+            self.assertIn("未成交（试探建仓/确认做多，但未到入场区间）：1", report_text)
+            self.assertIn("观察中（已成交后）：0", report_text)
             self.assertIn("确认池：样本 1 条", report_text)
             self.assertIn("预备池：样本 1 条", report_text)
             self.assertIn("直接成卡：样本 1 条", report_text)
@@ -900,6 +900,541 @@ class ReportingTests(unittest.TestCase):
             self.assertIn("T+7 表现最好 Top3：", report_text)
             self.assertIn("T+7 表现最差 Top3：", report_text)
             self.assertIn("T+7收益", report_text)
+
+    def test_historical_effect_review_includes_dual_window_comparison_and_path_quality_panel(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+            now = utcnow()
+
+            def _save_decision(index: int, *, days_ago: int, realized_return: float) -> None:
+                created_at = (now - timedelta(days=days_ago)).isoformat()
+                decision_id = f"decision-{index}"
+                store.save_decision_record(
+                    decision_id=decision_id,
+                    run_id="run-review",
+                    event_id=f"evt-{index}",
+                    symbol=f"SYM{index}",
+                    event_type="guidance",
+                    pool="confirmation",
+                    action="确认做多",
+                    priority="normal",
+                    confidence="高",
+                    event_score=82.0,
+                    market_score=75.0,
+                    theme_score=8.0,
+                    final_score=84.0,
+                    trigger_mode="direct",
+                    llm_used=False,
+                    theme_ids=["semis"],
+                    entry_plan={
+                        "entry_range": {"low": 100.0, "high": 101.0},
+                        "take_profit_range": {"low": 106.0, "high": 110.0},
+                        "invalidation_level": 98.0,
+                    },
+                    invalidation={"level": 98.0, "reason": "跌破支撑"},
+                    ttl=created_at,
+                    packet={},
+                    created_at=created_at,
+                )
+                store.save_decision_outcome(
+                    decision_id=decision_id,
+                    entered=True,
+                    entered_at=created_at,
+                    entry_price=101.0,
+                    exit_price=106.0,
+                    realized_return=realized_return,
+                    t_plus_7_return=realized_return,
+                    t_plus_14_return=realized_return + 1.0,
+                    t_plus_30_return=realized_return + 2.0,
+                    max_runup=realized_return + 3.0,
+                    max_drawdown=-2.0,
+                    holding_days=7,
+                    close_reason="window_complete",
+                    updated_at=created_at,
+                )
+
+            _save_decision(1, days_ago=5, realized_return=3.0)
+            _save_decision(2, days_ago=12, realized_return=4.0)
+            _save_decision(3, days_ago=20, realized_return=5.0)
+            _save_decision(4, days_ago=45, realized_return=2.0)
+            _save_decision(5, days_ago=70, realized_return=1.0)
+
+            review = _build_historical_effect_review_data(store, days=30, limit=10)
+            report_text = format_recent_performance_review(review)
+
+            comparison_windows = review.get("comparison_windows") or {}
+            self.assertEqual(comparison_windows["primary"]["window_days"], 30)
+            self.assertEqual(comparison_windows["baseline"]["window_days"], 90)
+            self.assertIn("阅读备注：", report_text)
+            self.assertIn("执行摘要：", report_text)
+            self.assertIn("核心指标摘要：", report_text)
+            self.assertIn("| 指标 | 近 30 天（调参） | 近 90 天（基准） | 状态 |", report_text)
+            self.assertIn("完整模拟闭环：", report_text)
+            self.assertIn("定位：看机会从观察到模拟退出，主要卡在哪一段。", report_text)
+            self.assertIn("路径质量 / 浮盈浮亏摘要：", report_text)
+            self.assertIn("定位：看已模拟成交样本在持有过程中的利润空间、回撤和延续性，包含已退出与未退出样本。", report_text)
+            self.assertIn("说明：截至目前路径统计，不等于完整持有周期结果。", report_text)
+
+    def test_historical_effect_review_path_quality_uses_matured_samples_for_t_plus_30(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+            now = utcnow()
+            mature_created_at = (now - timedelta(days=40)).isoformat()
+            fresh_created_at = (now - timedelta(days=10)).isoformat()
+
+            for decision_id, symbol, created_at, t30_return, runup in (
+                ("decision-mature", "MATR", mature_created_at, 8.0, 9.0),
+                ("decision-fresh", "FRESH", fresh_created_at, 5.0, 6.0),
+            ):
+                store.save_decision_record(
+                    decision_id=decision_id,
+                    run_id="run-review",
+                    event_id=f"evt-{symbol}",
+                    symbol=symbol,
+                    event_type="guidance",
+                    pool="confirmation",
+                    action="确认做多",
+                    priority="normal",
+                    confidence="高",
+                    event_score=80.0,
+                    market_score=72.0,
+                    theme_score=8.0,
+                    final_score=82.0,
+                    trigger_mode="direct",
+                    llm_used=False,
+                    theme_ids=["semis"],
+                    entry_plan={
+                        "entry_range": {"low": 100.0, "high": 101.0},
+                        "take_profit_range": {"low": 106.0, "high": 110.0},
+                        "invalidation_level": 98.0,
+                    },
+                    invalidation={"level": 98.0, "reason": "跌破支撑"},
+                    ttl=created_at,
+                    packet={},
+                    created_at=created_at,
+                )
+                store.save_decision_outcome(
+                    decision_id=decision_id,
+                    entered=True,
+                    entered_at=created_at,
+                    entry_price=101.0,
+                    t_plus_30_return=t30_return,
+                    max_runup=runup,
+                    max_drawdown=-2.0,
+                    close_reason="insufficient_lookahead",
+                    updated_at=created_at,
+                )
+
+            review = _build_historical_effect_review_data(store, days=90, limit=10)
+            checkpoint_30 = next(
+                row for row in review["path_quality_summary"]["checkpoints"]
+                if row["day"] == 30
+            )
+
+            self.assertEqual(checkpoint_30["sample_count"], 1)
+            self.assertEqual(checkpoint_30["avg_return"], 8.0)
+            self.assertEqual(review["path_quality_summary"]["max_runup_sample_count"], 2)
+
+    def test_historical_effect_review_path_quality_locks_realized_return_for_early_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+            created_at = (utcnow() - timedelta(days=5)).isoformat()
+
+            store.save_decision_record(
+                decision_id="decision-early-exit",
+                run_id="run-review",
+                event_id="evt-early-exit",
+                symbol="FAST",
+                event_type="guidance",
+                pool="confirmation",
+                action="确认做多",
+                priority="normal",
+                confidence="高",
+                event_score=81.0,
+                market_score=72.0,
+                theme_score=8.0,
+                final_score=83.0,
+                trigger_mode="direct",
+                llm_used=False,
+                theme_ids=["semis"],
+                entry_plan={
+                    "entry_range": {"low": 100.0, "high": 101.0},
+                    "take_profit_range": {"low": 106.0, "high": 110.0},
+                    "invalidation_level": 98.0,
+                },
+                invalidation={"level": 98.0, "reason": "跌破支撑"},
+                ttl=created_at,
+                packet={},
+                created_at=created_at,
+            )
+            store.save_decision_outcome(
+                decision_id="decision-early-exit",
+                entered=True,
+                entered_at=created_at,
+                entry_price=101.0,
+                exit_price=106.0,
+                realized_return=4.95,
+                holding_days=3,
+                close_reason="hit_invalidation",
+                max_runup=5.2,
+                max_drawdown=-1.8,
+                updated_at=created_at,
+            )
+
+            review = _build_historical_effect_review_data(store, days=30, limit=10)
+            checkpoint_7 = next(
+                row for row in review["path_quality_summary"]["checkpoints"]
+                if row["day"] == 7
+            )
+
+            self.assertEqual(checkpoint_7["sample_count"], 1)
+            self.assertEqual(checkpoint_7["avg_return"], 4.95)
+
+    def test_historical_effect_review_auxiliary_runup_drawdown_aligns_with_entered_samples(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+            created_at = (utcnow() - timedelta(days=5)).isoformat()
+
+            store.save_decision_record(
+                decision_id="decision-entered",
+                run_id="run-review",
+                event_id="evt-entered",
+                symbol="GOOD",
+                event_type="guidance",
+                pool="confirmation",
+                action="确认做多",
+                priority="normal",
+                confidence="高",
+                event_score=82.0,
+                market_score=72.0,
+                theme_score=8.0,
+                final_score=84.0,
+                trigger_mode="direct",
+                llm_used=False,
+                theme_ids=["semis"],
+                entry_plan={
+                    "entry_range": {"low": 100.0, "high": 101.0},
+                    "take_profit_range": {"low": 106.0, "high": 110.0},
+                    "invalidation_level": 98.0,
+                },
+                invalidation={"level": 98.0, "reason": "跌破支撑"},
+                ttl=created_at,
+                packet={},
+                created_at=created_at,
+            )
+            store.save_decision_outcome(
+                decision_id="decision-entered",
+                entered=True,
+                entered_at=created_at,
+                entry_price=101.0,
+                max_runup=5.5,
+                max_drawdown=-2.2,
+                close_reason="insufficient_lookahead",
+                updated_at=created_at,
+            )
+
+            store.save_decision_record(
+                decision_id="decision-not-entered",
+                run_id="run-review",
+                event_id="evt-not-entered",
+                symbol="WAIT",
+                event_type="guidance",
+                pool="confirmation",
+                action="试探建仓",
+                priority="normal",
+                confidence="中",
+                event_score=76.0,
+                market_score=68.0,
+                theme_score=6.0,
+                final_score=78.0,
+                trigger_mode="direct",
+                llm_used=False,
+                theme_ids=["semis"],
+                entry_plan={
+                    "entry_range": {"low": 50.0, "high": 51.0},
+                    "take_profit_range": {"low": 56.0, "high": 60.0},
+                    "invalidation_level": 48.0,
+                },
+                invalidation={"level": 48.0, "reason": "跌破支撑"},
+                ttl=created_at,
+                packet={},
+                created_at=created_at,
+            )
+            store.save_decision_outcome(
+                decision_id="decision-not-entered",
+                entered=False,
+                max_runup=9.9,
+                max_drawdown=-4.4,
+                close_reason="not_entered",
+                updated_at=created_at,
+            )
+
+            review = _build_historical_effect_review_data(store, days=30, limit=10)
+            runup_metric = next(
+                row for row in review["auxiliary_observation"]
+                if row["field"] == "max_runup"
+            )
+            drawdown_metric = next(
+                row for row in review["auxiliary_observation"]
+                if row["field"] == "max_drawdown"
+            )
+
+            self.assertEqual(runup_metric["sample_count"], 1)
+            self.assertEqual(runup_metric["avg_value"], 5.5)
+            self.assertEqual(drawdown_metric["sample_count"], 1)
+            self.assertEqual(drawdown_metric["avg_value"], -2.2)
+
+    def test_historical_effect_review_path_quality_displays_runup_and_drawdown_top3(self) -> None:
+        review = {
+            "status_label": "历史效果复盘（草稿）",
+            "status": "草稿",
+            "review_version": "v1",
+            "review_window": {"start_date": "2026-03-01", "end_date": "2026-03-25"},
+            "backfill_cutoff_at": utcnow().isoformat(),
+            "formal_readiness": {"status_label": "未满足", "blockers": []},
+            "adjusted_price_status": {},
+            "draft_reasons": [],
+            "sample_audit": {},
+            "overview": {},
+            "execution_quality": {},
+            "trade_path_summary": {},
+            "pool_funnel_summary": {},
+            "simulation_funnel_summary": {},
+            "candidate_evaluation_summary": {},
+            "candidate_evaluation_trend_summary": {},
+            "recent_observation_samples": [],
+            "auxiliary_observation": [],
+            "breakdowns": {},
+            "appendix": {"observation_signal_count": 0},
+            "best_completed_decisions": [],
+            "worst_completed_decisions": [],
+            "best_t7_decisions": [],
+            "worst_t7_decisions": [],
+            "decision_details": [],
+            "recommendations": [],
+            "recommendation_details": [],
+            "comparison_windows": {
+                "primary": {
+                    "label": "近 30 天",
+                    "role_label": "调参",
+                    "sample_gate": {"sufficient": True, "decision_count": 6},
+                    "overview": {},
+                    "execution_quality": {},
+                    "simulation_funnel_summary": {},
+                    "path_quality_summary": {
+                        "max_runup_sample_count": 3,
+                        "avg_max_runup": 7.5,
+                        "max_drawdown_sample_count": 3,
+                        "avg_max_drawdown": -3.2,
+                        "checkpoints": [],
+                        "observation_line": "给过利润窗口，但回撤仍需控制。",
+                        "best_runup_samples": [
+                            {"symbol": "AAA", "action": "确认做多", "action_display": "确认做多", "max_runup": 12.3},
+                            {"symbol": "BBB", "action": "试探建仓", "action_display": "试探建仓", "max_runup": 8.8},
+                        ],
+                        "worst_drawdown_samples": [
+                            {"symbol": "CCC", "action": "确认做多", "action_display": "确认做多", "max_drawdown": -6.5},
+                            {"symbol": "DDD", "action": "试探建仓", "action_display": "试探建仓", "max_drawdown": -4.2},
+                        ],
+                    },
+                },
+                "baseline": {
+                    "label": "近 90 天",
+                    "role_label": "基准",
+                    "sample_gate": {"sufficient": True, "decision_count": 8},
+                    "overview": {},
+                    "execution_quality": {},
+                    "simulation_funnel_summary": {},
+                    "path_quality_summary": {
+                        "max_runup_sample_count": 2,
+                        "avg_max_runup": 5.0,
+                        "max_drawdown_sample_count": 2,
+                        "avg_max_drawdown": -2.0,
+                        "checkpoints": [],
+                        "observation_line": "基准窗口整体中性。",
+                        "best_runup_samples": [],
+                        "worst_drawdown_samples": [],
+                    },
+                },
+                "summary": {"summary_lines": ["近 30 天和 90 天表现存在分化。"]},
+            },
+        }
+
+        report_text = format_recent_performance_review(review)
+
+        self.assertIn("最大浮盈 Top3：", report_text)
+        self.assertIn("AAA（确认做多） | 最大浮盈 12.30%", report_text)
+        self.assertIn("BBB（试探建仓） | 最大浮盈 8.80%", report_text)
+        self.assertIn("最大回撤 Top3：", report_text)
+        self.assertIn("CCC（确认做多） | 最大回撤 -6.50%", report_text)
+        self.assertIn("DDD（试探建仓） | 最大回撤 -4.20%", report_text)
+
+    def test_historical_effect_review_path_quality_dedupes_duplicate_representative_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+            created_at = (utcnow() - timedelta(days=12)).isoformat()
+            for decision_id in ("decision-dup-1", "decision-dup-2"):
+                store.save_decision_record(
+                    decision_id=decision_id,
+                    run_id="run-dup",
+                    event_id="evt-dup",
+                    symbol="TSM",
+                    event_type="news",
+                    pool="confirmation",
+                    action="确认做多",
+                    priority="high",
+                    confidence="高",
+                    event_score=80.0,
+                    market_score=72.0,
+                    theme_score=8.0,
+                    final_score=84.0,
+                    trigger_mode="direct",
+                    llm_used=False,
+                    theme_ids=["semis"],
+                    entry_plan={
+                        "entry_range": {"low": 100.0, "high": 101.0},
+                        "take_profit_range": {"low": 106.0, "high": 110.0},
+                        "invalidation_level": 98.0,
+                    },
+                    invalidation={"level": 98.0, "reason": "跌破支撑"},
+                    ttl=created_at,
+                    packet={},
+                    created_at=created_at,
+                )
+                store.save_decision_outcome(
+                    decision_id=decision_id,
+                    entered=True,
+                    entered_at=created_at,
+                    entry_price=101.0,
+                    max_runup=9.5,
+                    max_drawdown=-3.1,
+                    close_reason="insufficient_lookahead",
+                    updated_at=created_at,
+                )
+
+            review = _build_historical_effect_review_data(store, days=30, limit=10)
+            report_text = format_recent_performance_review(review)
+
+            self.assertEqual(review["path_quality_summary"]["entered_sample_count"], 1)
+            self.assertEqual(review["path_quality_summary"]["deduped_merge_count"], 1)
+            self.assertEqual(len(review["path_quality_summary"]["best_runup_samples"]), 1)
+            self.assertIn("已按代表样本合并 1 条重复路径记录。", report_text)
+
+    def test_historical_effect_review_skips_negative_confirmation_to_entry_timing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+            created_at = datetime(2026, 3, 20, 14, 0, tzinfo=timezone.utc).isoformat()
+            entered_at = datetime(2026, 3, 20, 0, 0, tzinfo=timezone.utc).isoformat()
+
+            store.save_decision_record(
+                decision_id="decision-negative-entry",
+                run_id="run-negative-entry",
+                event_id="evt-negative-entry",
+                symbol="TSM",
+                event_type="news",
+                pool="confirmation",
+                action="确认做多",
+                priority="high",
+                confidence="高",
+                event_score=80.0,
+                market_score=72.0,
+                theme_score=8.0,
+                final_score=84.0,
+                trigger_mode="promoted",
+                llm_used=False,
+                theme_ids=["semis"],
+                entry_plan={
+                    "entry_range": {"low": 100.0, "high": 101.0},
+                    "take_profit_range": {"low": 106.0, "high": 110.0},
+                    "invalidation_level": 98.0,
+                },
+                invalidation={"level": 98.0, "reason": "跌破支撑"},
+                ttl=created_at,
+                packet={"promoted_from_prewatch": True},
+                created_at=created_at,
+            )
+            store.save_decision_outcome(
+                decision_id="decision-negative-entry",
+                entered=True,
+                entered_at=entered_at,
+                entry_price=101.0,
+                max_runup=4.0,
+                max_drawdown=-1.5,
+                close_reason="insufficient_lookahead",
+                updated_at=created_at,
+            )
+
+            review = _build_historical_effect_review_data(store, days=30, limit=10)
+            report_text = format_recent_performance_review(review)
+
+            self.assertIsNone(review["simulation_funnel_summary"]["avg_confirmation_to_entry_days"])
+            self.assertEqual(review["simulation_funnel_summary"]["confirmation_to_entry_timing_anomaly_count"], 1)
+            self.assertIn("已跳过 1 条成交时间早于决策时间的异常样本。", report_text)
+
+    def test_historical_effect_review_small_sample_guard_downgrades_recommendation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+            created_at = (utcnow() - timedelta(days=4)).isoformat()
+
+            store.save_decision_record(
+                decision_id="decision-small-sample",
+                run_id="run-review",
+                event_id="evt-small-sample",
+                symbol="SMPL",
+                event_type="guidance",
+                pool="confirmation",
+                action="确认做多",
+                priority="normal",
+                confidence="高",
+                event_score=82.0,
+                market_score=74.0,
+                theme_score=8.0,
+                final_score=84.0,
+                trigger_mode="direct",
+                llm_used=False,
+                theme_ids=["semis"],
+                entry_plan={
+                    "entry_range": {"low": 100.0, "high": 101.0},
+                    "take_profit_range": {"low": 106.0, "high": 110.0},
+                    "invalidation_level": 98.0,
+                },
+                invalidation={"level": 98.0, "reason": "跌破支撑"},
+                ttl=created_at,
+                packet={},
+                created_at=created_at,
+            )
+            store.save_decision_outcome(
+                decision_id="decision-small-sample",
+                entered=True,
+                entered_at=created_at,
+                entry_price=101.0,
+                max_runup=3.5,
+                max_drawdown=-1.2,
+                close_reason="insufficient_lookahead",
+                updated_at=created_at,
+            )
+
+            review = _build_historical_effect_review_data(store, days=30, limit=10)
+            report_text = format_recent_performance_review(review)
+
+            self.assertIn("样本量不足", review["recommendations"][0])
+            self.assertIn("不建议直接调整参数", review["recommendations"][0])
+            self.assertIn("样本量不足", report_text)
+            self.assertIn("不建议直接调整参数", report_text)
 
     def test_historical_effect_review_summarizes_trade_paths_to_exit_pool(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1235,6 +1770,13 @@ class ReportingTests(unittest.TestCase):
             self.assertEqual(review["recent_observation_samples"][0]["symbol"], "CCC")
             self.assertEqual(review["recent_observation_samples"][0]["observation_status"], "仅后台观察")
             self.assertEqual(review["recent_observation_samples"][0]["confirmation_status"], "已形成确认机会")
+            self.assertEqual(review["observation_after_summary"]["observation_count"], 3)
+            self.assertEqual(review["observation_after_summary"]["observation_alert_count"], 2)
+            self.assertEqual(review["observation_after_summary"]["promoted_confirmation_count"], 2)
+            self.assertEqual(review["observation_after_summary"]["promoted_after_alert_count"], 1)
+            self.assertEqual(review["observation_after_summary"]["promoted_without_alert_count"], 1)
+            self.assertEqual(review["observation_after_summary"]["still_observing_symbol_count"], 1)
+            self.assertAlmostEqual(review["observation_after_summary"]["avg_days_to_confirmation"], 1.0, places=2)
             self.assertIn("三池漏斗：", report_text)
             self.assertIn("预备池候选：3 条", report_text)
             self.assertIn("观察提醒：2 条（观察 -> 观察提醒转化率：66.67%）", report_text)
@@ -1245,17 +1787,21 @@ class ReportingTests(unittest.TestCase):
             self.assertIn("最近新增观察样本：", report_text)
             self.assertIn("- 2026-03-16 22:00 | CCC | 仅后台观察 | 已形成确认机会", report_text)
             self.assertIn("预备池 74.00 分 / 结构预热", report_text)
+            self.assertIn("观察后表现：", report_text)
+            self.assertIn("观察样本：3 条", report_text)
+            self.assertIn("观察 -> 确认：平均 1.00 天，中位数 1.00 天", report_text)
+            self.assertIn("- 2026-03-16 22:00 | AAA | 确认做多", report_text)
             self.assertIn("完整模拟闭环：", report_text)
             self.assertIn("观察：3 条", report_text)
-            self.assertIn("模拟进场：2 条（确认机会 -> 模拟进场转化率：100.00%）", report_text)
-            self.assertIn("进入兑现池：1 条（模拟进场 -> 进入兑现池转化率：50.00%）", report_text)
-            self.assertIn("模拟退出完成：1 条（模拟进场 -> 模拟退出完成率：50.00%）", report_text)
-            self.assertIn("确认机会 -> 模拟进场：平均等待 0.00 天，中位数 0.00 天", report_text)
-            self.assertIn("模拟进场 -> 模拟退出完成：平均持有 2.00 天，中位数 2.00 天", report_text)
+            self.assertIn("模拟成交：2 条（确认机会 -> 模拟成交转化率：100.00%）", report_text)
+            self.assertIn("进入兑现池：1 条（模拟成交 -> 进入兑现池转化率：50.00%）", report_text)
+            self.assertIn("模拟退出完成：1 条（模拟成交 -> 模拟退出完成率：50.00%）", report_text)
+            self.assertIn("确认机会 -> 模拟成交：平均等待 0.00 天，中位数 0.00 天", report_text)
+            self.assertIn("模拟成交 -> 模拟退出完成：平均持有 2.00 天，中位数 2.00 天", report_text)
             self.assertIn("按动作看成交等待：确认做多：样本 1 条，平均等待 0.00 天，中位数 0.00 天", report_text)
             self.assertIn("按动作看成交等待：试探建仓：样本 1 条，平均等待 0.00 天，中位数 0.00 天", report_text)
             self.assertIn("按动作看持有时长：确认做多：样本 1 条，平均持有 2.00 天，中位数 2.00 天", report_text)
-            self.assertIn("另有 1 条已模拟进场，但当前仍在持有观察中。", report_text)
+            self.assertIn("另有 1 条已模拟成交，但当前仍在持有观察中。", report_text)
             self.assertIn("其中：兑现池 1 条", report_text)
 
     def test_historical_effect_review_summarizes_candidate_evaluation_diagnostics(self) -> None:
@@ -1450,18 +1996,9 @@ class ReportingTests(unittest.TestCase):
             report_text = format_recent_performance_review(review)
 
             trend = review["candidate_evaluation_trend_summary"]
-            self.assertEqual(
-                review["recommendations"][0],
-                "近 7 天预备池更多卡在低于观察阈值，优先回看观察门槛是否偏高。",
-            )
-            self.assertEqual(
-                review["recommendation_details"][0]["parameter_keys"],
-                ["prewatch_min_score"],
-            )
-            self.assertEqual(
-                review["recommendation_details"][0]["parameter_details"][0]["direction"],
-                "high",
-            )
+            self.assertIn("样本量不足", review["recommendations"][0])
+            self.assertIn("不建议直接调整参数", review["recommendations"][0])
+            self.assertEqual(review["recommendation_details"][0]["parameter_keys"], [])
             self.assertEqual(trend["recent_window_days"], 7)
             self.assertEqual(trend["baseline_window_days"], 30)
             self.assertEqual(trend["prewatch"]["recent_total_count"], 2)
@@ -1476,11 +2013,9 @@ class ReportingTests(unittest.TestCase):
             self.assertIn("确认机会：近 7 天 1 条，当前窗口 30 天 2 条。", report_text)
             self.assertIn("未达到确认阈值：近 7 天 1 条，30 天 1 条", report_text)
             self.assertIn("下一步建议：", report_text)
-            self.assertIn("参数检查清单：", report_text)
-            self.assertIn("1. 观察门槛（prewatch_min_score，更可能偏高）", report_text)
-            self.assertIn("优先先调：", report_text)
-            self.assertIn("近 7 天预备池更多卡在低于观察阈值，优先回看观察门槛是否偏高。", report_text)
-            self.assertIn("对应参数：观察门槛（prewatch_min_score，更可能偏高）", report_text)
+            self.assertIn("样本量不足", report_text)
+            self.assertIn("不建议直接调整参数", report_text)
+            self.assertNotIn("参数检查清单：", report_text)
 
     def test_format_recent_performance_review_groups_inspection_recommendations(self) -> None:
         review = {
@@ -1524,7 +2059,7 @@ class ReportingTests(unittest.TestCase):
         report_text = format_recent_performance_review(review)
 
         self.assertIn("下一步建议：", report_text)
-        self.assertIn("优先先排查：", report_text)
+        self.assertIn("当前结论：优先先排查", report_text)
         self.assertIn("确认评分异常增多，优先排查确认阶段评分链路。", report_text)
 
     def test_format_recent_performance_review_labels_missing_exit_price_states(self) -> None:
@@ -1560,7 +2095,7 @@ class ReportingTests(unittest.TestCase):
                     "event_type_display": "财报",
                     "action": "确认做多",
                     "action_display": "确认做多",
-                    "status_label": "未进场",
+                    "status_label": "未成交",
                     "entered": False,
                     "close_reason": "not_entered",
                     "entry_price": None,
@@ -1588,7 +2123,7 @@ class ReportingTests(unittest.TestCase):
 
         report_text = format_recent_performance_review(review)
 
-        self.assertIn("| 2026-03-24 18:00 | AAA | 财报 | 未进场（确认做多） | 暂无 | 未进场 | 暂无 | 暂无 |", report_text)
+        self.assertIn("| 2026-03-24 18:00 | AAA | 财报 | 未成交（确认做多） | 暂无 | 未成交 | 暂无 | 暂无 |", report_text)
         self.assertIn("| 2026-03-24 19:00 | BBB | 新闻 | 仍在观察窗（试探建仓） | 100.00 | 仍在持有 | 暂无 | 暂无 |", report_text)
 
     def test_serialize_strategy_report_completed_cohort_summary_prefers_completed_windows(self) -> None:
@@ -2550,6 +3085,82 @@ class ReportingTests(unittest.TestCase):
         self.assertIn("同步月报：2 份", text)
         self.assertIn("2026-03: /tmp/historical_effect/monthly/2026-03/review.md", text)
         self.assertIn("2026-02: /tmp/historical_effect/monthly/2026-02/review.md", text)
+
+    def test_format_live_run_artifacts_adds_external_connectivity_hint(self) -> None:
+        text = format_live_run_artifacts(
+            {
+                "run_id": "live-run-1",
+                "outcome_backfill": {"days": 45, "scanned": 2, "updated": 1, "skipped": 1, "fetched_symbols": 1},
+                "review_path": "/tmp/serve_review.md",
+                "historical_effect_review_path": "/tmp/historical_effect/review.md",
+                "historical_effect_review_refreshed": True,
+                "historical_effect_monthly_outputs": [],
+                "llm_usage_report_path": "/tmp/llm_usage/report.md",
+                "llm_usage_report_refreshed": True,
+                "payload_path": "/tmp/serve_payload.json",
+                "external_connectivity_issues": {"has_issue": True, "sources": ["sec_edgar"], "count": 1},
+            }
+        )
+        self.assertIn("外网提醒：检测到 sec_edgar 连通性异常，请先检查 VPN/当前网络。", text)
+
+    def test_format_source_health_sanitizes_external_connectivity_errors(self) -> None:
+        rows = [
+            {
+                "source_name": "sec_edgar",
+                "status": "unhealthy",
+                "detail": "URLError: [Errno 8] nodename nor servname provided",
+                "latency_ms": None,
+                "checked_at": datetime(2026, 3, 26, 1, 0, tzinfo=timezone.utc),
+            }
+        ]
+        text = format_source_health(rows)
+        self.assertIn("外网连通性异常，请检查 VPN/网络。", text)
+        self.assertNotIn("nodename nor servname provided", text)
+
+    def test_run_review_replaces_external_connectivity_log_with_vpn_hint(self) -> None:
+        run_detail = {
+            "run_id": "run-1",
+            "status": "success",
+            "started_at": datetime(2026, 3, 26, 1, 0, tzinfo=timezone.utc),
+            "finished_at": datetime(2026, 3, 26, 1, 1, tzinfo=timezone.utc),
+            "run_name": "live_run",
+            "note": "实时运行",
+            "summary": {
+                "events_processed": 0,
+                "cards_generated": 0,
+                "alerts_sent": 0,
+                "prewatch_candidates": [],
+                "prewatch_alerts_sent_count": 0,
+                "prewatch_candidates_count": 0,
+                "source_health_failures": 1,
+                "extraction_failures": 0,
+                "market_data_failures": 0,
+                "scoring_failures": 0,
+                "notification_failures": 0,
+            },
+            "config_snapshot": {"runtime_config": {"watchlist": {}}},
+            "candidate_evaluation_summary": {},
+        }
+        strategy_report = {"event_type_performance": [], "source_stability": [], "alert_volume": []}
+        source_health = [
+            {
+                "source_name": "sec_edgar",
+                "status": "unhealthy",
+                "detail": "URLError: [Errno 8] nodename nor servname provided",
+                "latency_ms": None,
+                "checked_at": datetime(2026, 3, 26, 1, 1, tzinfo=timezone.utc),
+            }
+        ]
+        review_text = format_run_review(
+            run_detail,
+            strategy_report,
+            source_health,
+            [],
+            [],
+        )
+        self.assertIn("检测到外网连通性异常，建议先检查 VPN 或当前网络", review_text)
+        self.assertIn("sec_edgar：检测到外网连通性异常，请先检查 VPN 或当前网络。", review_text)
+        self.assertNotIn("nodename nor servname provided", review_text)
 
     def test_write_llm_usage_report_cli_writes_report_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

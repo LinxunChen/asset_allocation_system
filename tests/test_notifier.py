@@ -259,7 +259,7 @@ class NotifierTests(unittest.TestCase):
             self.assertIn("NVIDIA（NVDA）", body)
             self.assertIn("链路：2天前加入观察 -> 今日加入观察", body)
             self.assertIn("降级原因：降级观察：盈亏比不足", body)
-            self.assertIn("为什么现在先观察", body)
+            self.assertIn("一句话核心：事件不差，但当前预期盈亏比不足，先观察比直接执行更稳。", body)
             self.assertIn("结构状态：多头（结构向上）（代表价格结构仍偏强", body)
             self.assertIn("事件倾向：偏利多（代表事件内容整体偏正面", body)
             self.assertIn("宏观覆盖：宏观风险覆盖已生效：综合分下调 12.0 分", body)
@@ -278,6 +278,48 @@ class NotifierTests(unittest.TestCase):
             self.assertIn("一句话核心：", body)
             self.assertIn("最大风险：", body)
             self.assertNotIn("动作由「确认做多」降为「试探建仓」", body)
+
+    def test_formal_card_core_summary_rewrites_observation_like_reasoning(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = Store(Path(temp_dir) / "test.db")
+            store.initialize()
+            notifier = Notifier(store=store, transport=None, dry_run=True)
+            card = make_formal_card()
+            card.llm_reasoning = "消息面虽有催化但市场反应平淡，未形成明确突破，仍需等待确认。"
+            card.relative_volume = 0.29
+            card.trend_state = "neutral"
+            body = notifier._body(card)
+            self.assertIn("卡片定位：自动降级观察卡", body)
+            self.assertIn("一句话核心：事件有支撑，但当前量能不足，先观察比直接执行更稳。", body)
+            self.assertIn("操作建议：加入观察（已自动降级）", body)
+
+    def test_formal_card_event_and_market_sections_do_not_repeat_observation_language(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = Store(Path(temp_dir) / "test.db")
+            store.initialize()
+            notifier = Notifier(store=store, transport=None, dry_run=True)
+            card = make_formal_card()
+            card.symbol = "TSM"
+            card.display_name = "Taiwan Semiconductor"
+            card.llm_impact_inference = "未来 1-7 个交易日可能维持震荡，仍需等待确认方向。"
+            card.llm_summary = "TSM 触发新闻事件"
+            card.headline_summary = "TSM 触发新闻事件"
+            body = notifier._body(card)
+            self.assertIn("事实摘要：TSM 当前更适合把新闻当作背景催化，执行上仍以结构和量价确认为主。", body)
+            self.assertIn("影响推理：当前更适合围绕既定入场区和失效价执行，不宜脱离计划追价。", body)
+            self.assertIn("量价状态：结构仍偏强，量价配合基本支持按计划执行。", body)
+            self.assertNotIn("仍需等待确认", body)
+
+    def test_core_summary_is_not_hard_truncated_to_ellipsis(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = Store(Path(temp_dir) / "test.db")
+            store.initialize()
+            notifier = Notifier(store=store, transport=None, dry_run=True)
+            card = make_formal_card()
+            card.llm_reasoning = "合作规模与兑现路径已经基本过线，当前更像可按计划执行的机会，而不是继续停留在观察层。"
+            body = notifier._body(card)
+            self.assertIn("一句话核心：合作规模与兑现路径已经基本过线，当前更像可按计划执行的机会，而不是继续停留在观察层。", body)
+            self.assertNotIn("一句话核心：合作规模与兑现路径已经基本过线，当前更像可按计划...", body)
 
     def test_formal_card_deduplicates_and_prioritizes_sources(self) -> None:
         transport = FeishuTransport("https://example.com/webhook")
@@ -304,10 +346,87 @@ class NotifierTests(unittest.TestCase):
             card.reason_to_watch = "先盯合作细节和订单金额是否继续落地。"
             card.positioning_hint = "当前先放入观察名单，不追价。"
             body = notifier._body(card)
-            self.assertIn("为什么现在先观察", body)
+            self.assertIn("一句话核心", body)
             self.assertIn("当前处理：当前先放入观察名单，不追价。", body)
             self.assertIn("关注重点：先盯合作细节和订单金额是否继续落地。", body)
             self.assertIn("升级触发：若量能继续配合", body)
+            self.assertIn("综合分：76.00（观察处理，代表当前仍按观察处理，不作为正式执行信号。）", body)
+            self.assertNotIn("综合分：76.00（可执行", body)
+
+    def test_watch_card_polishes_observation_copy_and_hides_zero_atr_wording(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = Store(Path(temp_dir) / "test.db")
+            store.initialize()
+            notifier = Notifier(store=store, transport=None, dry_run=True)
+            card = make_card(76.0)
+            card.market_data_complete = False
+            card.action_label = "加入观察"
+            card.reason_to_watch = "量能略有抬升至 1.00 倍；波动率可控，ATR 占比 0.0%。"
+            card.llm_impact_inference = ""
+            body = notifier._body(card)
+            self.assertIn("量能回到常态附近（1.00 倍），但尚未形成放量确认", body)
+            self.assertIn("波动率极低", body)
+            self.assertNotIn("ATR 占比 0.0%", body)
+
+    def test_repeated_watch_chain_is_compressed_to_single_step(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = Store(Path(temp_dir) / "test.db")
+            store.initialize()
+            notifier = Notifier(store=store, transport=None, dry_run=True)
+            card = make_card(84.0)
+            card.market_data_complete = False
+            card.action_label = "加入观察"
+            card.chain_summary = "今日加入观察 -> 今日加入观察"
+            body = notifier._body(card)
+            self.assertIn("链路：今日加入观察", body)
+            self.assertNotIn("今日加入观察 -> 今日加入观察", body)
+
+    def test_downgraded_watch_card_does_not_reuse_formal_execution_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = Store(Path(temp_dir) / "test.db")
+            store.initialize()
+            notifier = Notifier(store=store, transport=None, dry_run=True)
+            card = make_formal_card()
+            card.priority = "suppressed"
+            card.execution_eligible = False
+            card.action_label = "确认做多"
+            card.positioning_hint = "当前优先按价格计划执行。"
+            card.reason_to_watch = "如果当前文案读起来足够清楚，说明链路已经适合上线。"
+            card.llm_impact_inference = ""
+            card.relative_volume = 0.29
+            card.trend_state = "neutral"
+            body = notifier._body(card)
+            self.assertIn("当前处理：当前先放入观察名单，不追价，等结构和量价进一步确认后再升级。", body)
+            self.assertIn("升级触发：需等待成交量放大或价格突破关键位，才更像正式机会。", body)
+            self.assertNotIn("当前优先按价格计划执行", body)
+
+    def test_formal_card_with_neutral_structure_and_weak_volume_auto_downgrades(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = Store(Path(temp_dir) / "test.db")
+            store.initialize()
+            notifier = Notifier(store=store, transport=None, dry_run=True)
+            card = make_formal_card()
+            card.trend_state = "neutral"
+            card.relative_volume = 0.29
+            body = notifier._body(card)
+            self.assertIn("卡片定位：自动降级观察卡", body)
+            self.assertIn("操作建议：加入观察（已自动降级）", body)
+            self.assertIn("降级原因：降级观察：量能不足", body)
+
+    def test_generic_preview_style_event_summary_falls_back_to_contextual_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = Store(Path(temp_dir) / "test.db")
+            store.initialize()
+            notifier = Notifier(store=store, transport=None, dry_run=True)
+            card = make_card(76.0)
+            card.action_label = "加入观察"
+            card.market_data_complete = False
+            card.event_type = "news"
+            card.llm_summary = "模拟预备池卡片，用于预览当前文案与展示层效果。"
+            card.headline_summary = "模拟预备池卡片，用于预览当前文案与展示层效果。"
+            body = notifier._body(card)
+            self.assertIn("事实摘要：NVDA 当前以结构观察为主，新闻仅作背景参考。", body)
+            self.assertNotIn("用于预览", body)
 
     def test_plain_text_exit_card_uses_exit_specific_labels_and_guardrail(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -316,7 +435,7 @@ class NotifierTests(unittest.TestCase):
             notifier = Notifier(store=store, transport=None, dry_run=True)
             body = notifier._body(make_exit_card())
             self.assertIn("卡片定位：兑现管理卡", body)
-            self.assertIn("为什么进入兑现池", body)
+            self.assertIn("一句话核心：已有浮盈后遇到宏观风险抬升，当前更适合转入兑现管理。", body)
             self.assertIn("兑现原因：宏观保护", body)
             self.assertIn("来源链路：3天前确认做多 -> 今日进入兑现池", body)
             self.assertIn("使用边界：只面向已有浮盈仓位，不代表新的开仓信号。", body)

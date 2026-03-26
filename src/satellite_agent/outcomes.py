@@ -15,6 +15,7 @@ MAX_OUTCOME_LOOKAHEAD_DAYS = 10
 DEFAULT_INCREMENTAL_OUTCOME_BACKFILL_DAYS = 45
 US_MARKET_TZ = ZoneInfo("America/New_York")
 MACRO_PROXY_SYMBOLS = ("SPY", "QQQ", "SMH", "TLT")
+EXECUTABLE_OUTCOME_ACTIONS = ("试探建仓", "确认做多")
 
 
 @dataclass
@@ -206,6 +207,11 @@ def _entry_price_for_long(bar: Bar, *, entry_high: float) -> float:
 
 def _bar_overlaps_entry(bar: Bar, *, entry_low: float, entry_high: float) -> bool:
     return float(bar.low) <= float(entry_high) and float(bar.high) >= float(entry_low)
+
+
+def _entry_timestamp_for_decision(bar: Bar, *, created_at: datetime) -> datetime:
+    """Prevent same-session daily bars from producing pre-decision entry timestamps."""
+    return max(ensure_utc(bar.timestamp), created_at)
 
 
 def _resolve_long_exit(
@@ -411,7 +417,7 @@ def _compute_decision_outcome(
                 continue
             entered = True
             entry_index = index
-            entered_at = ensure_utc(bar.timestamp).isoformat()
+            entered_at = _entry_timestamp_for_decision(bar, created_at=created_at).isoformat()
             entry_price = _entry_price_for_long(bar, entry_high=entry_high)
             same_bar_exit_reason, same_bar_exit_price, same_bar_subreason = _resolve_long_exit(
                 bar,
@@ -500,7 +506,7 @@ def _compute_decision_outcome(
     else:
         if take_profit_mid is not None or invalidation_level is not None:
             entered = True
-            entered_at = ensure_utc(anchor_bar.timestamp).isoformat()
+            entered_at = _entry_timestamp_for_decision(anchor_bar, created_at=created_at).isoformat()
             entry_price = round(float(anchor_bar.close), 4)
             same_bar_exit_reason, same_bar_exit_price, same_bar_subreason = _resolve_long_exit(
                 anchor_bar,
@@ -627,6 +633,7 @@ def backfill_decision_outcomes(
         since=since,
         limit=limit,
         recompute_existing=recompute_existing,
+        actions=EXECUTABLE_OUTCOME_ACTIONS,
     )
     updated = 0
     skipped = 0
