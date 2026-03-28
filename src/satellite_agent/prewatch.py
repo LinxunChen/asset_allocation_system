@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from .config import HorizonSettings
-from .models import IndicatorSnapshot, PrewatchCandidate
+from .models import CandidatePoolCandidate, IndicatorSnapshot
 
 
-def evaluate_prewatch_snapshot(
+def evaluate_candidate_snapshot(
     snapshot: IndicatorSnapshot,
     horizon_settings: HorizonSettings,
     *,
@@ -41,13 +41,26 @@ def evaluate_prewatch_snapshot(
     }
 
 
-def build_prewatch_candidate(
+def evaluate_prewatch_snapshot(
     snapshot: IndicatorSnapshot,
     horizon_settings: HorizonSettings,
     *,
     min_score: float,
-) -> PrewatchCandidate | None:
-    evaluation = evaluate_prewatch_snapshot(
+) -> dict[str, object]:
+    return evaluate_candidate_snapshot(
+        snapshot,
+        horizon_settings,
+        min_score=min_score,
+    )
+
+
+def build_candidate_pool_candidate(
+    snapshot: IndicatorSnapshot,
+    horizon_settings: HorizonSettings,
+    *,
+    min_score: float,
+) -> CandidatePoolCandidate | None:
+    evaluation = evaluate_candidate_snapshot(
         snapshot,
         horizon_settings,
         min_score=min_score,
@@ -62,7 +75,7 @@ def build_prewatch_candidate(
     volatility_score = float(evaluation.get("volatility_score") or 0.0)
     total_score = float(evaluation.get("total_score") or 0.0)
     setup_type = str(evaluation.get("setup_type") or _setup_type(snapshot))
-    return PrewatchCandidate(
+    return CandidatePoolCandidate(
         symbol=snapshot.symbol,
         horizon=snapshot.horizon,
         setup_type=setup_type,
@@ -87,11 +100,24 @@ def build_prewatch_candidate(
     )
 
 
-def sort_prewatch_candidates(
-    candidates: list[PrewatchCandidate],
+def build_prewatch_candidate(
+    snapshot: IndicatorSnapshot,
+    horizon_settings: HorizonSettings,
+    *,
+    min_score: float,
+) -> CandidatePoolCandidate | None:
+    return build_candidate_pool_candidate(
+        snapshot,
+        horizon_settings,
+        min_score=min_score,
+    )
+
+
+def sort_candidate_pool_candidates(
+    candidates: list[CandidatePoolCandidate],
     *,
     max_candidates: int,
-) -> list[PrewatchCandidate]:
+) -> list[CandidatePoolCandidate]:
     ranked = sorted(
         candidates,
         key=lambda item: (
@@ -103,6 +129,17 @@ def sort_prewatch_candidates(
     if max_candidates <= 0:
         return ranked
     return ranked[:max_candidates]
+
+
+def sort_prewatch_candidates(
+    candidates: list[CandidatePoolCandidate],
+    *,
+    max_candidates: int,
+) -> list[CandidatePoolCandidate]:
+    return sort_candidate_pool_candidates(
+        candidates,
+        max_candidates=max_candidates,
+    )
 
 
 def _trend_score(trend_state: str, last_price: float, sma_20: float, sma_60: float) -> float:
@@ -174,7 +211,7 @@ def _headline_summary(snapshot: IndicatorSnapshot, setup_type: str) -> str:
         )
     if setup_type == "pullback_watch":
         return (
-            f"{snapshot.symbol} 处于多头结构内的回踩观察区，若承接继续稳定，可作为预备池候选。"
+            f"{snapshot.symbol} 处于多头结构内的回踩观察区，若承接继续稳定，可作为第一池候选。"
         )
     return (
         f"{snapshot.symbol} 维持相对强势，量价结构正在改善，适合提前跟踪等待正式催化。"
@@ -183,7 +220,7 @@ def _headline_summary(snapshot: IndicatorSnapshot, setup_type: str) -> str:
 
 def _action_hint(snapshot: IndicatorSnapshot, setup_type: str) -> str:
     if setup_type == "breakout_watch":
-        return "可先列入预备池，等待放量站稳阻力位后再考虑升入确认池。"
+        return "可先列入候选池，等待放量站稳阻力位后再考虑升入确认池。"
     if setup_type == "pullback_watch":
         return "可轻仓观察，优先等待回踩企稳或事件催化进一步确认。"
     return "当前更适合作为预热观察对象，暂不视作正式重仓信号。"

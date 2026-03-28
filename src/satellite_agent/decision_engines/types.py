@@ -19,13 +19,19 @@ class EventAssessment:
     reason_fragments: list[str] = field(default_factory=list)
     llm_used: bool = False
     llm_confidence: float = 0.0
-    event_prewatch_eligible: bool = False
+    event_candidate_pool_eligible: bool = False
     headline_summary: str = ""
     source_refs: list[str] = field(default_factory=list)
     risk_notes: list[str] = field(default_factory=list)
 
     def to_record(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        payload["event_prewatch_eligible"] = self.event_prewatch_eligible
+        return payload
+
+    @property
+    def event_prewatch_eligible(self) -> bool:
+        return self.event_candidate_pool_eligible
 
 
 @dataclass(frozen=True)
@@ -53,7 +59,7 @@ class MarketAssessment:
     market_confirmation_score: float
     entry_plan: PricePlan | None
     risk_flags: list[str] = field(default_factory=list)
-    prewatch_structure_eligible: bool = False
+    candidate_pool_structure_eligible: bool = False
     exit_signal_state: str = "hold"
     market_data_complete: bool = True
     market_data_note: str = ""
@@ -64,7 +70,12 @@ class MarketAssessment:
         payload = asdict(self)
         if self.entry_plan is not None:
             payload["entry_plan"] = self.entry_plan.to_record()
+        payload["prewatch_structure_eligible"] = self.prewatch_structure_eligible
         return payload
+
+    @property
+    def prewatch_structure_eligible(self) -> bool:
+        return self.candidate_pool_structure_eligible
 
 
 @dataclass(frozen=True)
@@ -73,13 +84,19 @@ class ThemeAssessment:
     theme_heat: float = 0.0
     theme_role: str = "standalone"
     confirmed_peers: list[str] = field(default_factory=list)
-    prewatch_peers: list[str] = field(default_factory=list)
+    candidate_pool_peers: list[str] = field(default_factory=list)
     dynamic_theme_detected: bool = False
     theme_chain_note: str = ""
     theme_boosts: dict[str, float] = field(default_factory=dict)
 
     def to_record(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        payload["prewatch_peers"] = list(self.prewatch_peers)
+        return payload
+
+    @property
+    def prewatch_peers(self) -> list[str]:
+        return self.candidate_pool_peers
 
 
 @dataclass(frozen=True)

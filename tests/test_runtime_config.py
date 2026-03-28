@@ -68,6 +68,25 @@ class RuntimeConfigTests(unittest.TestCase):
             self.assertTrue(settings.use_llm_narration)
             self.assertFalse(settings.use_llm_ranking_assist)
 
+    def test_settings_from_env_supports_candidate_env_aliases(self) -> None:
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "SATELLITE_CANDIDATE_POOL_MIN_SCORE": "66",
+                "SATELLITE_MAX_CANDIDATE_POOL_CANDIDATES_PER_RUN": "11",
+                "SATELLITE_CANDIDATE_OPTIONAL_ALERT_MIN_SCORE": "81",
+                "SATELLITE_CANDIDATE_POOL_PROMOTION_WINDOW_HOURS": "96",
+                "SATELLITE_CANDIDATE_CONFIRMATION_MIN_EVENT_SCORE": "79",
+            },
+            clear=True,
+        ):
+            settings = Settings.from_env()
+        self.assertEqual(settings.candidate_pool_min_score, 66.0)
+        self.assertEqual(settings.max_candidate_pool_candidates_per_run, 11)
+        self.assertEqual(settings.candidate_optional_alert_min_score, 81.0)
+        self.assertEqual(settings.candidate_pool_promotion_window_hours, 96)
+        self.assertEqual(settings.candidate_confirmation_min_event_score, 79.0)
+
     def test_runtime_config_applies_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "agent.json"

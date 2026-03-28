@@ -164,7 +164,7 @@ def _rewrite_terminal_chain_step(step: str, final_action: str) -> str:
 
 
 def _final_chain_summary(chain_summary: str, *, final_action: str, downgraded_to_watch: bool) -> str:
-    simplified = _simplify_chain_summary(chain_summary)
+    simplified = _simplify_chain_summary(chain_summary).replace("进入兑现池", "利润保护退出")
     if not downgraded_to_watch:
         return simplified
     steps = [step.strip() for step in simplified.split("->") if step.strip()]
@@ -324,8 +324,8 @@ def _watch_positioning_hint(card: OpportunityCard, delivery: dict) -> str:
     if candidate and not _watch_conflict_text(candidate):
         return candidate
     if card.relative_volume is not None and card.relative_volume < 1.0:
-        return "当前先放入观察名单，不追价，等结构和量价进一步确认后再升级。"
-    return "当前先放入观察名单，等催化和结构进一步确认后再升级。"
+        return "当前先放入候选池，不追价，等结构和量价进一步确认后再升级。"
+    return "当前先放入候选池，等催化和结构进一步确认后再升级。"
 
 
 def _event_summary_for_card(card: OpportunityCard, delivery: dict, *, final_type: str) -> str:
@@ -491,6 +491,39 @@ def _visible_macro_overlay_note(card: OpportunityCard, *, final_action: str) -> 
     return _normalize_user_facing_text(note)
 
 
+def _recent_candidate_observation_text(card: OpportunityCard) -> str:
+    count = int(getattr(card, "recent_candidate_observation_count_72h", 0) or 0)
+    if count <= 0:
+        return ""
+    return f"近72h进入候选池 {count} 次"
+
+
+def _theme_panel_text(delivery: dict) -> str:
+    theme_text = str(delivery.get("theme_text") or "").strip()
+    peers = [str(item).strip() for item in (delivery.get("confirmed_peers") or []) if str(item).strip()]
+    if theme_text and theme_text != "未标注":
+        if peers:
+            return f"题材：{theme_text}；同题材确认：{'、'.join(peers[:3])}"
+        return f"题材：{theme_text}；暂无明显同题材确认"
+    if peers:
+        return f"同题材确认：{'、'.join(peers[:3])}"
+    return "暂无明显同题材确认"
+
+
+def _macro_panel_lines(card: OpportunityCard, render: dict) -> list[str]:
+    lines = [f"市场环境：{render['market_env_line']}"]
+    macro_overlay_note = str(render.get("macro_overlay_note") or "").strip()
+    if macro_overlay_note:
+        lines.append(f"宏观覆盖：{macro_overlay_note}")
+    else:
+        lines.append("宏观覆盖：未见额外压制")
+    if render.get("downgraded_to_watch"):
+        lines.append("动作调整：前次正式机会未进场，本次已下调为观察。")
+    elif card.macro_action_before_overlay and card.macro_action_before_overlay != render.get("action_label"):
+        lines.append(f"动作调整：由「{card.macro_action_before_overlay}」调整为「{render['action_label']}」")
+    return lines
+
+
 def _downgrade_reason(card: OpportunityCard) -> str:
     ratio = _risk_reward_ratio(card)
     if not card.market_data_complete:
@@ -515,37 +548,26 @@ def _formal_structure_incompatible(card: OpportunityCard) -> bool:
 def _build_render_view(card: OpportunityCard) -> dict:
     delivery = build_delivery_view_from_card(card)
     current_action = str(delivery.get("action_label_effective") or card.action_label or "").strip()
-    is_exit_card = current_action == "进入兑现池"
-    requested_formal = current_action in {"确认做多", "试探建仓"}
-    ratio = _risk_reward_ratio(card)
-    formal_incompatible = requested_formal and (
-        not card.market_data_complete
-        or not getattr(card, "execution_eligible", True)
-        or card.priority == "suppressed"
-        or (ratio is not None and ratio < 1.5)
-        or _formal_structure_incompatible(card)
-    )
-    downgraded_to_watch = not is_exit_card and formal_incompatible
-    is_watch_card = downgraded_to_watch or current_action == "加入观察"
-    final_action = "加入观察" if is_watch_card else current_action
+    is_exit_card = _is_exit_card(card, delivery)
+    if is_exit_card and current_action == "进入兑现池":
+        current_action = "利润保护退出"
+    downgraded_to_watch = bool(getattr(card, "downgraded_from_formal", False)) and current_action == "加入观察"
+    is_watch_card = current_action == "加入观察"
+    final_action = current_action
     final_type = "exit" if is_exit_card else "watch" if is_watch_card else "formal"
     source_refs = _select_source_refs(list(card.source_refs or []))
     source_labels = [_source_label(source) for source in source_refs]
     risk_notes = _visible_risk_notes(card, downgraded_to_watch=downgraded_to_watch)
     risk_text = "；".join(risk_notes[:3]) if risk_notes else "无"
-    downgrade_reason = _downgrade_reason(card) if downgraded_to_watch else ""
+    downgrade_reason = str(getattr(card, "downgrade_explainer", "") or "").strip()
     if final_type == "watch":
-        card_positioning = (
-            "观察卡"
-            if not downgrade_reason
-            else f"自动降级观察卡 | {downgrade_reason}"
-        )
+        card_positioning = "观察卡"
     elif final_type == "exit":
-        card_positioning = "兑现管理卡"
+        card_positioning = "退出卡"
     else:
-        card_positioning = "正式操作卡"
-    priority_text = "观察" if downgraded_to_watch else _display_priority(card.priority)
-    confidence_text = "观察优先" if downgraded_to_watch else delivery["confidence_label_effective"]
+        card_positioning = "正式卡"
+    priority_text = _display_priority(card.priority)
+    confidence_text = delivery["confidence_label_effective"]
     chain_summary = _final_chain_summary(
         str(delivery.get("chain_summary") or card.chain_summary or "首次出现"),
         final_action=final_action,
@@ -609,7 +631,7 @@ def _build_render_view(card: OpportunityCard) -> dict:
         "core_summary": _soft_trim_text(core_reason or "等待更明确的催化与结构确认。", 68),
         "max_risk": risk_reason or "需继续核对原文与价格结构。",
         "execution_plan_lines": execution_plan_lines,
-        "render_warning": "formal_render_conflict_auto_downgraded" if downgraded_to_watch else "",
+        "render_warning": "",
         "macro_overlay_note": _visible_macro_overlay_note(card, final_action=final_action),
         "final_score_label": final_score_label,
         "final_score_explainer": final_score_explainer,
@@ -620,9 +642,9 @@ def _build_render_view(card: OpportunityCard) -> dict:
             if downgraded_to_watch
             else "当前按观察处理"
             if final_type == "watch"
-            else "优先保护利润"
+            else _holding_management_action_detail(card)
             if final_type == "exit"
-            else delivery["final_score_label"]
+            else _formal_action_detail(card)
         ),
     }
 
@@ -637,19 +659,41 @@ def _is_watch_card(card: OpportunityCard, delivery: dict | None = None) -> bool:
 
 
 def _is_exit_card(card: OpportunityCard, delivery: dict | None = None) -> bool:
+    if str(getattr(card, "delivery_category", "") or "").strip() == "exit":
+        return True
     action = (delivery or {}).get("action_label_effective") or card.action_label
-    return action == "进入兑现池"
+    return action in {"进入兑现池", "利润保护退出", "失效价退出"}
 
 
-def _exit_pool_subreason_display(value: str) -> str:
+def _holding_management_reason(card: OpportunityCard) -> str:
+    value = str(getattr(card, "holding_management_reason", "") or getattr(card, "normalized_close_reason", "") or "").strip()
+    if value:
+        return value
+    if str(card.action_label or "").strip() == "失效价退出":
+        return "invalidation_exit"
+    if str(card.action_label or "").strip() == "利润保护退出":
+        return "profit_protection_exit"
+    return "profit_protection_exit"
+
+
+def _holding_management_subreason_display(value: str) -> str:
     return {
         "target_hit": "达标止盈",
         "weakening_after_tp_zone": "提前锁盈",
         "macro_protection": "宏观保护",
-    }.get((value or "").strip(), "兑现管理")
+    }.get((value or "").strip(), "利润保护")
 
 
-def _exit_pool_subreason_explainer(value: str) -> str:
+def _holding_management_reason_display(card: OpportunityCard) -> str:
+    normalized = _holding_management_reason(card)
+    if normalized == "invalidation_exit":
+        return "失效价退出"
+    if normalized == "window_close_evaluation":
+        return "窗口到期结算"
+    return _holding_management_subreason_display(card.holding_management_subreason)
+
+
+def _holding_management_subreason_explainer(value: str) -> str:
     normalized = (value or "").strip()
     if normalized == "target_hit":
         return "价格已进入计划止盈区更深位置，当前更适合按计划兑现利润。"
@@ -657,11 +701,52 @@ def _exit_pool_subreason_explainer(value: str) -> str:
         return "进入止盈区后连续走弱，继续持有更容易把浮盈回吐回去。"
     if normalized == "macro_protection":
         return "宏观环境转差且已有浮盈，当前更适合先做利润保护。"
-    return "当前这笔交易已从进攻逻辑切换到兑现管理。"
+    return "当前这笔交易已从进攻逻辑切换到利润保护。"
 
 
-def _exit_pool_guardrail_text() -> str:
-    return "只面向已有浮盈仓位，不代表新的开仓信号。"
+def _holding_management_reason_explainer(card: OpportunityCard) -> str:
+    normalized = _holding_management_reason(card)
+    if normalized == "invalidation_exit":
+        return "价格已跌破失效价，本次进攻逻辑结束，当前更适合按纪律退出。"
+    if normalized == "window_close_evaluation":
+        return "持仓在观察窗口内未触发止盈或失效，当前只做窗口结算评估。"
+    return _holding_management_subreason_explainer(card.holding_management_subreason)
+
+
+def _holding_management_action_detail(card: OpportunityCard) -> str:
+    normalized = _holding_management_reason(card)
+    if normalized == "invalidation_exit":
+        return "按失效价执行退出"
+    if normalized == "window_close_evaluation":
+        return "进入窗口结算评估"
+    return "优先保护利润"
+
+
+def _formal_action_detail(card: OpportunityCard) -> str:
+    action = str(getattr(card, "action_label", "") or "").strip()
+    if action == "确认做多":
+        return "按计划执行"
+    if action == "试探建仓":
+        return "先小仓验证"
+    return "按计划执行"
+
+
+def _holding_management_guardrail_text(card: OpportunityCard | None = None) -> str:
+    if card is not None and _holding_management_reason(card) == "invalidation_exit":
+        return "属于风控退出，不代表新的开仓信号。"
+    return "只面向已有仓位的持仓管理，不代表新的开仓信号。"
+
+
+def _exit_pool_subreason_display(value: str) -> str:
+    return _holding_management_subreason_display(value)
+
+
+def _exit_pool_subreason_explainer(value: str) -> str:
+    return _holding_management_subreason_explainer(value)
+
+
+def _exit_pool_guardrail_text(card: OpportunityCard | None = None) -> str:
+    return _holding_management_guardrail_text(card)
 
 
 def _linked_sources(card: OpportunityCard) -> list[str]:
@@ -759,21 +844,15 @@ class FeishuTransport:
         confidence_text = render["confidence_text"]
         priority_text = render["priority_text"]
         theme_text = delivery["theme_text"]
-        peer_text = "、".join(delivery["confirmed_peers"][:3]) if delivery["confirmed_peers"] else "暂无"
-        theme_line = delivery["theme_reason_line"]
-        valid_until_text = delivery["valid_until_text"] or _display_valid_until(card)
         source_text = render["source_summary"]
-        source_line = render["source_line"]
-        market_env_line = render["market_env_line"]
         card_positioning = render["card_positioning"]
         overview_lines = [
             f"**标的**：{identity}",
             f"**卡片定位**：{card_positioning}",
             f"**操作建议**：{action_label}（{render['action_detail_text']}）",
-            f"**链路**：{render['chain_summary']}",
         ]
-        if render["downgrade_reason"]:
-            overview_lines.append(f"**降级原因**：{render['downgrade_reason']}")
+        if render["downgraded_to_watch"]:
+            overview_lines.append("**状态调整**：前次正式机会未进场，本次已下调为观察。")
         event_lines = [
             f"**事件类型**：{delivery['event_type_display']}",
             f"**事件倾向**：{delivery['event_bias_display']} | {delivery['event_bias_explainer']}",
@@ -782,14 +861,19 @@ class FeishuTransport:
         if render["event_impact_summary"]:
             event_lines.append(f"**影响推理**：{render['event_impact_summary']}")
         market_lines = [
-            f"**当前环境**：{market_env_line}",
             f"**结构状态**：{delivery['trend_state_display']} | {delivery['trend_state_explainer']}",
-            f"**量价状态**：{render['market_summary']}",
+            f"**相对量能**：{card.relative_volume:.2f} 倍 | {render['relative_volume_explainer']}"
+            if card.relative_volume is not None
+            else "**相对量能**：暂无 | 当前缺少量能快照",
+            f"**RSI**：{card.rsi_14:.1f}（{delivery['rsi_label']}）"
+            if card.rsi_14 is not None
+            else "**RSI**：暂无关键结构指标",
+            f"**执行判断**：{render['market_summary']}",
         ]
-        if render["macro_overlay_note"]:
-            market_lines.append(f"**宏观覆盖**：{render['macro_overlay_note']}")
         if not card.market_data_complete:
             market_lines.append(f"**行情状态**：{card.market_data_note or '行情确认暂缺'}")
+        theme_lines = [f"**题材联动**：{_theme_panel_text(delivery)}"]
+        macro_lines = [f"**{line}**" if "：" not in line else f"**{line.split('：', 1)[0]}**：{line.split('：', 1)[1]}" for line in _macro_panel_lines(card, render)]
         execution_metric_lines = [
             {
                 "is_short": True,
@@ -820,101 +904,6 @@ class FeishuTransport:
                 },
             },
         ]
-        signal_metric_lines = [
-            {
-                "is_short": True,
-                "text": {
-                    "tag": "lark_md",
-                    "content": (
-                        f"**综合分**\n{card.final_score:.2f}（{render['final_score_label']}）\n"
-                        f"{render['final_score_explainer']}"
-                    ),
-                },
-            },
-            {
-                "is_short": True,
-                "text": {
-                    "tag": "lark_md",
-                    "content": (
-                        f"**市场分**\n{card.market_score:.2f}（{delivery['market_score_label']}）\n"
-                        f"{delivery['market_score_explainer']}"
-                    ),
-                },
-            },
-            {
-                "is_short": True,
-                "text": {
-                    "tag": "lark_md",
-                    "content": (
-                        f"**事件分**\n{card.event_score:.2f}（{delivery['event_score_label']}）\n"
-                        f"{delivery['event_score_explainer']}"
-                    ),
-                },
-            },
-            {
-                "is_short": True,
-                "text": {
-                    "tag": "lark_md",
-                    "content": f"**题材联动**\n{theme_line}",
-                },
-            },
-        ]
-        if card.rsi_14 is not None:
-            signal_metric_lines.append(
-                {
-                    "is_short": True,
-                    "text": {
-                        "tag": "lark_md",
-                        "content": f"**RSI**\n{card.rsi_14:.1f}（{delivery['rsi_label']}）",
-                    },
-                }
-            )
-        if card.relative_volume is not None:
-            signal_metric_lines.append(
-                {
-                    "is_short": True,
-                    "text": {
-                        "tag": "lark_md",
-                        "content": (
-                            f"**相对量能**\n{card.relative_volume:.2f} 倍（{render['relative_volume_label']}）\n"
-                            f"{render['relative_volume_explainer']}"
-                        ),
-                    },
-                }
-            )
-        if card.trend_state:
-            signal_metric_lines.append(
-                {
-                    "is_short": True,
-                    "text": {
-                        "tag": "lark_md",
-                        "content": f"**结构状态**\n{delivery['trend_state_display']}\n{delivery['trend_state_explainer']}",
-                    },
-                }
-            )
-        if card.bias:
-            signal_metric_lines.append(
-                {
-                    "is_short": True,
-                    "text": {
-                        "tag": "lark_md",
-                        "content": f"**事件倾向**\n{delivery['event_bias_display']}\n{delivery['event_bias_explainer']}",
-                    },
-                }
-            )
-        if render["macro_overlay_note"]:
-            signal_metric_lines.append(
-                {
-                    "is_short": True,
-                    "text": {
-                        "tag": "lark_md",
-                        "content": (
-                            f"**宏观覆盖**\n{render['macro_overlay_note']}\n"
-                            f"环境分压制：-{delivery['macro_penalty_applied']:.1f}"
-                        ),
-                    },
-                }
-            )
         actions = []
         for source in render["source_refs"]:
             actions.append(
@@ -938,29 +927,33 @@ class FeishuTransport:
             decision_lines = [
                 f"**一句话核心**：{render['core_summary']}",
                 f"**当前处理**：{_watch_positioning_hint(card, delivery)}",
+                f"**为什么现在先观察**：{delivery['llm_reasoning'] or render['event_summary']}",
                 f"**最大风险**：{render['max_risk']}",
             ]
+            if render["downgraded_to_watch"]:
+                decision_lines.append("**行动指令**：建议撤销此前设置的买入挂单，等待新结构确立。")
             observation_lines = [
                 f"**关注重点**：{_watch_plan_focus(card, delivery)}",
                 f"**升级触发**：{_watch_upgrade_trigger(card, delivery)}",
                 f"**观察周期**：{delivery['horizon_display']}",
             ]
+            recent_candidate_text = _recent_candidate_observation_text(card)
+            if recent_candidate_text:
+                observation_lines.append(f"**候选轨迹**：{recent_candidate_text}")
         elif is_exit_card:
-            exit_reason = _exit_pool_subreason_display(card.exit_pool_subreason)
-            exit_explainer = _exit_pool_subreason_explainer(card.exit_pool_subreason)
+            exit_reason = _holding_management_reason_display(card)
+            exit_explainer = _holding_management_reason_explainer(card)
             decision_lines = [
-                f"**为什么进入兑现池**：{delivery['llm_reasoning'] or render['event_summary']}",
-                f"**兑现原因**：{exit_reason} | {exit_explainer}",
-                f"**来源链路**：{delivery['chain_summary']}",
-                f"**使用边界**：{_exit_pool_guardrail_text()}",
+                f"**为什么现在退出**：{delivery['llm_reasoning'] or render['event_summary']}",
+                f"**退出原因**：{exit_reason} | {exit_explainer}",
+                f"**使用边界**：{_holding_management_guardrail_text(card)}",
                 f"**最大风险**：{delivery['llm_uncertainty'] or risk_text}",
             ]
             observation_lines = [
-                f"**当前状态**：{exit_reason}，这笔交易已从进攻切换到兑现管理。",
-                f"**来源链路**：{delivery['chain_summary']}",
+                f"**当前状态**：{exit_reason}，这笔交易已从进攻切换到持仓管理。",
                 f"**原目标区**：{card.take_profit_range.low:.2f} - {card.take_profit_range.high:.2f}",
-                f"**处理建议**：{card.positioning_hint or '优先兑现利润，不再继续追新仓。'}",
-                f"**使用边界**：{_exit_pool_guardrail_text()}",
+                f"**处理建议**：{card.positioning_hint or '当前更适合先结束这次仓位，不再继续追新仓。'}",
+                f"**使用边界**：{_holding_management_guardrail_text(card)}",
             ]
         else:
             decision_lines = [
@@ -972,6 +965,9 @@ class FeishuTransport:
                 f"**升级关注**：{render['event_impact_summary'] or delivery['trend_state_explainer'] or '等待结构转强与量能进一步确认。'}",
                 f"**关注周期**：{delivery['horizon_display']}",
             ]
+            recent_candidate_text = _recent_candidate_observation_text(card)
+            if recent_candidate_text:
+                observation_lines.append(f"**候选轨迹**：{recent_candidate_text}")
         return {
             "msg_type": "interactive",
             "card": {
@@ -1003,8 +999,8 @@ class FeishuTransport:
                         "text": {
                             "tag": "lark_md",
                             "content": (
-                                f"**{'观察计划' if is_watch_card else '兑现计划' if is_exit_card else '执行计划'}**\n"
-                                f"{'当前更适合先观察后续确认。' if is_watch_card else '当前更适合优先兑现或保护利润。' if is_exit_card else '当前优先按价格计划执行。'}"
+                                f"**{'观察计划' if is_watch_card else '持仓管理计划' if is_exit_card else '执行计划'}**\n"
+                                f"{'当前更适合先观察后续确认。' if is_watch_card else '当前更适合先按持仓管理规则结束或保护这次仓位。' if is_exit_card else '当前优先按价格计划执行。'}"
                             ),
                         },
                     },
@@ -1096,38 +1092,22 @@ class FeishuTransport:
                         "tag": "div",
                         "text": {
                             "tag": "lark_md",
-                            "content": (
-                                f"**题材联动**\n题材：{theme_text}"
-                                + (f"；同题材确认：{peer_text}" if peer_text != "暂无" else "")
-                            ),
+                            "content": "\n".join(theme_lines),
                         },
                     },
                     {
                         "tag": "div",
                         "text": {
                             "tag": "lark_md",
-                            "content": "**信号评分**",
+                            "content": "**宏观环境**",
                         },
                     },
                     {
                         "tag": "div",
-                        "fields": signal_metric_lines,
-                    },
-                    {
-                        "tag": "note",
-                        "elements": [
-                            {
-                                "tag": "plain_text",
-                                "content": (
-                                    f"来源：{source_text} | {_display_trade_cycle(card.horizon)} | 失效条件：{card.invalidation_reason} | 风险提示：{risk_text}"
-                                    + (
-                                        f" | 行情说明：{card.market_data_note}"
-                                        if card.market_data_note
-                                        else ""
-                                    )
-                                ),
-                            }
-                        ],
+                        "text": {
+                            "tag": "lark_md",
+                            "content": "\n".join(macro_lines),
+                        },
                     },
                     {"tag": "action", "actions": actions},
                 ],
@@ -1213,11 +1193,8 @@ class Notifier:
         delivery = render["delivery"]
         is_watch_card = render["is_watch_card"]
         is_exit_card = render["is_exit_card"]
-        theme_line = delivery["theme_reason_line"]
-        confidence_text = render["confidence_text"]
         risk_reward_text = render["risk_reward_text"]
-        source_line = render["source_line"]
-        market_env_line = render["market_env_line"]
+        recent_candidate_text = _recent_candidate_observation_text(card)
         price_plan_block = ""
         if render["is_formal_card"] and card.market_data_complete:
             price_plan_block = (
@@ -1230,113 +1207,76 @@ class Notifier:
             f"标的：{render['identity']}",
             f"卡片定位：{render['card_positioning']}",
             f"操作建议：{render['action_label']}（{render['action_detail_text']}）",
-            f"链路：{render['chain_summary']}",
         ]
-        if render["downgrade_reason"]:
-            overview_lines.append(f"降级原因：{render['downgrade_reason']}")
+        if render["downgraded_to_watch"]:
+            overview_lines.append("状态调整：前次正式机会未进场，本次已下调为观察。")
         event_section = [
-            "事件理解：",
+            "事件摘要：",
             f"- 事件类型：{delivery['event_type_display']}",
-            f"- 事件倾向：{delivery['event_bias_display']}（{delivery['event_bias_explainer']}）",
             f"- 事实摘要：{render['event_summary']}",
         ]
         if render["event_impact_summary"]:
             event_section.append(f"- 影响推理：{render['event_impact_summary']}")
         market_section = [
             "市场与结构：",
-            f"- 当前环境：{market_env_line}",
             f"- 结构状态：{delivery['trend_state_display']}（{delivery['trend_state_explainer']}）",
-            f"- 量价状态：{render['market_summary']}",
+            f"- 相对量能：{card.relative_volume:.2f} 倍（{render['relative_volume_label']}，{render['relative_volume_explainer']}）"
+            if card.relative_volume is not None
+            else "- 相对量能：暂无",
         ]
-        if render["macro_overlay_note"]:
-            market_section.append(f"- 宏观覆盖：{render['macro_overlay_note']}")
         if card.rsi_14 is not None:
             market_section.append(f"- RSI：{card.rsi_14:.1f}（{delivery['rsi_label']}）")
-        if card.relative_volume is not None:
-            market_section.append(
-                f"- 相对量能：{card.relative_volume:.2f} 倍（{render['relative_volume_label']}，{render['relative_volume_explainer']}）"
-            )
-        score_section = [
-            "信号评分：",
-            f"- 事件分：{card.event_score:.2f}（{delivery['event_score_label']}，{delivery['event_score_explainer']}）",
-            f"- 市场分：{card.market_score:.2f}（{delivery['market_score_label']}，{delivery['market_score_explainer']}）",
-            f"- 综合分：{card.final_score:.2f}（{render['final_score_label']}，{render['final_score_explainer']}）",
-            f"- 题材联动：{theme_line}",
+        market_section.append(f"- 执行判断：{render['core_summary']}")
+        theme_section = [
+            "题材联动：",
+            f"- {_theme_panel_text(delivery)}",
         ]
+        macro_section = ["宏观环境：", *[f"- {line}" for line in _macro_panel_lines(card, render)]]
         if is_watch_card:
-            decision_section = [
-                "决策结论：",
-                f"- 一句话核心：{render['core_summary']}",
+            plan_lines = [
                 f"- 当前处理：{_watch_positioning_hint(card, delivery)}",
-                f"- 最大风险：{render['max_risk']}",
+                f"- 关注重点：{_watch_plan_focus(card, delivery)}",
+                f"- 升级触发：{_watch_upgrade_trigger(card, delivery)}",
             ]
+            if recent_candidate_text:
+                plan_lines.append(f"- 候选轨迹：{recent_candidate_text}")
+            if render["downgraded_to_watch"]:
+                plan_lines.append("- 行动指令：建议撤销此前设置的买入挂单，等待新结构确立。")
         elif is_exit_card:
-            exit_reason = _exit_pool_subreason_display(card.exit_pool_subreason)
-            exit_explainer = _exit_pool_subreason_explainer(card.exit_pool_subreason)
-            decision_section = [
-                "兑现结论：",
-                f"- 一句话核心：{render['core_summary']}",
-                f"- 兑现原因：{exit_reason}（{exit_explainer}）",
-                f"- 来源链路：{render['chain_summary']}",
-                f"- 使用边界：{_exit_pool_guardrail_text()}",
-                f"- 最大风险：{render['max_risk']}",
+            exit_reason = _holding_management_reason_display(card)
+            plan_lines = [
+                f"- 当前状态：{exit_reason}，这笔交易已从进攻切换到持仓管理。",
+                f"- 原目标区：{card.take_profit_range.low:.2f}-{card.take_profit_range.high:.2f}",
+                f"- 处理建议：{card.positioning_hint or '当前更适合先结束这次仓位，不再继续追新仓。'}",
+                f"- 使用边界：{_holding_management_guardrail_text(card)}",
             ]
         else:
-            decision_section = [
-                "决策结论：",
-                f"- 一句话核心：{render['core_summary']}",
-                f"- 最大风险：{render['max_risk']}",
-            ]
+            plan_lines = []
+            if price_plan_block:
+                plan_lines = []
+            else:
+                plan_lines = [f"- 当前处理：{card.positioning_hint or render['core_summary']}"]
+            if recent_candidate_text:
+                plan_lines.append(f"- 候选轨迹：{recent_candidate_text}")
         body_lines = [
             *overview_lines,
             "",
-            "执行计划：" if render["is_formal_card"] else "观察计划：" if is_watch_card else "兑现计划：",
+            "执行计划：" if render["is_formal_card"] else "观察计划：" if is_watch_card else "持仓管理计划：",
         ]
         if price_plan_block:
             body_lines.append(price_plan_block.rstrip())
-        elif is_watch_card:
-            body_lines.extend(
-                [
-                    f"- 关注重点：{_watch_plan_focus(card, delivery)}",
-                    f"- 升级触发：{_watch_upgrade_trigger(card, delivery)}",
-                ]
-            )
         else:
-            exit_reason = _exit_pool_subreason_display(card.exit_pool_subreason)
-            body_lines.extend(
-                [
-                    f"- 当前状态：{exit_reason}，这笔交易已从进攻切换到兑现管理。",
-                    f"- 来源链路：{render['chain_summary']}",
-                    f"- 原目标区：{card.take_profit_range.low:.2f}-{card.take_profit_range.high:.2f}",
-                    f"- 处理建议：{card.positioning_hint or '优先兑现利润，不再继续追新仓。'}",
-                ]
-            )
+            body_lines.extend(plan_lines)
         body_lines.extend(
             [
-                "",
-                *decision_section,
                 "",
                 *event_section,
-            ]
-        )
-        body_lines.extend(["", *market_section, "", *score_section])
-        if is_exit_card and card.positioning_hint:
-            body_lines.extend(["", f"当前处理：{card.positioning_hint}"])
-        if is_exit_card:
-            body_lines.extend(
-                [
-                    "",
-                    "兑现补充：",
-                    f"- 使用边界：{_exit_pool_guardrail_text()}",
-                ]
-            )
-        body_lines.extend(
-            [
                 "",
-                f"原文与来源：{source_line}",
-                f"原文链接：{' | '.join(render['source_refs'] or card.source_refs)}",
+                *market_section,
                 "",
-                f"风险提示：{' | '.join(render['risk_notes'] or ['无'])}",
+                *theme_section,
+                "",
+                *macro_section,
             ]
         )
         return "\n".join(body_lines)

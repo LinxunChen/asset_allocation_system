@@ -20,7 +20,7 @@ from satellite_agent.main import (
 )
 from satellite_agent.market_data import MultiSourceMarketDataError
 from satellite_agent.models import Bar
-from satellite_agent.outcomes import backfill_decision_outcomes, compute_decision_outcome
+from satellite_agent.outcomes import backfill_decision_outcomes, compute_decision_outcome, normalize_close_reason
 from satellite_agent.store import Store
 
 
@@ -97,6 +97,27 @@ def build_open_below_invalidation_then_entry_overlap_bars() -> list[Bar]:
 
 
 class DecisionOutcomeTests(unittest.TestCase):
+    def test_normalize_close_reason_matches_flow_contract(self) -> None:
+        self.assertEqual(normalize_close_reason("exit_pool"), "profit_protection_exit")
+        self.assertEqual(normalize_close_reason("hit_invalidation"), "invalidation_exit")
+        self.assertEqual(normalize_close_reason("window_complete"), "window_close_evaluation")
+        self.assertEqual(
+            normalize_close_reason("not_entered", exit_subreason="price_invalidated"),
+            "not_entered_price_invalidated",
+        )
+        self.assertEqual(
+            normalize_close_reason("not_entered", exit_subreason=""),
+            "not_entered_window_expired",
+        )
+        self.assertEqual(
+            normalize_close_reason("not_entered", exit_subreason="window_expired"),
+            "not_entered_window_expired",
+        )
+        self.assertEqual(
+            normalize_close_reason("insufficient_lookahead", entered=True),
+            "holding_active",
+        )
+
     def test_compute_decision_outcome_uses_decision_timestamp_for_same_session_entry(self) -> None:
         bars = build_daily_bars()
         created_at = datetime(2026, 3, 1, 14, 0, tzinfo=timezone.utc).isoformat()
@@ -116,6 +137,51 @@ class DecisionOutcomeTests(unittest.TestCase):
         assert outcome is not None
         self.assertTrue(outcome.entered)
         self.assertEqual(outcome.entered_at, created_at)
+
+    def test_compute_decision_outcome_marks_not_entered_price_invalidated(self) -> None:
+        outcome = compute_decision_outcome(
+            {
+                "decision_id": "decision-price-invalidated",
+                "created_at": datetime(2026, 3, 1, 14, 0, tzinfo=timezone.utc).isoformat(),
+                "entry_plan_json": '{"entry_range":{"low":99.0,"high":100.5},"take_profit_range":{"low":106.0,"high":110.0},"invalidation_level":98.0}',
+                "invalidation_json": '{"level":98.0}',
+                "packet_json": "{}",
+            },
+            build_open_below_invalidation_then_entry_overlap_bars(),
+        )
+
+        self.assertIsNotNone(outcome)
+        assert outcome is not None
+        self.assertFalse(outcome.entered)
+        self.assertEqual(outcome.close_reason, "not_entered")
+        self.assertEqual(outcome.exit_subreason, "price_invalidated")
+        self.assertEqual(
+            normalize_close_reason(outcome.close_reason, exit_subreason=outcome.exit_subreason, entered=outcome.entered),
+            "not_entered_price_invalidated",
+        )
+
+    def test_compute_decision_outcome_marks_not_entered_window_expired(self) -> None:
+        bars = build_daily_bars()
+        outcome = compute_decision_outcome(
+            {
+                "decision_id": "decision-window-expired",
+                "created_at": datetime(2026, 3, 1, 14, 0, tzinfo=timezone.utc).isoformat(),
+                "entry_plan_json": '{"entry_range":{"low":120.0,"high":121.0},"take_profit_range":{"low":130.0,"high":135.0},"invalidation_level":95.0}',
+                "invalidation_json": '{"level":95.0}',
+                "packet_json": "{}",
+            },
+            bars,
+        )
+
+        self.assertIsNotNone(outcome)
+        assert outcome is not None
+        self.assertFalse(outcome.entered)
+        self.assertEqual(outcome.close_reason, "not_entered")
+        self.assertEqual(outcome.exit_subreason, "window_expired")
+        self.assertEqual(
+            normalize_close_reason(outcome.close_reason, exit_subreason=outcome.exit_subreason, entered=outcome.entered),
+            "not_entered_window_expired",
+        )
 
     def test_cleanup_decision_outcomes_dry_run_and_apply(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from ..entry_exit import EntryExitEngine
-from ..prewatch import build_prewatch_candidate
+from ..prewatch import build_candidate_pool_candidate
 from ..scoring import SignalScorer
 from ..config import HorizonSettings
 from ..models import EventInsight, IndicatorSnapshot, OpportunityCard, PriceRange
@@ -22,6 +22,9 @@ class MarketUnderstandingEngine(Protocol):
         *,
         failure_reason: str = "",
     ) -> tuple[OpportunityCard, MarketAssessment]:
+        ...
+
+    def build_candidate_pool(self, snapshot: IndicatorSnapshot, horizon_settings: HorizonSettings, *, min_score: float):
         ...
 
     def build_prewatch(self, snapshot: IndicatorSnapshot, horizon_settings: HorizonSettings, *, min_score: float):
@@ -93,7 +96,7 @@ def build_market_assessment(
                 ttl_iso=card.ttl.isoformat(),
             ),
             risk_flags=list(card.risk_notes),
-            prewatch_structure_eligible=False,
+            candidate_pool_structure_eligible=False,
             exit_signal_state="observe",
             market_data_complete=market_data_complete,
             market_data_note=market_data_note,
@@ -113,7 +116,7 @@ def build_market_assessment(
             ttl_iso=card.ttl.isoformat(),
         ),
         risk_flags=list(card.risk_notes),
-        prewatch_structure_eligible=snapshot.trend_state != "bearish",
+        candidate_pool_structure_eligible=snapshot.trend_state != "bearish",
         exit_signal_state=_exit_signal_state(card, snapshot),
         market_data_complete=market_data_complete,
         market_data_note=market_data_note,
@@ -149,14 +152,14 @@ class RuleMarketUnderstandingEngine:
         )
         return card, assessment
 
-    def build_prewatch(self, snapshot: IndicatorSnapshot, horizon_settings: HorizonSettings, *, min_score: float):
-        candidate = build_prewatch_candidate(snapshot, horizon_settings, min_score=min_score)
+    def build_candidate_pool(self, snapshot: IndicatorSnapshot, horizon_settings: HorizonSettings, *, min_score: float):
+        candidate = build_candidate_pool_candidate(snapshot, horizon_settings, min_score=min_score)
         base_card = OpportunityCard(
             card_id="",
             event_id="",
             symbol=snapshot.symbol,
             horizon=snapshot.horizon,
-            event_type="prewatch",
+            event_type="candidate_pool",
             headline_summary="",
             bull_case="",
             bear_case="",
@@ -174,6 +177,9 @@ class RuleMarketUnderstandingEngine:
             priority="normal",
             dedup_key="",
         )
-        # Reuse the assessment builder shape even for prewatch flows.
+        # Reuse the assessment builder shape even for candidate-pool flows.
         assessment = build_market_assessment(base_card, snapshot, market_data_complete=True)
         return candidate, assessment
+
+    def build_prewatch(self, snapshot: IndicatorSnapshot, horizon_settings: HorizonSettings, *, min_score: float):
+        return self.build_candidate_pool(snapshot, horizon_settings, min_score=min_score)

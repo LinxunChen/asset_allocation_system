@@ -25,7 +25,8 @@ EVENT_QUALITY_TIERS: dict[str, str] = {
     "news": "secondary",
 }
 
-EVENT_PREWATCH_TYPES = {"earnings", "guidance", "m&a", "strategic", "product"}
+EVENT_CANDIDATE_POOL_TYPES = {"earnings", "guidance", "m&a", "strategic", "product"}
+EVENT_PREWATCH_TYPES = EVENT_CANDIDATE_POOL_TYPES
 
 
 class EventUnderstandingEngine(Protocol):
@@ -98,7 +99,7 @@ def build_event_assessment(
         reason_fragments=_reason_fragments(insight),
         llm_used=llm_used,
         llm_confidence=round(insight.llm_confidence, 2),
-        event_prewatch_eligible=insight.event_type in EVENT_PREWATCH_TYPES and strength >= 74.0,
+        event_candidate_pool_eligible=insight.event_type in EVENT_CANDIDATE_POOL_TYPES and strength >= 74.0,
         headline_summary=insight.headline_summary,
         source_refs=list(insight.source_refs),
         risk_notes=list(insight.risk_notes),

@@ -438,7 +438,7 @@ class OpenAINarrator:
             }
         if lite:
             prompt = (
-                "Rewrite this prewatch stock alert for a Chinese-speaking trader. "
+                "Rewrite this candidate-pool stock alert for a Chinese-speaking trader. "
                 "Return JSON only with keys: summary, impact_inference, reasoning, uncertainty, priority_adjustment. "
                 "Use concise Simplified Chinese. No hype, no markdown, no extra keys. "
                 "summary: facts only, 1 short sentence. "

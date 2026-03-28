@@ -16,6 +16,18 @@ DEFAULT_INCREMENTAL_OUTCOME_BACKFILL_DAYS = 45
 US_MARKET_TZ = ZoneInfo("America/New_York")
 MACRO_PROXY_SYMBOLS = ("SPY", "QQQ", "SMH", "TLT")
 EXECUTABLE_OUTCOME_ACTIONS = ("试探建仓", "确认做多")
+TERMINAL_OUTCOME_REASONS = ("exit_pool", "hit_invalidation", "window_complete")
+HOLDING_MANAGEMENT_TERMINAL_REASONS = TERMINAL_OUTCOME_REASONS
+NORMALIZED_TERMINAL_OUTCOME_REASONS = (
+    "profit_protection_exit",
+    "invalidation_exit",
+    "window_close_evaluation",
+)
+NORMALIZED_NOT_ENTERED_REASONS = (
+    "not_entered_price_invalidated",
+    "not_entered_window_expired",
+)
+NORMALIZED_HOLDING_ACTIVE_REASON = "holding_active"
 
 
 @dataclass
@@ -49,6 +61,45 @@ class DecisionOutcomeResult:
 class DecisionOutcomeComputation:
     outcome: DecisionOutcomeResult | None
     skip_reason: str = ""
+
+
+def normalize_close_reason(
+    close_reason: str,
+    *,
+    exit_subreason: str = "",
+    entered: bool = False,
+) -> str:
+    normalized_reason = str(close_reason or "").strip()
+    normalized_subreason = str(exit_subreason or "").strip()
+    if normalized_reason == "exit_pool":
+        return "profit_protection_exit"
+    if normalized_reason == "hit_invalidation":
+        return "invalidation_exit"
+    if normalized_reason == "window_complete":
+        return "window_close_evaluation"
+    if normalized_reason == "not_entered":
+        if normalized_subreason == "price_invalidated":
+            return "not_entered_price_invalidated"
+        return "not_entered_window_expired"
+    if normalized_reason == "insufficient_lookahead" and entered:
+        return "holding_active"
+    return normalized_reason
+
+
+def is_terminal_holding_management_reason(close_reason: str) -> bool:
+    return str(close_reason or "").strip() in HOLDING_MANAGEMENT_TERMINAL_REASONS
+
+
+def is_terminal_normalized_reason(close_reason: str) -> bool:
+    return str(close_reason or "").strip() in NORMALIZED_TERMINAL_OUTCOME_REASONS
+
+
+def is_not_entered_normalized_reason(close_reason: str) -> bool:
+    return str(close_reason or "").strip() in NORMALIZED_NOT_ENTERED_REASONS
+
+
+def is_holding_active_normalized_reason(close_reason: str) -> bool:
+    return str(close_reason or "").strip() == NORMALIZED_HOLDING_ACTIVE_REASON
 
 
 def _parse_timestamp(value: str | None) -> datetime | None:
@@ -407,6 +458,7 @@ def _compute_decision_outcome(
         for index, bar in enumerate(window):
             if invalidation_level is not None and float(bar.open) <= float(invalidation_level):
                 exit_reason = "not_entered"
+                exit_subreason = "price_invalidated"
                 entered = False
                 entered_at = ""
                 entry_price = None
@@ -503,6 +555,8 @@ def _compute_decision_outcome(
             break
         if not entered and len(window) >= MAX_OUTCOME_LOOKAHEAD_DAYS + 1:
             exit_reason = "not_entered"
+            if not exit_subreason:
+                exit_subreason = "window_expired"
     else:
         if take_profit_mid is not None or invalidation_level is not None:
             entered = True
@@ -581,10 +635,15 @@ def _compute_decision_outcome(
             holding_days = None
             exit_reason = close_reason
 
-    if entered and entry_price is not None and exit_price is not None and exit_reason in {
-        "exit_pool",
-        "hit_invalidation",
-        "window_complete",
+    normalized_exit_reason = normalize_close_reason(
+        exit_reason,
+        exit_subreason=exit_subreason,
+        entered=entered,
+    )
+    if entered and entry_price is not None and exit_price is not None and normalized_exit_reason in {
+        "profit_protection_exit",
+        "invalidation_exit",
+        "window_close_evaluation",
     }:
         realized_return = _pct_change(exit_price, entry_price)
         gross_realized_return = realized_return
@@ -611,8 +670,8 @@ def _compute_decision_outcome(
             t_plus_30_return=_close_return(30),
             max_runup=max_runup,
             max_drawdown=max_drawdown,
-            hit_take_profit=exit_reason == "exit_pool" and exit_subreason == "target_hit",
-            hit_invalidation=exit_reason == "hit_invalidation",
+            hit_take_profit=normalized_exit_reason == "profit_protection_exit" and exit_subreason == "target_hit",
+            hit_invalidation=normalized_exit_reason == "invalidation_exit",
             close_reason=exit_reason,
             exit_subreason=exit_subreason,
         )
@@ -639,8 +698,11 @@ def backfill_decision_outcomes(
     skipped = 0
     pending_lookahead = 0
     completed_window = 0
-    exit_pool_hits = 0
-    invalidation_hits = 0
+    profit_protection_exit_count = 0
+    invalidation_exit_count = 0
+    window_close_evaluation_count = 0
+    not_entered_price_invalidated_count = 0
+    not_entered_window_expired_count = 0
     skip_reasons = {
         "missing_bars": 0,
         "stale_bars": 0,
@@ -783,14 +845,25 @@ def backfill_decision_outcomes(
             exit_subreason=outcome.exit_subreason,
             updated_at=utcnow().isoformat(),
         )
-        if outcome.close_reason == "insufficient_lookahead":
+        normalized_close_reason = normalize_close_reason(
+            outcome.close_reason,
+            exit_subreason=outcome.exit_subreason,
+            entered=outcome.entered,
+        )
+        if normalized_close_reason == "holding_active":
             pending_lookahead += 1
         else:
             completed_window += 1
-        if outcome.close_reason == "exit_pool":
-            exit_pool_hits += 1
-        if outcome.hit_invalidation:
-            invalidation_hits += 1
+        if normalized_close_reason == "profit_protection_exit":
+            profit_protection_exit_count += 1
+        if normalized_close_reason == "window_close_evaluation":
+            window_close_evaluation_count += 1
+        if normalized_close_reason == "not_entered_price_invalidated":
+            not_entered_price_invalidated_count += 1
+        if normalized_close_reason == "not_entered_window_expired":
+            not_entered_window_expired_count += 1
+        if normalized_close_reason == "invalidation_exit":
+            invalidation_exit_count += 1
         updated += 1
     return {
         "updated": updated,
@@ -798,9 +871,16 @@ def backfill_decision_outcomes(
         "scanned": len(rows),
         "pending_lookahead": pending_lookahead,
         "completed_window": completed_window,
-        "exit_pool_hits": exit_pool_hits,
-        "take_profit_hits": exit_pool_hits,
-        "invalidation_hits": invalidation_hits,
+        "holding_management_exit_count": profit_protection_exit_count + invalidation_exit_count,
+        "profit_protection_exit_count": profit_protection_exit_count,
+        "window_close_evaluation_count": window_close_evaluation_count,
+        "invalidation_exit_count": invalidation_exit_count,
+        "holding_active_count": pending_lookahead,
+        "not_entered_price_invalidated_count": not_entered_price_invalidated_count,
+        "not_entered_window_expired_count": not_entered_window_expired_count,
+        "exit_pool_hits": profit_protection_exit_count,
+        "take_profit_hits": profit_protection_exit_count,
+        "invalidation_hits": invalidation_exit_count,
         "fetched_symbols": fetched_symbols,
         "fetch_attempted_symbols": fetch_attempted_symbols,
         "fetch_failed_symbols": fetch_failed_symbols,

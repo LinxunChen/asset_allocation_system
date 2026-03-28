@@ -21,6 +21,7 @@ from satellite_agent.models import Bar, SourceEvent
 from satellite_agent.models import EventInsight, IndicatorSnapshot, OpportunityCard, PrewatchCandidate, PriceRange, utcnow
 from satellite_agent.notifier import Notifier
 from satellite_agent.observability import RunContext, StructuredLogger
+from satellite_agent.outcomes import compute_decision_outcome, normalize_close_reason
 from satellite_agent.prewatch import build_prewatch_candidate
 from satellite_agent.scoring import SignalScorer
 from satellite_agent.service import (
@@ -121,6 +122,48 @@ def build_exit_pool_target_hit_bars() -> list[Bar]:
                 close=close,
                 volume=1_200_000 + index * 20_000,
                 adjusted=True,
+            )
+        )
+    return bars
+
+
+def build_entered_holding_active_bars() -> list[Bar]:
+    base = datetime(2026, 3, 1, tzinfo=timezone.utc)
+    candles = [
+        (100.2, 101.0, 99.2),
+        (100.6, 101.3, 99.8),
+        (101.1, 101.8, 100.2),
+        (100.9, 101.6, 100.1),
+        (101.4, 102.0, 100.5),
+    ]
+    bars: list[Bar] = []
+    for index, (close, high, low) in enumerate(candles):
+        bars.append(
+            Bar(
+                timestamp=base + timedelta(days=index),
+                open=close,
+                high=high,
+                low=low,
+                close=close,
+                volume=1_000_000 + index * 5_000,
+            )
+        )
+    return bars
+
+
+def build_entered_window_close_bars() -> list[Bar]:
+    base = datetime(2026, 3, 1, tzinfo=timezone.utc)
+    closes = [100.2, 100.6, 101.1, 100.9, 101.4, 101.7, 102.0, 101.8, 102.2, 102.5, 102.8]
+    bars: list[Bar] = []
+    for index, close in enumerate(closes):
+        bars.append(
+            Bar(
+                timestamp=base + timedelta(days=index),
+                open=close,
+                high=close + 0.7,
+                low=close - 0.8,
+                close=close,
+                volume=1_000_000 + index * 5_000,
             )
         )
     return bars
@@ -409,7 +452,7 @@ class ScoringServiceTests(unittest.TestCase):
             )
             result = service.run_once()
             self.assertEqual(result["events_processed"], 1)
-            self.assertEqual(result["cards_generated"], 2)
+            self.assertEqual(result["cards_generated"], 1)
             self.assertGreaterEqual(result["alerts_sent"], 1)
             latest_run = store.load_latest_run()
             self.assertIsNotNone(latest_run)
@@ -420,7 +463,7 @@ class ScoringServiceTests(unittest.TestCase):
             first_packet = json.loads(decision_rows[0]["packet_json"])
             self.assertEqual(first_packet["strategy_version"], SATELLITE_STRATEGY_VERSION)
             confirmation_rows = store.load_candidate_evaluations(latest_run["run_id"], stage="confirmation")
-            self.assertEqual(len(confirmation_rows), 2)
+            self.assertEqual(len(confirmation_rows), 1)
             self.assertTrue(all(row["outcome"] == "selected" for row in confirmation_rows))
             self.assertTrue(all(row["reason"] == "confirmation_opportunity" for row in confirmation_rows))
             self.assertTrue(all(row["strategy_version"] == SATELLITE_STRATEGY_VERSION for row in confirmation_rows))
@@ -568,13 +611,214 @@ class ScoringServiceTests(unittest.TestCase):
             cards = store.connection.execute(
                 "SELECT card_json FROM opportunity_cards ORDER BY created_at ASC"
             ).fetchall()
+            summary = json.loads(store.load_latest_run()["summary_json"])
 
             self.assertEqual(result["events_processed"], 1)
-            self.assertEqual(result["cards_generated"], 2)
-            parsed_cards = [json.loads(row["card_json"]) for row in cards]
-            self.assertTrue(all(card["market_data_complete"] is False for card in parsed_cards))
-            self.assertTrue(all(card["priority"] == "high" for card in parsed_cards))
-            self.assertTrue(all("行情快照暂不可用" in card["market_data_note"] for card in parsed_cards))
+            self.assertEqual(result["cards_generated"], 0)
+            self.assertEqual(len(cards), 0)
+            self.assertEqual(summary["candidate_pool_count"], 2)
+            self.assertTrue(all(candidate["trigger_mode"] == "event" for candidate in summary["prewatch_candidates"]))
+            self.assertTrue(
+                all("行情快照暂不可用" in candidate["reason_to_watch"] for candidate in summary["prewatch_candidates"])
+            )
+
+    def test_formal_confirmation_cards_bypass_normal_alert_thresholds_and_budgets(self) -> None:
+        class DummyTransport:
+            def __init__(self) -> None:
+                self.messages: list[tuple[str, str]] = []
+
+            def send(self, title: str, body: str) -> None:
+                self.messages.append((title, body))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+            store.seed_watchlist(["NVDA"], "stock")
+            settings = Settings(
+                dry_run=False,
+                database_path=db_path,
+                normal_alert_min_final_score=95.0,
+                max_alerts_per_run=1,
+                max_alerts_per_symbol_per_run=1,
+                prewatch_alert_min_score=100.0,
+            ).with_strategy_overrides(
+                event_score_threshold=50.0,
+                horizons={
+                    "swing": {
+                        "market_score_threshold": 50.0,
+                        "priority_threshold": 60.0,
+                    },
+                    "position": {
+                        "market_score_threshold": 50.0,
+                        "priority_threshold": 60.0,
+                    },
+                },
+            )
+
+            class StaticMarketData:
+                def snapshot(self, symbol: str, horizon: str, include_intraday: bool = True):
+                    thresholds = {
+                        "swing": {
+                            "rsi": 66.0,
+                            "relative_volume": 1.45,
+                            "atr": 3.2,
+                            "support_20": 110.8,
+                            "resistance_20": 126.5,
+                            "support_60": 106.0,
+                            "resistance_60": 132.0,
+                            "intraday_breakout": True,
+                            "is_pullback": False,
+                        },
+                        "position": {
+                            "rsi": 63.0,
+                            "relative_volume": 1.28,
+                            "atr": 3.6,
+                            "support_20": 110.8,
+                            "resistance_20": 126.5,
+                            "support_60": 106.0,
+                            "resistance_60": 136.0,
+                            "intraday_breakout": False,
+                            "is_pullback": True,
+                        },
+                    }[horizon]
+                    return IndicatorSnapshot(
+                        symbol=symbol,
+                        horizon=horizon,
+                        as_of=utcnow(),
+                        last_price=113.5,
+                        rsi_14=thresholds["rsi"],
+                        atr_14=thresholds["atr"],
+                        sma_20=111.6,
+                        sma_60=108.2,
+                        relative_volume=thresholds["relative_volume"],
+                        support_20=thresholds["support_20"],
+                        resistance_20=thresholds["resistance_20"],
+                        support_60=thresholds["support_60"],
+                        resistance_60=thresholds["resistance_60"],
+                        gap_percent=0.0,
+                        intraday_breakout=thresholds["intraday_breakout"],
+                        is_pullback=thresholds["is_pullback"],
+                        trend_state="bullish",
+                        atr_percent=(thresholds["atr"] / 113.5) * 100,
+                    )
+
+            event = SourceEvent(
+                event_id="evt-budget-bypass",
+                source="Reuters",
+                source_type="news",
+                symbol="NVDA",
+                headline="Nvidia rises after analysts cite stronger AI server demand",
+                summary="Several desks lifted expectations after supply checks pointed to stronger near-term data center demand.",
+                published_at=utcnow() - timedelta(hours=2),
+                url="https://example.com/nvda-budget-bypass",
+            )
+            transport = DummyTransport()
+            service = SatelliteAgentService(
+                settings=settings,
+                store=store,
+                source_adapter=StaticSourceAdapter([event]),
+                normalizer=EventNormalizer(),
+                extractor=RuleBasedExtractor(),
+                market_data=StaticMarketData(),
+                scorer=SignalScorer(settings),
+                entry_exit=EntryExitEngine(),
+                notifier=Notifier(store=store, transport=transport, dry_run=False),
+            )
+
+            result = service.run_once()
+            latest_run = store.load_latest_run()
+            summary = json.loads(latest_run["summary_json"])
+
+            self.assertEqual(summary["confirmation_pool_count"], 1)
+            self.assertEqual(result["alerts_sent"], 1)
+            self.assertEqual(len(transport.messages), 1)
+            self.assertTrue(all("确认做多" in title or "试探建仓" in title for title, _ in transport.messages))
+
+    def test_event_fallback_and_scan_candidates_merge_into_same_candidate_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+            store.seed_watchlist(["NBIS", "AAA"], "stock")
+            settings = Settings(
+                dry_run=True,
+                database_path=db_path,
+                event_only_alert_min_event_score=78.0,
+                normal_alert_min_final_score=73.0,
+                max_prewatch_candidates_per_run=5,
+            )
+
+            class EventOnlyFailingMarketData:
+                def snapshot(self, symbol: str, horizon: str, include_intraday: bool = True):
+                    raise TimeoutError("simulated timeout")
+
+            event = SourceEvent(
+                event_id="evt-nbis-route",
+                source="Google News",
+                source_type="news",
+                symbol="NBIS",
+                headline="Meta signs strategic partnership and investment deal with Nebius",
+                summary="Meta invested in Nebius and expanded a strategic AI infrastructure partnership.",
+                published_at=utcnow() - timedelta(hours=1),
+                url="https://example.com/nbis-route",
+            )
+            service = SatelliteAgentService(
+                settings=settings,
+                store=store,
+                source_adapter=StaticSourceAdapter([event]),
+                normalizer=EventNormalizer(),
+                extractor=RuleBasedExtractor(),
+                market_data=EventOnlyFailingMarketData(),
+                scorer=SignalScorer(settings),
+                entry_exit=EntryExitEngine(),
+                notifier=Notifier(store=store, transport=None, dry_run=True),
+                prewatch_symbols=["AAA"],
+            )
+            service._select_prewatch_scan_symbols = lambda watchlist, snapshot_cache: ["AAA"]  # type: ignore[method-assign]
+
+            def fake_build_single(symbol: str, horizon: str, horizon_settings, snapshot_cache):
+                self.assertEqual(symbol, "AAA")
+                snapshot = IndicatorSnapshot(
+                    symbol="AAA",
+                    horizon=horizon,
+                    as_of=utcnow(),
+                    last_price=100.0,
+                    rsi_14=58.0,
+                    atr_14=2.0,
+                    sma_20=99.2,
+                    sma_60=97.8,
+                    relative_volume=1.8,
+                    support_20=97.0,
+                    resistance_20=103.0,
+                    support_60=95.0,
+                    resistance_60=106.0,
+                    gap_percent=0.0,
+                    intraday_breakout=True,
+                    is_pullback=False,
+                    trend_state="bullish",
+                    atr_percent=2.0,
+                )
+                candidate = build_prewatch_candidate(
+                    snapshot,
+                    horizon_settings,
+                    min_score=settings.candidate_pool_min_score,
+                )
+                return snapshot, candidate
+
+            service._build_single_prewatch_candidate = fake_build_single  # type: ignore[method-assign]
+
+            result = service.run_once()
+            summary = json.loads(store.load_latest_run()["summary_json"])
+            trigger_modes = {candidate["trigger_mode"] for candidate in summary["prewatch_candidates"]}
+            symbols = {candidate["symbol"] for candidate in summary["prewatch_candidates"]}
+
+            self.assertEqual(result["cards_generated"], 0)
+            self.assertEqual(summary["confirmation_pool_count"], 0)
+            self.assertIn("event", trigger_modes)
+            self.assertIn("structure", trigger_modes)
+            self.assertIn("NBIS", symbols)
+            self.assertIn("AAA", symbols)
 
     def test_recent_prewatch_candidate_is_promoted_into_confirmation_pool(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -642,23 +886,444 @@ class ScoringServiceTests(unittest.TestCase):
             )
 
             service.run_once()
-            rows = store.load_opportunity_cards(store.load_latest_run()["run_id"])
-            cards = [json.loads(row["card_json"]) for row in rows]
-            promoted = [card for card in cards if card["horizon"] == "position"][0]
+            summary = json.loads(store.load_latest_run()["summary_json"])
+            promoted = next(card for card in summary["prewatch_candidates"] if card["horizon"] == "position")
+            self.assertTrue(store.get_state("candidate_pool:NVDA"))
 
-            self.assertTrue(promoted["promoted_from_prewatch"])
-            self.assertEqual(promoted["prewatch_setup_type"], "breakout_watch")
-            self.assertAlmostEqual(promoted["prewatch_score"], 81.5, places=2)
-            self.assertEqual(promoted["prewatch_observation_count"], 1)
-            self.assertEqual(promoted["prewatch_alert_sent_count"], 0)
-            self.assertIn("累计观察 1 次", promoted["prewatch_promotion_reason"])
-            self.assertIn("此前已进入预备池", promoted["reason_to_watch"])
-            self.assertIn("正式确认", promoted["positioning_hint"])
+            self.assertEqual(promoted["setup_type"], "event_watch")
+            self.assertIn("近72h进入候选池 1 次", promoted["reason_to_watch"])
+            self.assertIn("此前已进入候选池", promoted["reason_to_watch"])
             self.assertAlmostEqual(
-                promoted["final_score"],
+                promoted["score"],
                 round(baseline_card.final_score + settings.prewatch_confirmation_bonus, 2),
                 places=2,
             )
+
+    def test_confirmation_pool_rejects_neutral_low_volume_formal_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+            service = SatelliteAgentService(
+                settings=Settings(dry_run=True, database_path=db_path),
+                store=store,
+                source_adapter=StaticSourceAdapter([]),
+                normalizer=EventNormalizer(),
+                extractor=RuleBasedExtractor(),
+                market_data=MarketDataEngine(InMemoryMarketDataProvider(data={})),
+                scorer=SignalScorer(Settings()),
+                entry_exit=EntryExitEngine(),
+                notifier=Notifier(store=store, transport=None, dry_run=True),
+            )
+            now = utcnow()
+            weak_card = OpportunityCard(
+                card_id="weak-confirmation",
+                event_id="evt-weak",
+                symbol="NBIS",
+                horizon="position",
+                event_type="product",
+                headline_summary="NBIS product update",
+                bull_case="",
+                bear_case="",
+                event_score=76.0,
+                market_score=69.0,
+                final_score=63.8,
+                entry_range=PriceRange(107.0, 108.0),
+                take_profit_range=PriceRange(128.0, 135.0),
+                invalidation_level=100.8,
+                invalidation_reason="Breakdown",
+                risk_notes=[],
+                source_refs=["https://example.com/nbis"],
+                created_at=now,
+                ttl=now + timedelta(days=7),
+                priority="normal",
+                dedup_key="NBIS:evt-weak:product:position",
+                bias="long",
+                action_label="试探建仓",
+                execution_eligible=True,
+                trend_state="neutral",
+                relative_volume=0.33,
+                delivery_category="formal",
+            )
+            stronger_card = weak_card.__class__(**{**weak_card.__dict__, "card_id": "strong-confirmation", "relative_volume": 1.35})
+
+            self.assertFalse(service._card_belongs_to_confirmation_pool(weak_card))
+            self.assertTrue(service._card_belongs_to_confirmation_pool(stronger_card))
+
+    def test_formal_cycle_policy_downgrades_weaker_pending_entry_to_watch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+            created_at = (utcnow() - timedelta(hours=6)).isoformat()
+            store.save_decision_record(
+                decision_id="decision-pending-entry",
+                run_id="run-seed",
+                event_id="evt-pending-entry",
+                symbol="NVDA",
+                event_type="strategic",
+                pool="confirmation",
+                action="确认做多",
+                priority="high",
+                confidence="高",
+                event_score=82.0,
+                market_score=76.0,
+                theme_score=8.0,
+                final_score=79.6,
+                trigger_mode="direct",
+                llm_used=False,
+                theme_ids=["semiconductors_and_ai"],
+                entry_plan={
+                    "entry_range": {"low": 99.0, "high": 100.5},
+                    "take_profit_range": {"low": 130.0, "high": 135.0},
+                    "invalidation_level": 95.0,
+                },
+                invalidation={"level": 95.0, "reason": "跌破关键支撑"},
+                ttl=created_at,
+                packet={},
+                created_at=created_at,
+            )
+            service = SatelliteAgentService(
+                settings=Settings(dry_run=True, database_path=db_path),
+                store=store,
+                source_adapter=StaticSourceAdapter([]),
+                normalizer=EventNormalizer(),
+                extractor=RuleBasedExtractor(),
+                market_data=MarketDataEngine(InMemoryMarketDataProvider(data={})),
+                scorer=SignalScorer(Settings()),
+                entry_exit=EntryExitEngine(),
+                notifier=Notifier(store=store, transport=None, dry_run=True),
+            )
+            now = utcnow()
+            weaker_card = OpportunityCard(
+                card_id="cycle-policy-weaker",
+                event_id="evt-new-cycle",
+                symbol="NVDA",
+                horizon="position",
+                event_type="strategic",
+                headline_summary="NVDA weaker follow-up signal",
+                bull_case="",
+                bear_case="",
+                event_score=76.0,
+                market_score=67.0,
+                final_score=69.0,
+                entry_range=PriceRange(101.0, 102.0),
+                take_profit_range=PriceRange(110.0, 116.0),
+                invalidation_level=98.0,
+                invalidation_reason="跌破关键支撑",
+                risk_notes=[],
+                source_refs=["https://example.com/nvda-cycle"],
+                created_at=now,
+                ttl=now + timedelta(days=5),
+                priority="normal",
+                dedup_key="NVDA:evt-new-cycle:strategic:formal",
+                bias="long",
+                display_name="NVIDIA",
+                action_label="试探建仓",
+                confidence_label="中",
+                execution_eligible=True,
+                trend_state="bullish",
+                relative_volume=1.2,
+                delivery_category="formal",
+            )
+            adjusted_cards, adjusted_packets = service._apply_formal_card_cycle_policies(
+                [weaker_card],
+                [],
+                logger=StructuredLogger(store, "run-cycle-policy"),
+            )
+
+            self.assertEqual(len(adjusted_cards), 1)
+            self.assertEqual(adjusted_packets, [])
+            adjusted = adjusted_cards[0]
+            self.assertEqual(adjusted.action_label, "加入观察")
+            self.assertTrue(adjusted.downgraded_from_formal)
+            self.assertEqual(adjusted.active_cycle_status, "pending_entry")
+            self.assertIn("建议撤销此前设置的买入挂单", adjusted.reason_to_watch)
+            self.assertIn("建议撤销此前设置的买入挂单", adjusted.positioning_hint)
+
+    def test_formal_cycle_policy_suppresses_new_entry_when_holding_active(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+            created_at = (utcnow() - timedelta(days=2)).isoformat()
+            store.save_decision_record(
+                decision_id="decision-holding-cycle",
+                run_id="run-seed",
+                event_id="evt-holding-cycle",
+                symbol="NVDA",
+                event_type="strategic",
+                pool="confirmation",
+                action="确认做多",
+                priority="high",
+                confidence="高",
+                event_score=82.0,
+                market_score=76.0,
+                theme_score=8.0,
+                final_score=79.6,
+                trigger_mode="direct",
+                llm_used=False,
+                theme_ids=["semiconductors_and_ai"],
+                entry_plan={
+                    "entry_range": {"low": 99.0, "high": 100.5},
+                    "take_profit_range": {"low": 130.0, "high": 135.0},
+                    "invalidation_level": 95.0,
+                },
+                invalidation={"level": 95.0, "reason": "跌破关键支撑"},
+                ttl=created_at,
+                packet={},
+                created_at=created_at,
+            )
+            store.save_decision_outcome(
+                decision_id="decision-holding-cycle",
+                entered=True,
+                entered_at=created_at,
+                entry_price=100.0,
+                close_reason="insufficient_lookahead",
+                updated_at=utcnow().isoformat(),
+            )
+            service = SatelliteAgentService(
+                settings=Settings(dry_run=True, database_path=db_path),
+                store=store,
+                source_adapter=StaticSourceAdapter([]),
+                normalizer=EventNormalizer(),
+                extractor=RuleBasedExtractor(),
+                market_data=MarketDataEngine(InMemoryMarketDataProvider(data={})),
+                scorer=SignalScorer(Settings()),
+                entry_exit=EntryExitEngine(),
+                notifier=Notifier(store=store, transport=None, dry_run=True),
+            )
+            now = utcnow()
+            new_card = OpportunityCard(
+                card_id="cycle-policy-holding",
+                event_id="evt-holding-follow-up",
+                symbol="NVDA",
+                horizon="position",
+                event_type="strategic",
+                headline_summary="NVDA follow-up signal while holding active",
+                bull_case="",
+                bear_case="",
+                event_score=76.0,
+                market_score=67.0,
+                final_score=69.0,
+                entry_range=PriceRange(101.0, 102.0),
+                take_profit_range=PriceRange(110.0, 116.0),
+                invalidation_level=98.0,
+                invalidation_reason="跌破关键支撑",
+                risk_notes=[],
+                source_refs=["https://example.com/nvda-holding"],
+                created_at=now,
+                ttl=now + timedelta(days=5),
+                priority="normal",
+                dedup_key="NVDA:evt-holding-follow-up:strategic:formal",
+                bias="long",
+                display_name="NVIDIA",
+                action_label="试探建仓",
+                confidence_label="中",
+                execution_eligible=True,
+                trend_state="bullish",
+                relative_volume=1.2,
+                delivery_category="formal",
+            )
+            adjusted_cards, adjusted_packets = service._apply_formal_card_cycle_policies(
+                [new_card],
+                [],
+                logger=StructuredLogger(store, "run-cycle-policy-holding"),
+            )
+
+            self.assertEqual(adjusted_cards, [])
+            self.assertEqual(adjusted_packets, [])
+
+    def test_formal_cycle_policy_allows_new_formal_after_terminal_unentered_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+            created_at = (utcnow() - timedelta(days=2)).isoformat()
+            store.save_decision_record(
+                decision_id="decision-terminal-cycle",
+                run_id="run-seed",
+                event_id="evt-terminal-cycle",
+                symbol="NVDA",
+                event_type="strategic",
+                pool="confirmation",
+                action="确认做多",
+                priority="high",
+                confidence="高",
+                event_score=82.0,
+                market_score=76.0,
+                theme_score=8.0,
+                final_score=79.6,
+                trigger_mode="direct",
+                llm_used=False,
+                theme_ids=["semiconductors_and_ai"],
+                entry_plan={
+                    "entry_range": {"low": 99.0, "high": 100.5},
+                    "take_profit_range": {"low": 130.0, "high": 135.0},
+                    "invalidation_level": 95.0,
+                },
+                invalidation={"level": 95.0, "reason": "跌破关键支撑"},
+                ttl=created_at,
+                packet={},
+                created_at=created_at,
+            )
+            store.save_decision_outcome(
+                decision_id="decision-terminal-cycle",
+                entered=False,
+                close_reason="not_entered",
+                exit_subreason="price_invalidated",
+                updated_at=utcnow().isoformat(),
+            )
+            service = SatelliteAgentService(
+                settings=Settings(dry_run=True, database_path=db_path),
+                store=store,
+                source_adapter=StaticSourceAdapter([]),
+                normalizer=EventNormalizer(),
+                extractor=RuleBasedExtractor(),
+                market_data=MarketDataEngine(InMemoryMarketDataProvider(data={})),
+                scorer=SignalScorer(Settings()),
+                entry_exit=EntryExitEngine(),
+                notifier=Notifier(store=store, transport=None, dry_run=True),
+            )
+            now = utcnow()
+            new_card = OpportunityCard(
+                card_id="cycle-policy-terminal",
+                event_id="evt-terminal-follow-up",
+                symbol="NVDA",
+                horizon="position",
+                event_type="strategic",
+                headline_summary="NVDA new cycle after terminal outcome",
+                bull_case="",
+                bear_case="",
+                event_score=83.0,
+                market_score=74.0,
+                final_score=78.0,
+                entry_range=PriceRange(102.0, 103.0),
+                take_profit_range=PriceRange(112.0, 118.0),
+                invalidation_level=99.0,
+                invalidation_reason="跌破关键支撑",
+                risk_notes=[],
+                source_refs=["https://example.com/nvda-terminal"],
+                created_at=now,
+                ttl=now + timedelta(days=5),
+                priority="high",
+                dedup_key="NVDA:evt-terminal-follow-up:strategic:formal",
+                bias="long",
+                display_name="NVIDIA",
+                action_label="确认做多",
+                confidence_label="高",
+                execution_eligible=True,
+                trend_state="bullish",
+                relative_volume=1.4,
+                delivery_category="formal",
+            )
+            adjusted_cards, adjusted_packets = service._apply_formal_card_cycle_policies(
+                [new_card],
+                [],
+                logger=StructuredLogger(store, "run-cycle-policy-terminal"),
+            )
+
+            self.assertEqual(len(adjusted_cards), 1)
+            self.assertEqual(adjusted_packets, [])
+            adjusted = adjusted_cards[0]
+            self.assertEqual(adjusted.action_label, "确认做多")
+            self.assertEqual(adjusted.active_cycle_status, "terminal")
+            self.assertFalse(adjusted.downgraded_from_formal)
+            self.assertEqual(adjusted.previous_formal_action, "")
+
+    def test_formal_cycle_policy_keeps_breakthrough_hook_dormant_during_holding_active(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+            created_at = (utcnow() - timedelta(days=2)).isoformat()
+            store.save_decision_record(
+                decision_id="decision-breakthrough-cycle",
+                run_id="run-seed",
+                event_id="evt-breakthrough-cycle",
+                symbol="NVDA",
+                event_type="strategic",
+                pool="confirmation",
+                action="确认做多",
+                priority="high",
+                confidence="高",
+                event_score=82.0,
+                market_score=76.0,
+                theme_score=8.0,
+                final_score=79.6,
+                trigger_mode="direct",
+                llm_used=False,
+                theme_ids=["semiconductors_and_ai"],
+                entry_plan={
+                    "entry_range": {"low": 99.0, "high": 100.5},
+                    "take_profit_range": {"low": 130.0, "high": 135.0},
+                    "invalidation_level": 95.0,
+                },
+                invalidation={"level": 95.0, "reason": "跌破关键支撑"},
+                ttl=created_at,
+                packet={},
+                created_at=created_at,
+            )
+            store.save_decision_outcome(
+                decision_id="decision-breakthrough-cycle",
+                entered=True,
+                entered_at=created_at,
+                entry_price=100.0,
+                close_reason="insufficient_lookahead",
+                updated_at=utcnow().isoformat(),
+            )
+            service = SatelliteAgentService(
+                settings=Settings(dry_run=True, database_path=db_path),
+                store=store,
+                source_adapter=StaticSourceAdapter([]),
+                normalizer=EventNormalizer(),
+                extractor=RuleBasedExtractor(),
+                market_data=MarketDataEngine(InMemoryMarketDataProvider(data={})),
+                scorer=SignalScorer(Settings()),
+                entry_exit=EntryExitEngine(),
+                notifier=Notifier(store=store, transport=None, dry_run=True),
+            )
+            now = utcnow()
+            new_card = OpportunityCard(
+                card_id="cycle-policy-breakthrough",
+                event_id="evt-breakthrough-follow-up",
+                symbol="NVDA",
+                horizon="position",
+                event_type="strategic",
+                headline_summary="NVDA breakthrough follow-up while holding active",
+                bull_case="",
+                bear_case="",
+                event_score=84.0,
+                market_score=78.0,
+                final_score=80.0,
+                entry_range=PriceRange(101.0, 102.0),
+                take_profit_range=PriceRange(112.0, 118.0),
+                invalidation_level=98.0,
+                invalidation_reason="跌破关键支撑",
+                risk_notes=[],
+                source_refs=["https://example.com/nvda-breakthrough"],
+                created_at=now,
+                ttl=now + timedelta(days=5),
+                priority="high",
+                dedup_key="NVDA:evt-breakthrough-follow-up:strategic:formal",
+                bias="long",
+                display_name="NVIDIA",
+                action_label="确认做多",
+                confidence_label="高",
+                execution_eligible=True,
+                trend_state="bullish",
+                relative_volume=1.8,
+                delivery_category="formal",
+                is_breakthrough_event=True,
+            )
+            adjusted_cards, adjusted_packets = service._apply_formal_card_cycle_policies(
+                [new_card],
+                [],
+                logger=StructuredLogger(store, "run-cycle-policy-breakthrough"),
+            )
+
+            self.assertEqual(adjusted_cards, [])
+            self.assertEqual(adjusted_packets, [])
 
     def test_theme_linkage_boosts_prewatch_candidate_when_same_theme_has_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -855,10 +1520,13 @@ class ScoringServiceTests(unittest.TestCase):
             latest_run = store.load_latest_run()
             self.assertIsNotNone(latest_run)
             latest_summary = json.loads(latest_run["summary_json"])
-            rows = store.load_candidate_evaluations(latest_run["run_id"], stage="prewatch")
+            rows = store.load_candidate_evaluations(latest_run["run_id"], stage="candidate_pool")
+            legacy_rows = store.load_candidate_evaluations(latest_run["run_id"], stage="prewatch")
             self.assertEqual(result["prewatch_candidates"], 1)
             self.assertEqual(latest_summary["prewatch_candidates_count"], 1)
             self.assertEqual(len(rows), 3)
+            self.assertEqual(len(legacy_rows), 3)
+            self.assertTrue(all(str(row["stage"]) == "candidate_pool" for row in rows))
 
             by_symbol = {row["symbol"]: row for row in rows}
             aaa_payload = json.loads(by_symbol["AAA"]["payload_json"])
@@ -980,14 +1648,8 @@ class ScoringServiceTests(unittest.TestCase):
             summary = json.loads(store.load_latest_run()["summary_json"])
             candidates = summary["prewatch_candidates"]
 
-            mu_candidate = next(candidate for candidate in candidates if candidate["symbol"] == "MU")
-            self.assertIn("NVDA", mu_candidate["reason_to_watch"])
-            self.assertTrue(
-                (
-                    "同题材已有确认标的" in mu_candidate["reason_to_watch"]
-                    or "同题材预热共振" in mu_candidate["reason_to_watch"]
-                )
-            )
+            self.assertFalse(any(candidate["symbol"] == "MU" for candidate in candidates))
+            self.assertTrue(all(candidate["trigger_mode"] == "event" for candidate in candidates))
 
     def test_recent_theme_memory_boosts_prewatch_scan_priority(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1185,14 +1847,8 @@ class ScoringServiceTests(unittest.TestCase):
             summary = json.loads(store.load_latest_run()["summary_json"])
             candidates = summary["prewatch_candidates"]
 
-            self.assertEqual(len(candidates), 1)
-            self.assertEqual(candidates[0]["symbol"], "MU")
-            self.assertEqual(candidates[0]["trigger_mode"], "event")
-            self.assertEqual(candidates[0]["trigger_theme"], "AI芯片与半导体设备")
-            self.assertEqual(candidates[0]["trigger_symbols"], ["NVDA"])
-            self.assertIn("事件预热：AI芯片与半导体设备", candidates[0]["reason_to_watch"])
-            self.assertIn("战略合作催化", candidates[0]["reason_to_watch"])
-            self.assertIn("触发标的 NVDA", candidates[0]["reason_to_watch"])
+            self.assertFalse(any(candidate["symbol"] == "MU" for candidate in candidates))
+            self.assertTrue(all(candidate["trigger_mode"] == "event" for candidate in candidates))
 
     def test_run_once_generates_exit_pool_card_for_target_hit_position(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1263,15 +1919,177 @@ class ScoringServiceTests(unittest.TestCase):
 
             latest_run = store.load_latest_run()
             summary = json.loads(latest_run["summary_json"])
-            self.assertEqual(summary["exit_pool_cards_count"], 1)
+            self.assertEqual(summary["holding_management_cards_count"], 1)
             self.assertEqual(summary["exit_pool_symbols"], ["NVDA"])
+            self.assertEqual(summary["holding_management_cards"][0]["holding_management_reason"], "profit_protection_exit")
             self.assertEqual(summary["exit_pool_cards"][0]["subreason"], "target_hit")
 
             rows = store.load_decision_records(latest_run["run_id"])
-            exit_rows = [row for row in rows if row["pool"] == "exit"]
+            exit_rows = [row for row in rows if row["pool"] == "holding_management"]
             self.assertEqual(len(exit_rows), 1)
-            self.assertEqual(exit_rows[0]["action"], "进入兑现池")
-            self.assertEqual(json.loads(exit_rows[0]["packet_json"])["exit_subreason"], "target_hit")
+            self.assertEqual(exit_rows[0]["action"], "利润保护退出")
+            self.assertEqual(json.loads(exit_rows[0]["packet_json"])["normalized_close_reason"], "profit_protection_exit")
+
+    def test_run_once_keeps_entered_position_as_holding_active_without_exit_card(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+            store.seed_watchlist(["NVDA"], "stock")
+            store.upsert_price_bars("NVDA", "1d", build_entered_holding_active_bars())
+            created_at = datetime(2026, 3, 1, 14, 0, tzinfo=timezone.utc).isoformat()
+            store.save_decision_record(
+                decision_id="decision-holding-active",
+                run_id="run-seed",
+                event_id="evt-holding-active",
+                symbol="NVDA",
+                event_type="strategic",
+                pool="confirmation",
+                action="确认做多",
+                priority="high",
+                confidence="高",
+                event_score=82.0,
+                market_score=76.0,
+                theme_score=8.0,
+                final_score=79.6,
+                trigger_mode="direct",
+                llm_used=False,
+                theme_ids=["semiconductors_and_ai"],
+                entry_plan={
+                    "entry_range": {"low": 99.0, "high": 100.5},
+                    "take_profit_range": {"low": 130.0, "high": 135.0},
+                    "invalidation_level": 95.0,
+                },
+                invalidation={"level": 95.0, "reason": "跌破关键支撑"},
+                ttl=created_at,
+                packet={},
+                created_at=created_at,
+            )
+
+            settings = Settings(
+                dry_run=True,
+                database_path=db_path,
+            )
+            service = SatelliteAgentService(
+                settings=settings,
+                store=store,
+                source_adapter=StaticSourceAdapter([]),
+                normalizer=EventNormalizer(),
+                extractor=RuleBasedExtractor(),
+                market_data=MarketDataEngine(InMemoryMarketDataProvider(data={})),
+                scorer=SignalScorer(settings),
+                entry_exit=EntryExitEngine(),
+                notifier=Notifier(store=store, transport=None, dry_run=True),
+            )
+            service._select_prewatch_scan_symbols = lambda watchlist, snapshot_cache: []  # type: ignore[method-assign]
+
+            result = service.run_once()
+
+            latest_run = store.load_latest_run()
+            summary = json.loads(latest_run["summary_json"])
+            seeded_row = store.connection.execute(
+                "SELECT * FROM decision_records WHERE decision_id = ?",
+                ("decision-holding-active",),
+            ).fetchone()
+            outcome = compute_decision_outcome(seeded_row, build_entered_holding_active_bars()) if seeded_row else None
+
+            self.assertEqual(result["alerts_sent"], 0)
+            self.assertEqual(summary["holding_active_count"], 1)
+            self.assertEqual(summary["holding_management_cards_count"], 0)
+            self.assertEqual(summary["window_close_evaluation_count"], 0)
+            self.assertEqual(summary["invalidation_exit_count"], 0)
+            self.assertIsNotNone(outcome)
+            assert outcome is not None
+            self.assertEqual(outcome.close_reason, "insufficient_lookahead")
+            self.assertTrue(outcome.entered)
+            self.assertEqual(
+                normalize_close_reason(
+                    outcome.close_reason,
+                    exit_subreason=outcome.exit_subreason,
+                    entered=outcome.entered,
+                ),
+                "holding_active",
+            )
+
+    def test_run_once_records_window_close_evaluation_without_exit_card(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "agent.db"
+            store = Store(db_path)
+            store.initialize()
+            store.seed_watchlist(["NVDA"], "stock")
+            store.upsert_price_bars("NVDA", "1d", build_entered_window_close_bars())
+            created_at = datetime(2026, 3, 1, 14, 0, tzinfo=timezone.utc).isoformat()
+            store.save_decision_record(
+                decision_id="decision-window-close",
+                run_id="run-seed",
+                event_id="evt-window-close",
+                symbol="NVDA",
+                event_type="strategic",
+                pool="confirmation",
+                action="确认做多",
+                priority="high",
+                confidence="高",
+                event_score=82.0,
+                market_score=76.0,
+                theme_score=8.0,
+                final_score=79.6,
+                trigger_mode="direct",
+                llm_used=False,
+                theme_ids=["semiconductors_and_ai"],
+                entry_plan={
+                    "entry_range": {"low": 99.0, "high": 100.5},
+                    "take_profit_range": {"low": 130.0, "high": 135.0},
+                    "invalidation_level": 95.0,
+                },
+                invalidation={"level": 95.0, "reason": "跌破关键支撑"},
+                ttl=created_at,
+                packet={},
+                created_at=created_at,
+            )
+
+            settings = Settings(
+                dry_run=True,
+                database_path=db_path,
+            )
+            service = SatelliteAgentService(
+                settings=settings,
+                store=store,
+                source_adapter=StaticSourceAdapter([]),
+                normalizer=EventNormalizer(),
+                extractor=RuleBasedExtractor(),
+                market_data=MarketDataEngine(InMemoryMarketDataProvider(data={})),
+                scorer=SignalScorer(settings),
+                entry_exit=EntryExitEngine(),
+                notifier=Notifier(store=store, transport=None, dry_run=True),
+            )
+            service._select_prewatch_scan_symbols = lambda watchlist, snapshot_cache: []  # type: ignore[method-assign]
+
+            result = service.run_once()
+
+            latest_run = store.load_latest_run()
+            summary = json.loads(latest_run["summary_json"])
+            seeded_row = store.connection.execute(
+                "SELECT * FROM decision_records WHERE decision_id = ?",
+                ("decision-window-close",),
+            ).fetchone()
+            outcome = compute_decision_outcome(seeded_row, build_entered_window_close_bars()) if seeded_row else None
+
+            self.assertEqual(result["alerts_sent"], 0)
+            self.assertEqual(summary["window_close_evaluation_count"], 1)
+            self.assertEqual(summary["holding_management_cards_count"], 0)
+            self.assertEqual(summary["holding_active_count"], 0)
+            self.assertIsNotNone(outcome)
+            assert outcome is not None
+            self.assertEqual(outcome.close_reason, "window_complete")
+            self.assertTrue(outcome.entered)
+            self.assertEqual(
+                normalize_close_reason(
+                    outcome.close_reason,
+                    exit_subreason=outcome.exit_subreason,
+                    entered=outcome.entered,
+                ),
+                "window_close_evaluation",
+            )
 
     def test_theme_linkage_adds_chain_bonus_to_promoted_confirmation_card(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1362,29 +2180,18 @@ class ScoringServiceTests(unittest.TestCase):
             )
 
             service.run_once()
-            rows = store.load_opportunity_cards(store.load_latest_run()["run_id"])
-            cards = [json.loads(row["card_json"]) for row in rows]
-            promoted = next(card for card in cards if card["symbol"] == "NVDA" and card["horizon"] == "position")
+            summary = json.loads(store.load_latest_run()["summary_json"])
+            promoted = next(card for card in summary["prewatch_candidates"] if card["symbol"] == "NVDA" and card["horizon"] == "position")
 
-            self.assertTrue(promoted["promoted_from_prewatch"])
             self.assertTrue(
                 (
                     "同题材已有确认标的：MU" in promoted["reason_to_watch"]
-                    or "预备池" in promoted["reason_to_watch"]
-                )
-            )
-            self.assertTrue(
-                (
-                    "题材联动正在形成" in promoted["positioning_hint"]
-                    or "本次事件触发确认" in promoted["positioning_hint"]
-                    or "切换到正式确认" in promoted["positioning_hint"]
+                    or "候选池" in promoted["reason_to_watch"]
                 )
             )
             expected_bonus = settings.prewatch_confirmation_bonus
-            if promoted.get("confirmed_peer_symbols"):
-                expected_bonus += THEME_CONFIRMATION_CHAIN_BONUS
             self.assertAlmostEqual(
-                promoted["final_score"],
+                promoted["score"],
                 round(baseline_card.final_score + expected_bonus, 2),
                 places=2,
             )
@@ -1572,11 +2379,11 @@ class ScoringServiceTests(unittest.TestCase):
             sent_rows = [row for row in rows if row["sent"] == 1]
             skipped_reasons = {row["reason"] for row in rows if row["sent"] == 0}
 
-            self.assertEqual(result["alerts_sent"], 2)
-            self.assertEqual(len(sent_rows), 2)
-            self.assertEqual({row["symbol"] for row in sent_rows}, {"AAA", "BBB"})
-            self.assertIn("symbol_alert_budget_exhausted", skipped_reasons)
-            self.assertIn("quality_cutoff", skipped_reasons)
+            self.assertEqual(result["alerts_sent"], 3)
+            self.assertEqual(len(sent_rows), 3)
+            self.assertEqual({row["symbol"] for row in sent_rows}, {"AAA", "BBB", "CCC"})
+            self.assertTrue(all(row["horizon"] == "swing" for row in sent_rows))
+            self.assertEqual(skipped_reasons, set())
 
     def test_run_once_reuses_market_snapshot_for_same_symbol_within_run(self) -> None:
         class CountingMarketData:
@@ -1820,7 +2627,7 @@ class ScoringServiceTests(unittest.TestCase):
             self.assertEqual(set(scanned_symbols), {"CCC", "AAA"})
             self.assertEqual(first["prewatch_alerts_sent"], 2)
             self.assertEqual(len(transport.messages), 2)
-            self.assertTrue(transport.messages[0][0].startswith("[预备池]"))
+            self.assertTrue(transport.messages[0][0].startswith("[候选池]"))
             self.assertEqual(second["prewatch_alerts_sent"], 0)
             self.assertEqual(latest_summary["prewatch_alert_symbols"], [])
 
@@ -1884,6 +2691,7 @@ class ScoringServiceTests(unittest.TestCase):
             )
             self.assertEqual(first_sent, ["NBIS"])
             self.assertEqual(len(transport.messages), 1)
+            self.assertTrue(store.get_state("candidate_optional_alert:NBIS"))
 
             previous_state = json.loads(store.get_state("prewatch_alert:NBIS"))
             previous_state["sent_at"] = (utcnow() - timedelta(hours=5)).isoformat()
@@ -1979,9 +2787,9 @@ class ScoringServiceTests(unittest.TestCase):
             self.assertEqual(sent, ["NBIS"])
             self.assertEqual(len(transport.messages), 1)
             title, body = transport.messages[0]
-            self.assertTrue(title.startswith("[预备池]"))
+            self.assertTrue(title.startswith("[候选池]"))
             self.assertIn("事实摘要：公司披露的新合作仍处在预热阶段", body)
-            self.assertIn("为什么现在先观察：消息先把这只票重新拉回视野", body)
+            self.assertIn("影响推理：短线先看合作细节和量能能否继续跟上", body)
             self.assertIn("升级触发：短线先看合作细节和量能能否继续跟上", body)
 
     def test_prewatch_scan_skips_ineligible_and_recent_failure_symbols(self) -> None:

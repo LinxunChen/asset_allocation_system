@@ -149,19 +149,19 @@ class ReportingTests(unittest.TestCase):
             ],
         )
 
-        self.assertIn("另外有 2 个标的进入兑现池（达标止盈 1 个，宏观保护 1 个）", review_text)
-        self.assertIn("兑现池：", review_text)
+        self.assertIn("另外有 2 个标的进入持仓管理（达标止盈 1 个，宏观保护 1 个）", review_text)
+        self.assertIn("持仓管理：", review_text)
         self.assertIn("NVIDIA / 波段 / 达标止盈", review_text)
-        self.assertIn("来源链路：3天前确认做多 -> 今日进入兑现池", review_text)
+        self.assertIn("来源链路：3天前确认做多 -> 今日利润保护退出", review_text)
         self.assertIn("来源决策：decision-confirm-1", review_text)
         self.assertIn("原目标区：120.00-128.00", review_text)
         self.assertIn("当前处理：已到达目标区更深位置", review_text)
         self.assertIn("Meta Platforms / 短线 / 宏观保护", review_text)
-        self.assertIn("使用边界：兑现池只面向已有浮盈仓位，不代表新的开仓信号。", review_text)
+        self.assertIn("使用边界：持仓管理只面向已有仓位，不代表新的开仓信号。", review_text)
         self.assertIn("交易轨迹：", review_text)
-        self.assertIn("NVDA / 确认做多 -> 进入兑现池", review_text)
+        self.assertIn("NVDA / 确认做多 -> 利润保护退出", review_text)
         self.assertIn("起点：确认池 / 确认做多 / 优先级 high / 综合 86.50", review_text)
-        self.assertIn("终点：兑现池 / 进入兑现池 / 触发模式 target_hit / 综合 88.00", review_text)
+        self.assertIn("终点：第三池：持仓管理 / 利润保护退出 / 触发模式 target_hit / 综合 88.00", review_text)
         self.assertIn("结果：历时 3.00 天 / 真实收益 9.80%", review_text)
         self.assertIn("时间：2026-03-21 18:00 -> 2026-03-24 18:00 / 历时 3 天", review_text)
         self.assertIn("来源动作：确认池 / 确认做多 / 优先级 high / 综合 86.50", review_text)
@@ -398,32 +398,32 @@ class ReportingTests(unittest.TestCase):
         )
 
         self.assertIn("三池漏斗：", review_text)
-        self.assertIn("预备池候选：3 条", review_text)
-        self.assertIn("观察提醒：2 条 | 观察 -> 观察提醒转化率 66.7%", review_text)
-        self.assertIn("确认机会：2 条 | 观察 -> 确认机会转化率 66.7%", review_text)
-        self.assertIn("观察提醒后确认机会：1 条 | 观察提醒 -> 确认机会转化率 50.0%", review_text)
-        self.assertIn("另有 1 条未经过观察提醒，直接从观察进入确认机会。", review_text)
-        self.assertIn("进入兑现池：1 条 | 确认机会 -> 兑现转化率 50.0%", review_text)
+        self.assertIn("第一池候选：3 条", review_text)
+        self.assertIn("观察卡：2 条 | 候选 -> 观察卡转化率 66.7%", review_text)
+        self.assertIn("确认机会：2 条 | 候选 -> 确认机会转化率 66.7%", review_text)
+        self.assertIn("观察卡后确认机会：1 条 | 观察卡 -> 确认机会转化率 50.0%", review_text)
+        self.assertIn("另有 1 条未经过观察卡，直接从候选进入确认机会。", review_text)
+        self.assertIn("进入持仓管理退出：1 条 | 确认机会 -> 持仓管理退出转化率 50.0%", review_text)
         self.assertIn("候选诊断：", review_text)
         self.assertIn("预备池：共 5 条，进入观察 3 条，未入选 1 条，拒绝 1 条，异常 0 条。", review_text)
         self.assertIn("主要未通过原因：低于观察阈值 1 条 / 排在本轮候选上限之外 1 条", review_text)
         self.assertIn("确认机会：共 3 条，形成确认机会 1 条，未入选 0 条，拒绝 2 条，异常 0 条。", review_text)
         self.assertIn("主要未通过原因：未达到确认阈值 1 条 / 不满足执行条件 1 条", review_text)
         self.assertIn("完整模拟闭环：", review_text)
-        self.assertIn("观察：3 条", review_text)
+        self.assertIn("候选：3 条", review_text)
         self.assertIn("模拟成交：1 条 | 确认机会 -> 模拟成交转化率 50.0%", review_text)
-        self.assertIn("进入兑现池：1 条 | 模拟成交 -> 进入兑现池转化率 100.0%", review_text)
+        self.assertIn("进入持仓管理退出：1 条 | 模拟成交 -> 持仓管理退出转化率 100.0%", review_text)
         self.assertIn("模拟退出完成：1 条 | 模拟成交 -> 模拟退出完成率 100.0%", review_text)
         self.assertIn("确认机会 -> 模拟成交：平均等待 1.00 天，中位数 1.00 天", review_text)
         self.assertIn("模拟成交 -> 模拟退出完成：平均持有 2.00 天，中位数 2.00 天", review_text)
         self.assertIn("按动作看成交等待：确认做多：样本 1 条，平均等待 1.00 天，中位数 1.00 天", review_text)
         self.assertIn("按动作看持有时长：确认做多：样本 1 条，平均持有 2.00 天，中位数 2.00 天", review_text)
         self.assertIn("另有 1 条确认机会尚未形成模拟成交。", review_text)
-        self.assertIn("其中：兑现池 1 条", review_text)
+        self.assertIn("其中：利润保护退出 1 条", review_text)
         self.assertIn("新增观察标的：", review_text)
         self.assertIn("本轮新增观察标的 3 个，其中 1 个当前仍处于后台观察。", review_text)
-        self.assertIn("CCC / 波段 / 相对强势 / 预备池 74.00 分", review_text)
-        self.assertIn("当前状态：仅后台观察，尚未触发观察提醒。", review_text)
+        self.assertIn("CCC / 波段 / 相对强势 / 候选池 74.00 分", review_text)
+        self.assertIn("当前状态：仅后台观察，尚未触发观察卡。", review_text)
         self.assertIn("提醒压制诊断：", review_text)
         self.assertIn("共 3 张卡片，其中 1 张停留在观察级别，2 张进入正式提醒候选，实际发送 1 张。", review_text)
         self.assertIn("确认机会候选被挡主因：未达到确认阈值 1 条 / 不满足执行条件 1 条", review_text)
@@ -888,13 +888,13 @@ class ReportingTests(unittest.TestCase):
             self.assertEqual(review["overview"]["open_position_count"], 0)
             self.assertIn("已成交（试探建仓/确认做多）：1", report_text)
             self.assertIn("未成交（试探建仓/确认做多，但未到入场区间）：1", report_text)
-            self.assertIn("观察中（已成交后）：0", report_text)
+            self.assertIn("持仓中（已成交后）：0", report_text)
             self.assertIn("确认池：样本 1 条", report_text)
-            self.assertIn("预备池：样本 1 条", report_text)
+            self.assertIn("第一池：候选池：样本 1 条", report_text)
             self.assertIn("直接成卡：样本 1 条", report_text)
             self.assertIn("结构预热成卡：样本 1 条", report_text)
             self.assertIn("普通：样本 2 条", report_text)
-            self.assertIn("失效退出（确认做多）", report_text)
+            self.assertIn("失效价退出（确认做多）", report_text)
             self.assertIn("效果最好 Top3（已完成样本）：", report_text)
             self.assertIn("效果最差 Top3（已完成样本）：", report_text)
             self.assertIn("T+7 表现最好 Top3：", report_text)
@@ -1539,16 +1539,16 @@ class ReportingTests(unittest.TestCase):
             self.assertEqual(review["trade_path_summary"]["best_samples"][0]["symbol"], "NVDA")
             self.assertEqual(review["trade_path_summary"]["worst_samples"][0]["symbol"], "META")
             self.assertIn("交易轨迹摘要：", report_text)
-            self.assertIn("确认机会后进入兑现池：2 条", report_text)
+            self.assertIn("确认机会后进入持仓管理退出：2 条", report_text)
             self.assertIn("平均历时：2.00 天", report_text)
             self.assertIn("中位数历时：2.00 天", report_text)
-            self.assertIn("确认做多 -> 兑现池：样本 1 条，平均 3.00 天", report_text)
-            self.assertIn("试探建仓 -> 兑现池：样本 1 条，平均 1.00 天", report_text)
+            self.assertIn("确认做多 -> 持仓管理退出：样本 1 条，平均 3.00 天", report_text)
+            self.assertIn("试探建仓 -> 持仓管理退出：样本 1 条，平均 1.00 天", report_text)
             self.assertIn("最快样本：META（试探建仓），1.00 天", report_text)
             self.assertIn("最慢样本：NVDA（确认做多），3.00 天", report_text)
             self.assertIn("代表样本（最近3条）：", report_text)
-            self.assertIn("- 2026-03-16 22:00 | META | 试探建仓 -> 兑现池退出（含达标止盈 / 提前锁盈 / 宏观保护） | 历时 1.00 天 | 真实收益 6.47%", report_text)
-            self.assertIn("- 2026-03-14 22:00 | NVDA | 确认做多 -> 兑现池退出（含达标止盈 / 提前锁盈 / 宏观保护） | 历时 3.00 天 | 真实收益 10.89%", report_text)
+            self.assertIn("- 2026-03-16 22:00 | META | 试探建仓 -> 利润保护退出 | 历时 1.00 天 | 真实收益 6.47%", report_text)
+            self.assertIn("- 2026-03-14 22:00 | NVDA | 确认做多 -> 利润保护退出 | 历时 3.00 天 | 真实收益 10.89%", report_text)
             self.assertIn("收益最好轨迹样本：", report_text)
             self.assertIn("收益最差轨迹样本：", report_text)
 
@@ -1604,10 +1604,10 @@ class ReportingTests(unittest.TestCase):
                 [
                     (
                         "run-review",
-                        "prewatch-notify:AAA:position",
-                        "prewatch-notify:AAA:1",
+                        "candidate-notify:AAA:position",
+                        "candidate-notify:AAA:1",
                         "AAA",
-                        "prewatch-notify:AAA:1",
+                        "candidate-notify:AAA:1",
                         "position",
                         "suppressed",
                         79.0,
@@ -1618,10 +1618,10 @@ class ReportingTests(unittest.TestCase):
                     ),
                     (
                         "run-review",
-                        "prewatch-notify:BBB:position",
-                        "prewatch-notify:BBB:1",
+                        "candidate-notify:BBB:position",
+                        "candidate-notify:BBB:1",
                         "BBB",
-                        "prewatch-notify:BBB:1",
+                        "candidate-notify:BBB:1",
                         "position",
                         "suppressed",
                         78.0,
@@ -1778,31 +1778,31 @@ class ReportingTests(unittest.TestCase):
             self.assertEqual(review["observation_after_summary"]["still_observing_symbol_count"], 1)
             self.assertAlmostEqual(review["observation_after_summary"]["avg_days_to_confirmation"], 1.0, places=2)
             self.assertIn("三池漏斗：", report_text)
-            self.assertIn("预备池候选：3 条", report_text)
-            self.assertIn("观察提醒：2 条（观察 -> 观察提醒转化率：66.67%）", report_text)
-            self.assertIn("确认机会：2 条（观察 -> 确认机会转化率：66.67%）", report_text)
-            self.assertIn("观察提醒后确认机会：1 条（观察提醒 -> 确认机会转化率：50.00%）", report_text)
-            self.assertIn("另有 1 条未经过观察提醒，直接从观察进入确认机会。", report_text)
-            self.assertIn("进入兑现池：1 条（确认机会 -> 兑现转化率：50.00%）", report_text)
+            self.assertIn("第一池候选：3 条", report_text)
+            self.assertIn("观察卡：2 条（候选 -> 观察卡转化率：66.67%）", report_text)
+            self.assertIn("确认机会：2 条（候选 -> 确认机会转化率：66.67%）", report_text)
+            self.assertIn("观察卡后确认机会：1 条（观察卡 -> 确认机会转化率：50.00%）", report_text)
+            self.assertIn("另有 1 条未经过观察卡，直接从候选进入确认机会。", report_text)
+            self.assertIn("进入持仓管理退出：1 条（确认机会 -> 持仓管理退出转化率：50.00%）", report_text)
             self.assertIn("最近新增观察样本：", report_text)
             self.assertIn("- 2026-03-16 22:00 | CCC | 仅后台观察 | 已形成确认机会", report_text)
-            self.assertIn("预备池 74.00 分 / 结构预热", report_text)
+            self.assertIn("候选池 74.00 分 / 结构预热", report_text)
             self.assertIn("观察后表现：", report_text)
             self.assertIn("观察样本：3 条", report_text)
             self.assertIn("观察 -> 确认：平均 1.00 天，中位数 1.00 天", report_text)
             self.assertIn("- 2026-03-16 22:00 | AAA | 确认做多", report_text)
             self.assertIn("完整模拟闭环：", report_text)
-            self.assertIn("观察：3 条", report_text)
+            self.assertIn("候选：3 条", report_text)
             self.assertIn("模拟成交：2 条（确认机会 -> 模拟成交转化率：100.00%）", report_text)
-            self.assertIn("进入兑现池：1 条（模拟成交 -> 进入兑现池转化率：50.00%）", report_text)
+            self.assertIn("进入持仓管理退出：1 条（模拟成交 -> 持仓管理退出转化率：50.00%）", report_text)
             self.assertIn("模拟退出完成：1 条（模拟成交 -> 模拟退出完成率：50.00%）", report_text)
             self.assertIn("确认机会 -> 模拟成交：平均等待 0.00 天，中位数 0.00 天", report_text)
             self.assertIn("模拟成交 -> 模拟退出完成：平均持有 2.00 天，中位数 2.00 天", report_text)
             self.assertIn("按动作看成交等待：确认做多：样本 1 条，平均等待 0.00 天，中位数 0.00 天", report_text)
             self.assertIn("按动作看成交等待：试探建仓：样本 1 条，平均等待 0.00 天，中位数 0.00 天", report_text)
             self.assertIn("按动作看持有时长：确认做多：样本 1 条，平均持有 2.00 天，中位数 2.00 天", report_text)
-            self.assertIn("另有 1 条已模拟成交，但当前仍在持有观察中。", report_text)
-            self.assertIn("其中：兑现池 1 条", report_text)
+            self.assertIn("另有 1 条已模拟成交，但当前仍在持仓中。", report_text)
+            self.assertIn("其中：利润保护退出 1 条", report_text)
 
     def test_historical_effect_review_summarizes_candidate_evaluation_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1903,7 +1903,7 @@ class ReportingTests(unittest.TestCase):
             self.assertEqual(confirmation_summary["error_count"], 1)
             self.assertEqual(confirmation_summary["top_error_reasons"][0]["label"], "评分失败（ValueError）")
             self.assertIn("候选诊断：", report_text)
-            self.assertIn("预备池：共 3 条，进入观察 1 条，未入选 1 条，拒绝 1 条，异常 0 条。", report_text)
+            self.assertIn("第一池：候选池：共 3 条，进入观察 1 条，未入选 1 条，拒绝 1 条，异常 0 条。", report_text)
             self.assertIn("主要未通过原因：低于观察阈值 1 条 / 排在本轮候选上限之外 1 条", report_text)
             self.assertIn("确认机会：共 3 条，形成确认机会 1 条，未入选 0 条，拒绝 1 条，异常 1 条。", report_text)
             self.assertIn("主要未通过原因：未达到确认阈值 1 条", report_text)
@@ -2008,7 +2008,7 @@ class ReportingTests(unittest.TestCase):
             self.assertEqual(trend["prewatch"]["reason_trends"][0]["baseline_count"], 3)
             self.assertEqual(trend["confirmation"]["reason_trends"][0]["label"], "未达到确认阈值")
             self.assertIn("候选诊断趋势：", report_text)
-            self.assertIn("预备池：近 7 天 2 条，当前窗口 30 天 4 条。", report_text)
+            self.assertIn("第一池：候选池：近 7 天 2 条，当前窗口 30 天 4 条。", report_text)
             self.assertIn("低于观察阈值：近 7 天 2 条，30 天 3 条", report_text)
             self.assertIn("确认机会：近 7 天 1 条，当前窗口 30 天 2 条。", report_text)
             self.assertIn("未达到确认阈值：近 7 天 1 条，30 天 1 条", report_text)
@@ -2276,7 +2276,7 @@ class ReportingTests(unittest.TestCase):
         self.assertEqual(report["decision_outcomes_by_pool"][1]["readiness_label"], "渐进确认")
         self.assertIn("事件侧较可用分组：earnings（渐进确认）、guidance（渐进确认）。", report["outcome_readiness"]["line_items"])
         self.assertIn("事件排序可渐进参考：财报、指引，适合小步提高排序权重。", report["outcome_readiness_actions"]["line_items"])
-        self.assertIn("确认池排序可渐进参考：确认池、预备池，适合先作为辅助排序信号。", report["outcome_readiness_actions"]["line_items"])
+        self.assertIn("确认池排序可渐进参考：第二池：确认池、第一池：候选池，适合先作为辅助排序信号。", report["outcome_readiness_actions"]["line_items"])
         self.assertEqual(
             report["outcome_headline"]["summary"],
             "积累期下优先动作：事件排序可渐进参考：财报、指引，适合小步提高排序权重。",
@@ -2288,7 +2288,7 @@ class ReportingTests(unittest.TestCase):
         )
         self.assertEqual(
             report["outcome_priority_list"]["line_items"][1],
-            "P2 确认池排序可渐进参考：确认池、预备池，适合先作为辅助排序信号。",
+            "P2 确认池排序可渐进参考：第二池：确认池、第一池：候选池，适合先作为辅助排序信号。",
         )
 
     def test_serialize_strategy_report_validation_flags_top_slice_without_warning(self) -> None:
@@ -2710,6 +2710,7 @@ class ReportingTests(unittest.TestCase):
                 replay_payload["source_health"],
                 replay_payload["card_diagnostics"],
                 replay_payload.get("decision_diagnostics", []),
+                replay_payload.get("cycle_audit"),
             )
             review_text = format_run_review(
                 replay_payload["run"],
@@ -2724,6 +2725,7 @@ class ReportingTests(unittest.TestCase):
                 replay_payload["source_health"],
                 replay_payload["card_diagnostics"],
                 replay_payload.get("decision_diagnostics", []),
+                replay_payload.get("cycle_audit"),
             )
             store.record_run(
                 run_id="run-2",
@@ -2789,7 +2791,7 @@ class ReportingTests(unittest.TestCase):
             self.assertIn("Strongest event outcome so far: earnings avg_t3=4.2 with 1 outcomes.", strategy_text)
             self.assertIn("Best pool so far: confirmation avg_t3=4.2 with 1 outcomes.", strategy_text)
             self.assertIn("Outcome support is still thin, so any event or pool preference should be treated as provisional.", strategy_text)
-            self.assertIn("当前更适合观察和观察提醒，而不是把后验结果直接翻译成强执行动作。", strategy_text)
+            self.assertIn("当前更适合候选观察和观察卡，而不是把后验结果直接翻译成强执行动作。", strategy_text)
             self.assertIn("Lean more on earnings while it keeps the best average T+3 return (4.2).", strategy_text)
             self.assertIn("Keep confirmation as the cleaner downstream pool; its average T+3 return is 4.2.", strategy_text)
             self.assertIn("Completed windows are still too few to justify a strong directional tilt.", strategy_text)
@@ -2799,7 +2801,7 @@ class ReportingTests(unittest.TestCase):
             self.assertIn("事件侧仍偏观察分组：earnings（轻度参考）。", strategy_text)
             self.assertIn("池子侧仍偏观察分组：confirmation（轻度参考）。", strategy_text)
             self.assertIn("仍以观察为主的事件：财报。", strategy_text)
-            self.assertIn("仍以观察为主的池子：确认池。", strategy_text)
+            self.assertIn("仍以观察为主的池子：第二池：确认池。", strategy_text)
             self.assertEqual(strategy_json["event_type_performance"][0]["event_type"], "earnings")
             self.assertEqual(strategy_json["alert_volume"][0]["high_priority_alerts"], 1)
             self.assertEqual(strategy_json["decision_outcomes_by_event_type"][0]["event_type"], "earnings")
@@ -2827,38 +2829,39 @@ class ReportingTests(unittest.TestCase):
             self.assertEqual(strategy_json["outcome_headline"]["summary"], "观察期下优先动作：仍以观察为主的事件：财报。")
             self.assertEqual(strategy_json["outcome_priority_list"]["line_items"][0], "P1 仍以观察为主的事件：财报。")
             self.assertIn("Replay Evaluation", replay_text)
-            self.assertIn("Prewatch Candidates", replay_text)
+            self.assertIn("Candidate Pool", replay_text)
             self.assertIn("NBIS", replay_text)
             self.assertIn("Card Diagnostics", replay_text)
             self.assertIn("Decision Diagnostics", replay_text)
+            self.assertIn("Cycle Audit", replay_text)
             self.assertIn("Outcome Context:", replay_text)
             self.assertIn("baseline", replay_text)
             self.assertIn("Started: 2026-03-14 22:00", replay_text)
-            self.assertIn("预备池：", review_text)
+            self.assertIn("第一池：候选池：", review_text)
             self.assertIn("NBIS / 波段 / 突破预热", review_text)
-            self.assertIn("观察提醒：", review_text)
+            self.assertIn("观察卡：", review_text)
             self.assertIn("决策记录：", review_text)
             self.assertIn("确认做多", review_text)
-            self.assertIn("历史后验背景：事件 earnings 近期待回写 0 条，T+3 均值 4.2，已回写 1 条；池子 确认池 T+3 均值 4.2，止盈 1 条。", review_text)
+            self.assertIn("历史后验背景：事件 earnings 近期待回写 0 条，T+3 均值 4.2，已回写 1 条；池子 第二池：确认池 T+3 均值 4.2，止盈 1 条。", review_text)
             self.assertNotIn("后验结果概览：", review_text)
             self.assertNotIn("后验建议：", review_text)
             self.assertNotIn("策略倾向：", review_text)
             self.assertIn("确认机会：", review_text)
             self.assertIn("NVDA / 交易周期：短线（1-7个交易日） / 财报事件 / 高优先级", review_text)
-            self.assertIn("形成原因：此前处于突破预热预备状态（81.50 分），本轮事件达到确认条件。", review_text)
-            self.assertIn("确认机会链路：预备池阶段累计观察 3 次", review_text)
-            self.assertIn("观察轨迹：累计观察 3 次，观察提醒 1 次（首次 2026-03-12 22:00 / 最近 2026-03-14 22:00）", review_text)
-            self.assertIn("预备池来源决策：decision-prewatch-1", review_text)
-            self.assertIn("阶段：预备池 -> 确认机会（突破预热 / 预备池 81.50 分）", review_text)
+            self.assertIn("形成原因：此前处于突破预热候选状态（81.50 分），本轮事件达到确认条件。", review_text)
+            self.assertIn("确认机会链路：此前已进入候选池，近72h进入候选池 3 次", review_text)
+            self.assertIn("观察轨迹：累计观察 3 次，观察卡 1 次（首次 2026-03-12 22:00 / 最近 2026-03-14 22:00）", review_text)
+            self.assertIn("候选池来源决策：decision-prewatch-1", review_text)
+            self.assertIn("阶段：第一池：候选池 -> 第二池：确认池（突破预热 / 候选池 81.50 分）", review_text)
             self.assertIn("仓位提示：可从观察仓提升到主交易仓位，优先等待盘中回踩确认。", review_text)
             self.assertIn("事件解读：财报事件：AI 需求改善带动 NVDA 进入确认阶段。", review_text)
             self.assertIn("题材解读：题材：AI芯片与半导体设备", review_text)
             self.assertIn("题材链路：", review_text)
             self.assertIn("AI芯片与半导体设备 / 热度 8", review_text)
             self.assertIn("确认池：NVDA", review_text)
-            self.assertIn("预备池：NBIS", review_text)
+            self.assertIn("第一池：候选池：NBIS", review_text)
             self.assertIn("题材：AI芯片与半导体设备", review_text)
-            self.assertIn("本轮状态 成功，健康判断为 阻塞；共处理 2 个事件，生成 4 张卡片，发送 1 条提醒，识别 1 个预备池候选，并发出 1 条观察提醒。", review_text)
+            self.assertIn("本轮状态 成功，健康判断为 阻塞；共处理 2 个事件，生成 4 张卡片，发送 1 条提醒，识别 1 个候选池标的，并发出 1 张观察卡。", review_text)
             self.assertEqual(replay_json["run"]["run_id"], "run-1")
             self.assertEqual(replay_json["run"]["run_name"], "baseline")
             self.assertEqual(replay_json["prewatch_candidates"][0]["symbol"], "NBIS")
@@ -2866,6 +2869,8 @@ class ReportingTests(unittest.TestCase):
             self.assertEqual(replay_json["alert_suppression_summary"]["total_cards"], 1)
             self.assertIn("parameter_checklist", replay_json["alert_suppression_summary"])
             self.assertEqual(replay_json["decision_diagnostics"][0]["symbol"], "NVDA")
+            self.assertIn("cycle_audit", replay_json)
+            self.assertGreaterEqual(replay_json["cycle_audit"]["symbol_count"], 1)
             self.assertEqual(replay_json["decision_diagnostics"][0]["prewatch_observation_count"], 3)
             self.assertEqual(replay_json["decision_diagnostics"][0]["source_decision_id"], "decision-prewatch-1")
             self.assertEqual(replay_json["decision_diagnostics"][0]["event_type_outcome_context"]["avg_t_plus_3_return"], 4.2)
@@ -4245,7 +4250,7 @@ class ReportingTests(unittest.TestCase):
             self.assertTrue(Path(payload["replay"]["payload_path"]).exists())
             self.assertTrue(Path(payload["preview"]["report_path"]).exists())
             self.assertTrue(Path(payload["preview"]["payload_path"]).exists())
-            self.assertEqual(payload["preview"]["mode_count"], 5)
+            self.assertEqual(payload["preview"]["mode_count"], 4)
             self.assertTrue(Path(payload["batch"]["manifest_path"]).exists())
             self.assertTrue(Path(payload["batch"]["report_path"]).exists())
             self.assertTrue(Path(payload["batch"]["index_path"]).exists())
@@ -4253,21 +4258,25 @@ class ReportingTests(unittest.TestCase):
             copied_spec = json.loads(Path(payload["batch"]["spec_path"]).read_text(encoding="utf-8"))
             self.assertEqual(copied_spec["replay_path"], str(replay_path.resolve()))
             preview_payload = json.loads(Path(payload["preview"]["payload_path"]).read_text(encoding="utf-8"))
-            self.assertEqual(len(preview_payload["items"]), 5)
-            self.assertEqual(preview_payload["items"][1]["mode_name"], "formal_downgraded")
-            self.assertEqual(preview_payload["items"][1]["mode_label"], "自动降级观察卡")
-            self.assertEqual(preview_payload["items"][-1]["mode_name"], "exit_pool")
-            self.assertEqual(preview_payload["items"][0]["mode_label"], "正式操作卡")
+            self.assertEqual(len(preview_payload["items"]), 4)
+            self.assertEqual(
+                [item["mode_name"] for item in preview_payload["items"]],
+                ["formal", "watch", "candidate_optional", "holding_management"],
+            )
+            self.assertEqual(preview_payload["items"][1]["mode_name"], "watch")
+            self.assertEqual(preview_payload["items"][1]["mode_label"], "观察卡")
+            self.assertEqual(preview_payload["items"][-1]["mode_name"], "holding_management")
+            self.assertEqual(preview_payload["items"][0]["mode_label"], "正式卡")
             self.assertIn("render_view", preview_payload["items"][0])
             self.assertIn("card_type", preview_payload["items"][0]["render_view"])
             self.assertIn("适合结合价格计划做执行判断", preview_payload["items"][0]["use_case"])
-            self.assertEqual(preview_payload["items"][-1]["mode_label"], "兑现池管理卡")
+            self.assertEqual(preview_payload["items"][-1]["mode_label"], "退出卡")
             self.assertIn("不适合当成新的开仓信号", preview_payload["items"][-1]["not_for"])
             preview_report = Path(payload["preview"]["report_path"]).read_text(encoding="utf-8")
             self.assertIn("最终卡型：", preview_report)
             self.assertIn("最终动作：", preview_report)
-            self.assertIn("自动降级：", preview_report)
-            self.assertIn("自动降级观察卡", preview_report)
+            self.assertNotIn("自动降级：", preview_report)
+            self.assertNotIn("自动降级观察卡", preview_report)
             self.assertIn("适用场景：", preview_report)
             self.assertIn("不适用场景：", preview_report)
             self.assertIn("使用提示：", preview_report)
@@ -4293,7 +4302,7 @@ class ReportingTests(unittest.TestCase):
             output = stdout.getvalue()
             self.assertIn("初版流程联调", output)
             self.assertIn("卡片预览：", output)
-            self.assertIn("预览模式数：5", output)
+            self.assertIn("预览模式数：4", output)
             self.assertIn("Batch 推荐：baseline", output)
             self.assertIn("推荐配置：", output)
 
@@ -4758,7 +4767,6 @@ class ReportingTests(unittest.TestCase):
                     mocked_preview.return_value = {
                         "symbol": "NVDA",
                         "watch_mode": False,
-                        "degraded_formal_mode": False,
                         "llm_enabled": True,
                         "llm_used": True,
                         "render_view": {
@@ -4780,11 +4788,53 @@ class ReportingTests(unittest.TestCase):
         self.assertIn("本地预览卡片", output)
         self.assertIn("最终卡型：formal", output)
         self.assertIn("最终动作：确认做多", output)
-        self.assertIn("自动降级：否", output)
+        self.assertNotIn("自动降级：", output)
         self.assertIn("LLM 实际参与：是", output)
         self.assertIn("测试摘要", output)
 
-    def test_preview_alert_render_cli_supports_prewatch_light_mode(self) -> None:
+    def test_preview_alert_render_cli_supports_candidate_optional_light_mode(self) -> None:
+        stdout = io.StringIO()
+        argv = [
+            "satellite-agent",
+            "preview-alert-render",
+            "--symbol",
+            "NBIS",
+            "--candidate-optional-light",
+        ]
+        with patch.object(sys, "argv", argv):
+            with patch("sys.stdout", stdout):
+                with patch("satellite_agent.main.build_preview_alert_payload") as mocked_preview:
+                    mocked_preview.return_value = {
+                        "symbol": "NBIS",
+                        "watch_mode": False,
+                        "candidate_optional_light": True,
+                        "prewatch_light": True,
+                        "llm_enabled": True,
+                        "llm_used": True,
+                        "render_view": {
+                            "card_type": "watch",
+                            "action_label": "加入观察",
+                            "downgraded_to_watch": False,
+                            "downgrade_reason": "",
+                            "render_warning": "",
+                            "chain_summary": "昨晚加入观察 -> 今日继续跟踪",
+                        },
+                        "title": "[候选池] Nebius（NBIS） | 加入观察 | 战略合作",
+                        "body": "事实摘要：测试轻推摘要\n为什么现在先观察：测试轻推理由",
+                        "delivery_view": {},
+                        "feishu_card": {},
+                    }
+                    main()
+
+        _, kwargs = mocked_preview.call_args
+        self.assertTrue(kwargs["candidate_optional_light"])
+        self.assertTrue(kwargs["candidate_optional_mode"])
+        output = stdout.getvalue()
+        self.assertIn("模式：观察卡", output)
+        self.assertIn("最终卡型：watch", output)
+        self.assertIn("测试轻推摘要", output)
+
+    def test_preview_alert_render_cli_keeps_prewatch_light_as_compat_alias(self) -> None:
         stdout = io.StringIO()
         argv = [
             "satellite-agent",
@@ -4799,8 +4849,8 @@ class ReportingTests(unittest.TestCase):
                     mocked_preview.return_value = {
                         "symbol": "NBIS",
                         "watch_mode": False,
+                        "candidate_optional_light": True,
                         "prewatch_light": True,
-                        "degraded_formal_mode": False,
                         "llm_enabled": True,
                         "llm_used": True,
                         "render_view": {
@@ -4811,16 +4861,18 @@ class ReportingTests(unittest.TestCase):
                             "render_warning": "",
                             "chain_summary": "昨晚加入观察 -> 今日继续跟踪",
                         },
-                        "title": "[预备池] Nebius（NBIS） | 加入观察 | 战略合作",
+                        "title": "[候选池] Nebius（NBIS） | 加入观察 | 战略合作",
                         "body": "事实摘要：测试轻推摘要\n为什么现在先观察：测试轻推理由",
                         "delivery_view": {},
                         "feishu_card": {},
                     }
                     main()
 
+        _, kwargs = mocked_preview.call_args
+        self.assertTrue(kwargs["candidate_optional_light"])
+        self.assertTrue(kwargs["candidate_optional_mode"])
         output = stdout.getvalue()
-        self.assertIn("模式：观察提醒", output)
-        self.assertIn("最终卡型：watch", output)
+        self.assertIn("模式：观察卡", output)
         self.assertIn("测试轻推摘要", output)
 
     def test_preview_alert_render_cli_supports_exit_pool_mode(self) -> None:
@@ -4840,70 +4892,29 @@ class ReportingTests(unittest.TestCase):
                         "watch_mode": False,
                         "prewatch_light": False,
                         "exit_pool_mode": True,
-                        "degraded_formal_mode": False,
                         "llm_enabled": True,
                         "llm_used": True,
                         "render_view": {
                             "card_type": "exit",
-                            "action_label": "进入兑现池",
+                            "action_label": "利润保护退出",
                             "downgraded_to_watch": False,
                             "downgrade_reason": "",
                             "render_warning": "",
-                            "chain_summary": "3天前确认做多 -> 今日进入兑现池",
+                            "chain_summary": "3天前确认做多 -> 今日利润保护退出",
                         },
-                        "title": "NVIDIA（NVDA） | 进入兑现池 | 战略合作",
-                        "body": "为什么进入兑现池：测试退出理由\n来源链路：3天前确认做多 -> 今日进入兑现池",
+                        "title": "NVIDIA（NVDA） | 利润保护退出 | 战略合作",
+                        "body": "为什么触发退出：测试退出理由\n来源链路：3天前确认做多 -> 今日利润保护退出",
                         "delivery_view": {},
                         "feishu_card": {},
                     }
                     main()
 
         output = stdout.getvalue()
-        self.assertIn("模式：兑现池管理卡", output)
+        self.assertIn("模式：退出卡", output)
         self.assertIn("最终卡型：exit", output)
         self.assertIn("测试退出理由", output)
         self.assertIn("来源链路", output)
 
-    def test_preview_alert_render_cli_supports_formal_downgraded_mode(self) -> None:
-        stdout = io.StringIO()
-        argv = [
-            "satellite-agent",
-            "preview-alert-render",
-            "--symbol",
-            "AMD",
-            "--formal-downgraded",
-        ]
-        with patch.object(sys, "argv", argv):
-            with patch("sys.stdout", stdout):
-                with patch("satellite_agent.main.build_preview_alert_payload") as mocked_preview:
-                    mocked_preview.return_value = {
-                        "symbol": "AMD",
-                        "watch_mode": False,
-                        "prewatch_light": False,
-                        "exit_pool_mode": False,
-                        "degraded_formal_mode": True,
-                        "llm_enabled": True,
-                        "llm_used": True,
-                        "render_view": {
-                            "card_type": "watch",
-                            "action_label": "加入观察",
-                            "downgraded_to_watch": True,
-                            "downgrade_reason": "降级观察：盈亏比不足",
-                            "render_warning": "formal_render_conflict_auto_downgraded",
-                            "chain_summary": "今日试探建仓 -> 今日确认做多",
-                        },
-                        "title": "AMD | 加入观察 | 财报事件",
-                        "body": "降级原因：降级观察：盈亏比不足\n为什么现在先观察：测试降级理由",
-                        "delivery_view": {},
-                        "feishu_card": {},
-                    }
-                    main()
-
-        output = stdout.getvalue()
-        self.assertIn("模式：自动降级观察卡", output)
-        self.assertIn("最终卡型：watch", output)
-        self.assertIn("自动降级：是", output)
-        self.assertIn("降级观察：盈亏比不足", output)
 
     def test_run_once_writes_latest_live_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

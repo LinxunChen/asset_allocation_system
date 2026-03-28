@@ -230,30 +230,37 @@ def summarize_symbol_theme_context(
     symbol_theme_map: dict[str, list[str]],
     theme_memberships: dict[str, set[str]] | None = None,
     confirmed_symbols: set[str] | None = None,
+    candidate_symbols: set[str] | None = None,
     prewatch_symbols: set[str] | None = None,
 ) -> dict[str, Any]:
     normalized_symbol = symbol.upper()
     memberships = theme_memberships or build_theme_memberships(symbol_theme_map)
     confirmed = {item.upper() for item in (confirmed_symbols or set())}
-    prewatch = {item.upper() for item in (prewatch_symbols or set())}
+    candidate_pool = {
+        item.upper() for item in (candidate_symbols if candidate_symbols is not None else (prewatch_symbols or set()))
+    }
     theme_keys = list(symbol_theme_map.get(normalized_symbol, []))
     peer_symbols: set[str] = set()
     confirmed_peer_symbols: set[str] = set()
-    prewatch_peer_symbols: set[str] = set()
+    candidate_peer_symbols: set[str] = set()
     for theme_key in theme_keys:
         theme_members = memberships.get(theme_key, set())
         peers = {item for item in theme_members if item != normalized_symbol}
         peer_symbols.update(peers)
         confirmed_peer_symbols.update(item for item in peers if item in confirmed)
-        prewatch_peer_symbols.update(item for item in peers if item in prewatch)
+        candidate_peer_symbols.update(item for item in peers if item in candidate_pool)
     return {
         "theme_keys": theme_keys,
         "peer_symbols": sorted(peer_symbols),
         "confirmed_peer_symbols": sorted(confirmed_peer_symbols),
-        "prewatch_peer_symbols": sorted(prewatch_peer_symbols),
+        "candidate_peer_symbols": sorted(candidate_peer_symbols),
+        "candidate_pool_peer_symbols": sorted(candidate_peer_symbols),
+        "prewatch_peer_symbols": sorted(candidate_peer_symbols),
         "peer_count": len(peer_symbols),
         "confirmed_peer_count": len(confirmed_peer_symbols),
-        "prewatch_peer_count": len(prewatch_peer_symbols),
+        "candidate_peer_count": len(candidate_peer_symbols),
+        "candidate_pool_peer_count": len(candidate_peer_symbols),
+        "prewatch_peer_count": len(candidate_peer_symbols),
     }
 
 
@@ -265,7 +272,7 @@ def build_theme_snapshot_rows(
     prewatch_candidates: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     theme_rows: dict[str, dict[str, Any]] = {}
-    prewatch_by_symbol = {str(row.get("symbol", "")).upper() for row in prewatch_candidates}
+    candidate_pool_candidates = prewatch_candidates
 
     def ensure_theme_row(theme_key: str) -> dict[str, Any]:
         row = theme_rows.get(theme_key)
@@ -276,6 +283,7 @@ def build_theme_snapshot_rows(
                 "confirmed_symbols": set(),
                 "promoted_symbols": set(),
                 "sent_symbols": set(),
+                "candidate_pool_symbols": set(),
                 "prewatch_symbols": set(),
                 "high_priority_symbols": set(),
             }
@@ -301,12 +309,13 @@ def build_theme_snapshot_rows(
             if row.get("priority") == "high":
                 bucket["high_priority_symbols"].add(symbol)
 
-    for row in prewatch_candidates:
+    for row in candidate_pool_candidates:
         symbol = str(row.get("symbol", "")).upper()
         if not symbol:
             continue
         for theme_key in symbol_theme_map.get(symbol, []):
             bucket = ensure_theme_row(theme_key)
+            bucket["candidate_pool_symbols"].add(symbol)
             bucket["prewatch_symbols"].add(symbol)
 
     ranked: list[dict[str, Any]] = []
@@ -314,15 +323,15 @@ def build_theme_snapshot_rows(
         confirmed = sorted(row["confirmed_symbols"])
         promoted = sorted(row["promoted_symbols"])
         sent = sorted(row["sent_symbols"])
-        prewatch = sorted(row["prewatch_symbols"])
+        candidate_pool = sorted(row["candidate_pool_symbols"])
         high_priority = sorted(row["high_priority_symbols"])
-        heat_score = len(promoted) * 3 + len(sent) * 2 + len(confirmed) * 2 + len(prewatch)
-        if confirmed and prewatch:
-            chain_note = "已有确认标的，同时同题材仍有预备池候选，适合跟踪扩散。"
+        heat_score = len(promoted) * 3 + len(sent) * 2 + len(confirmed) * 2 + len(candidate_pool)
+        if confirmed and candidate_pool:
+            chain_note = "已有确认标的，同时同题材仍有候选池标的，适合跟踪扩散。"
         elif confirmed:
             chain_note = "已有确认信号，可回看同题材是否存在补涨机会。"
-        elif len(prewatch) >= 2:
-            chain_note = "同题材多标的进入预备池，题材预热正在形成。"
+        elif len(candidate_pool) >= 2:
+            chain_note = "同题材多标的进入候选池，题材预热正在形成。"
         else:
             chain_note = "暂处于单点预热阶段，适合继续观察是否形成共振。"
         ranked.append(
@@ -333,9 +342,11 @@ def build_theme_snapshot_rows(
                 "confirmed_symbols": confirmed,
                 "promoted_symbols": promoted,
                 "sent_symbols": sent,
-                "prewatch_symbols": prewatch,
+                "candidate_pool_symbols": candidate_pool,
+                "prewatch_symbols": candidate_pool,
                 "high_priority_symbols": high_priority,
-                "prewatch_only_symbols": [symbol for symbol in prewatch if symbol not in confirmed],
+                "candidate_pool_only_symbols": [symbol for symbol in candidate_pool if symbol not in confirmed],
+                "prewatch_only_symbols": [symbol for symbol in candidate_pool if symbol not in confirmed],
                 "chain_note": chain_note,
             }
         )
@@ -343,14 +354,14 @@ def build_theme_snapshot_rows(
         key=lambda row: (
             -row["heat_score"],
             -len(row["confirmed_symbols"]),
-            -len(row["prewatch_symbols"]),
+            -len(row["candidate_pool_symbols"]),
             row["theme_name"],
         )
     )
     return ranked
 
 
-def build_prewatch_peer_map(
+def build_candidate_pool_peer_map(
     candidates: list[dict[str, Any]],
     symbol_theme_map: dict[str, list[str]],
 ) -> dict[str, list[str]]:
@@ -373,3 +384,10 @@ def build_prewatch_peer_map(
         if peers:
             peer_map[symbol] = peers
     return peer_map
+
+
+def build_prewatch_peer_map(
+    candidates: list[dict[str, Any]],
+    symbol_theme_map: dict[str, list[str]],
+) -> dict[str, list[str]]:
+    return build_candidate_pool_peer_map(candidates, symbol_theme_map)

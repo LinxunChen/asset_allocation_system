@@ -1,95 +1,102 @@
-# Satellite Agent
+# 卫星仓位 Agent
 
-这是当前仓库里已经真正落地并持续运行的 agent。
+最后更新：2026-03-28
 
-这个 `README.md` 只负责卫星仓位 agent 自己的入口说明；仓库级导航仍以根目录 [README.md](/Users/chenxi/CodeSpace/asset_allocation_system/README.md) 为准。
+`satellite_agent` 是一个面向股票与 ETF 观察池的机会发现与执行辅助系统。
 
-## 你最常看的文档
+它的目标不是自动下单，而是把“关注名单里的事件、结构和风险”整理成一条更清晰的决策链，帮助使用者完成三件事：
 
-- 交接文档：[HANDOFF.md](/Users/linxun/CodeSpace/asset_allocation_system/docs/satellite_agent/HANDOFF.md)
-- 常用命令速查：[commands.zh-CN.md](/Users/chenxi/CodeSpace/asset_allocation_system/docs/satellite_agent/commands.zh-CN.md)
-- 决策链路说明：[decision_logic.zh-CN.md](/Users/linxun/CodeSpace/asset_allocation_system/docs/satellite_agent/decision_logic.zh-CN.md)
-- 评分体系说明：[scoring_guide.zh-CN.md](/Users/linxun/CodeSpace/asset_allocation_system/docs/satellite_agent/scoring_guide.zh-CN.md)
+- 更早发现值得继续跟踪的机会
+- 在结构和催化同时到位时给出正式动作建议
+- 在已经进场后，把判断切换到持仓管理和退出提醒
+
+## 它解决什么问题
+
+很多资讯系统只能做到“把新闻推过来”，但很难回答这些更接近真实交易的问题：
+
+- 这条消息到底值不值得继续跟踪
+- 现在只是先观察，还是已经可以正式出手
+- 已经进场后，后面应该继续持有、保护利润，还是退出
+
+`satellite_agent` 的做法不是把所有内容混成一个黑盒分数，而是把决策拆成三池流转和一个后验复盘闭环。
+
+## 主链路
+
+系统的对外主骨架可以概括成：
+
+1. 在关注名单内持续发现事件和扫描行情
+2. 做归池判断
+3. 进入三池中的某一层
+4. 对正式机会做成交后的持仓管理
+5. 把整个过程写入复盘与审计
+
+三池分工是：
+
+- 第一池 `candidate_pool`
+  候选池。值得继续跟踪，但暂时不适合正式出手。
+- 第二池 `confirmation`
+  确认池。消息和盘面都支持，适合给出正式机会卡。
+- 第三池 `holding_management`
+  持仓管理。已经成交后，统一处理止盈、失效、窗口到期等退出逻辑。
+
+如果你想看更直观的系统骨架图，直接打开：
+
+- [satellite_agent_flow.html](/Users/chenxi/CodeSpace/asset_allocation_system/docs/satellite_agent/satellite_agent_flow.html)
+
+## 系统输出什么
+
+当前系统会持续产出这些东西：
+
+- 候选池记录
+- 正式机会卡
+- 持仓管理 / 退出卡
+- 运行复盘
+- 历史效果复盘
+- 状态机审计
+
+其中要特别说明两点：
+
+- 历史效果复盘默认是“单笔决策复盘”，不是把整条动作链揉成一笔收益故事
+- 状态机审计用于排查系统流程是否正确，不直接参与策略绩效评价
+
+## 它不做什么
+
+当前版本不直接负责：
+
+- 自动下单
+- 真实账户仓位账本
+- 全市场无约束扫描
+- 用单一黑盒模型完全替代人工理解
+
+它更像一个“围绕关注名单持续工作的交易助手”，而不是全自动交易系统。
+
+## 当前项目重点
+
+当前代码主线已经收口到：
+
+- 三池闭环
+- 活跃周期状态机
+- 单笔决策复盘
+- 状态机审计
+
+接下来更值得继续投入的方向主要是：
+
+- 用真实样本验证状态机边界
+- 校准第三池退出规则
+- 降低候选池噪声
+
+## 从哪里继续看
+
+如果你是第一次看这个项目，建议顺序是：
+
+1. 先看这份 [README.md](/Users/chenxi/CodeSpace/asset_allocation_system/docs/satellite_agent/README.md)
+2. 再看 [satellite_agent_flow.html](/Users/chenxi/CodeSpace/asset_allocation_system/docs/satellite_agent/satellite_agent_flow.html)
+3. 想理解长期边界时，看 [design_principles.zh-CN.md](/Users/chenxi/CodeSpace/asset_allocation_system/docs/satellite_agent/design_principles.zh-CN.md)
+4. 想实际运行或排查时，看 [usage_guide.zh-CN.md](/Users/chenxi/CodeSpace/asset_allocation_system/docs/satellite_agent/usage_guide.zh-CN.md)
+5. 想接手当前阶段任务时，看 [HANDOFF.md](/Users/chenxi/CodeSpace/asset_allocation_system/docs/satellite_agent/HANDOFF.md)
 
 ## 代码、配置、数据目录
 
-- 代码：[src/satellite_agent](/Users/linxun/CodeSpace/asset_allocation_system/src/satellite_agent)
-- 配置：[config/satellite_agent](/Users/linxun/CodeSpace/asset_allocation_system/config/satellite_agent)
-- 数据：[data/satellite_agent](/Users/linxun/CodeSpace/asset_allocation_system/data/satellite_agent)
-
-## 当前配置原则
-
-- 你主要维护 `watchlist.stock_items / watchlist.etf_items`
-- 标的展示名称来自 `name`
-- 题材归属默认由系统内置题材目录自动维护
-- `stock_groups / etf_groups / themes` 仅作为高级兼容能力保留，后续会逐步淡出
-
-## 常用入口
-
-```bash
-satellite-agent daily-run --workspace-dir ./data/satellite_agent/daily_run --config-path ./config/satellite_agent/agent.recommended.json --replay-path tests/fixtures/events.jsonl
-satellite-agent run-once --workspace-dir ./data/satellite_agent/run_once --replay-path tests/fixtures/events.jsonl
-satellite-agent serve --workspace-dir ./data/satellite_agent/serve
-```
-
-## LLM 用量查看
-
-查看最近 7 天的终端报告：
-
-```bash
-PYTHONPATH=src .venv/bin/python -m satellite_agent.main report-llm-usage --days 7
-```
-
-把 LLM 用量正式落盘到某个 workspace：
-
-```bash
-PYTHONPATH=src .venv/bin/python -m satellite_agent.main write-llm-usage-report --workspace-dir ./data/satellite_agent/serve --days 7
-```
-
-自动运行时的默认行为：
-
-- `run-once`：每轮自动刷新 `LLM 用量报告`
-- `daily-run`：每轮自动刷新 `LLM 用量报告`
-- `serve`：按小时节流刷新 `LLM 用量报告`
-
-## 策略赛马快速开始
-
-先生成一份可编辑的赛马模板：
-
-```bash
-PYTHONPATH=src .venv/bin/python -m satellite_agent.main write-batch-replay-template --path ./config/satellite_agent/batch_replay.local.json
-```
-
-然后用这份 spec 跑离线赛马：
-
-```bash
-PYTHONPATH=src .venv/bin/python -m satellite_agent.main batch-replay --spec-path ./config/satellite_agent/batch_replay.local.json --output-dir ./data/satellite_agent/experiments/batch_runs
-```
-
-常见用途：
-
-- `纯规则`、`规则 + LLM特征抽取`、`纯规则 + 宏观风险覆盖层`、`规则 + LLM特征抽取 + 宏观风险覆盖层` 并排比较
-- 如果你想先验证“宏观覆盖层本身有没有帮助”，优先看：
-  - `rules_only`
-  - `rules_plus_macro_overlay`
-- 统一看：
-  - 平均真实收益
-  - 胜率
-  - 最大回撤
-  - 盈亏比
-  - `T+7 / T+14 / T+30`
-- 输出推荐策略，但不会自动覆盖正式配置
-
-## 运行产物位置
-
-- `run-once`：[data/satellite_agent/run_once](/Users/linxun/CodeSpace/asset_allocation_system/data/satellite_agent/run_once)
-- `serve`：[data/satellite_agent/serve](/Users/linxun/CodeSpace/asset_allocation_system/data/satellite_agent/serve)
-- `daily-run`：[data/satellite_agent/daily_run](/Users/linxun/CodeSpace/asset_allocation_system/data/satellite_agent/daily_run)
-- 历史效果复盘主报告：[data/satellite_agent/serve/historical_effect/review.md](/Users/linxun/CodeSpace/asset_allocation_system/data/satellite_agent/serve/historical_effect/review.md)
-- LLM 用量报告：[data/satellite_agent/serve/llm_usage/report.md](/Users/linxun/CodeSpace/asset_allocation_system/data/satellite_agent/serve/llm_usage/report.md)
-
-## 当前定位
-
-- 卫星仓位 agent 已进入可持续迭代阶段
-- 文档、配置、运行产物都已尽量隔离在 `satellite_agent` 前缀下
-- 后续如果引入核心仓位 agent，再考虑抽共享底层模块
+- 代码：[src/satellite_agent](/Users/chenxi/CodeSpace/asset_allocation_system/src/satellite_agent)
+- 配置：[config/satellite_agent](/Users/chenxi/CodeSpace/asset_allocation_system/config/satellite_agent)
+- 数据：[data/satellite_agent](/Users/chenxi/CodeSpace/asset_allocation_system/data/satellite_agent)

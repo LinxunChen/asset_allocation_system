@@ -13,6 +13,15 @@ def _dt(value: str) -> datetime:
     return datetime.fromisoformat(value)
 
 
+def _candidate_evaluation_stage_aliases(stage: str) -> tuple[str, ...]:
+    normalized = str(stage or "").strip()
+    if not normalized:
+        return ()
+    if normalized in {"prewatch", "candidate_pool"}:
+        return ("candidate_pool", "prewatch")
+    return (normalized,)
+
+
 class Store:
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path
@@ -243,6 +252,39 @@ class Store:
             state_key TEXT PRIMARY KEY,
             state_value TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS symbol_cycle_snapshots (
+            symbol TEXT PRIMARY KEY,
+            cycle_id TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'terminal',
+            previous_formal_action TEXT NOT NULL DEFAULT '',
+            last_formal_decision_id TEXT NOT NULL DEFAULT '',
+            last_related_event_id TEXT NOT NULL DEFAULT '',
+            last_event_kind TEXT NOT NULL DEFAULT '',
+            last_terminal_reason TEXT NOT NULL DEFAULT '',
+            current_cycle_started_at TEXT NOT NULL DEFAULT '',
+            last_transition_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL,
+            snapshot_json TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE TABLE IF NOT EXISTS symbol_cycle_events (
+            cycle_event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            cycle_id TEXT NOT NULL,
+            event_kind TEXT NOT NULL,
+            status_before TEXT NOT NULL DEFAULT '',
+            status_after TEXT NOT NULL DEFAULT '',
+            decision_id TEXT NOT NULL DEFAULT '',
+            related_event_id TEXT NOT NULL DEFAULT '',
+            pool TEXT NOT NULL DEFAULT '',
+            action_label TEXT NOT NULL DEFAULT '',
+            normalized_reason TEXT NOT NULL DEFAULT '',
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_symbol_cycle_events_symbol_created
+        ON symbol_cycle_events (symbol, created_at ASC, cycle_event_id ASC);
+        CREATE INDEX IF NOT EXISTS idx_symbol_cycle_events_cycle
+        ON symbol_cycle_events (cycle_id, created_at ASC, cycle_event_id ASC);
         """
         self.connection.executescript(schema)
         self._ensure_columns()
@@ -654,6 +696,33 @@ class Store:
         cursor = self.connection.execute(query, params)
         return cursor.fetchall()
 
+    def load_cycle_transition_logs_for_window(
+        self,
+        *,
+        since: str,
+        symbols: Iterable[str] | None = None,
+    ) -> list[sqlite3.Row]:
+        transition_events = (
+            "formal_suppressed_active_holding",
+            "formal_downgraded_to_watch_unentered",
+        )
+        placeholders = ", ".join("?" for _ in transition_events)
+        query = f"""
+            SELECT *
+            FROM system_logs
+            WHERE created_at >= ?
+              AND event_type IN ({placeholders})
+        """
+        params: list[Any] = [since, *transition_events]
+        normalized_symbols = [str(symbol or "").strip().upper() for symbol in (symbols or []) if str(symbol or "").strip()]
+        if normalized_symbols:
+            symbol_placeholders = ", ".join("?" for _ in normalized_symbols)
+            query += f" AND UPPER(symbol) IN ({symbol_placeholders})"
+            params.extend(normalized_symbols)
+        query += " ORDER BY created_at ASC, log_id ASC"
+        cursor = self.connection.execute(query, tuple(params))
+        return cursor.fetchall()
+
     def load_opportunity_cards(self, run_id: str) -> list[sqlite3.Row]:
         cursor = self.connection.execute(
             """
@@ -695,6 +764,25 @@ class Store:
             ORDER BY ah.notified_at ASC, ah.alert_id ASC
         """
         cursor = self.connection.execute(query, tuple(params))
+        return cursor.fetchall()
+
+    def load_alert_history_for_symbols(self, symbols: Iterable[str]) -> list[sqlite3.Row]:
+        normalized_symbols = [str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()]
+        if not normalized_symbols:
+            return []
+        placeholders = ", ".join("?" for _ in normalized_symbols)
+        cursor = self.connection.execute(
+            f"""
+            SELECT
+                ah.*,
+                oc.card_json
+            FROM alert_history ah
+            LEFT JOIN opportunity_cards oc ON ah.card_id = oc.card_id
+            WHERE UPPER(ah.symbol) IN ({placeholders})
+            ORDER BY ah.notified_at ASC, ah.alert_id ASC
+            """,
+            tuple(normalized_symbols),
+        )
         return cursor.fetchall()
 
     def load_source_health(self, run_id: str) -> list[sqlite3.Row]:
@@ -955,6 +1043,68 @@ class Store:
         cursor = self.connection.execute(query, tuple(params))
         return cursor.fetchall()
 
+    def load_decision_records_for_symbols(self, symbols: Iterable[str]) -> list[sqlite3.Row]:
+        normalized_symbols = [str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()]
+        if not normalized_symbols:
+            return []
+        placeholders = ", ".join("?" for _ in normalized_symbols)
+        cursor = self.connection.execute(
+            f"""
+            SELECT
+                dr.decision_id,
+                dr.run_id,
+                dr.event_id,
+                dr.symbol,
+                COALESCE(NULLIF(dr.event_type, ''), ei.event_type, '') AS event_type,
+                dr.pool,
+                dr.action,
+                dr.priority,
+                dr.confidence,
+                dr.event_score,
+                dr.market_score,
+                dr.theme_score,
+                dr.final_score,
+                dr.trigger_mode,
+                dr.llm_used,
+                dr.theme_ids_json,
+                dr.entry_plan_json,
+                dr.invalidation_json,
+                dr.ttl,
+                dr.packet_json,
+                dr.created_at,
+                do.entered,
+                do.entered_at,
+                do.entry_price,
+                do.exit_price,
+                do.realized_return,
+                do.holding_days,
+                do.gross_realized_return,
+                do.net_realized_return,
+                do.slippage_bps,
+                do.t_plus_1_return,
+                do.t_plus_3_return,
+                do.t_plus_5_return,
+                do.t_plus_7_return,
+                do.t_plus_10_return,
+                do.t_plus_14_return,
+                do.t_plus_30_return,
+                do.max_runup,
+                do.max_drawdown,
+                do.hit_take_profit,
+                do.hit_invalidation,
+                do.close_reason,
+                do.exit_subreason,
+                do.updated_at AS outcome_updated_at
+            FROM decision_records dr
+            LEFT JOIN event_insights ei ON dr.event_id = ei.event_id AND dr.run_id = ei.run_id
+            LEFT JOIN decision_outcomes do ON dr.decision_id = do.decision_id
+            WHERE UPPER(dr.symbol) IN ({placeholders})
+            ORDER BY dr.created_at ASC, dr.symbol ASC, dr.pool ASC
+            """,
+            tuple(normalized_symbols),
+        )
+        return cursor.fetchall()
+
     def load_latest_source_health(self) -> list[sqlite3.Row]:
         cursor = self.connection.execute(
             """
@@ -1120,13 +1270,19 @@ class Store:
                 SUM(CASE WHEN do.close_reason = 'insufficient_lookahead' THEN 1 ELSE 0 END) AS pending_count,
                 SUM(CASE WHEN do.entered = 1 THEN 1 ELSE 0 END) AS entered_count,
                 SUM(CASE WHEN do.close_reason = 'not_entered' THEN 1 ELSE 0 END) AS not_entered_count,
+                SUM(CASE WHEN do.close_reason = 'not_entered' AND do.exit_subreason = 'price_invalidated' THEN 1 ELSE 0 END) AS not_entered_price_invalidated_count,
+                SUM(CASE WHEN do.close_reason = 'not_entered' AND do.exit_subreason != 'price_invalidated' THEN 1 ELSE 0 END) AS not_entered_window_expired_count,
                 SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') THEN 1 ELSE 0 END) AS exit_pool_hits,
+                SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') THEN 1 ELSE 0 END) AS holding_management_hits,
                 SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') OR do.hit_take_profit = 1 THEN 1 ELSE 0 END) AS take_profit_hits,
+                SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') OR do.hit_take_profit = 1 THEN 1 ELSE 0 END) AS profit_protection_hits,
                 SUM(CASE WHEN do.exit_subreason = 'target_hit' THEN 1 ELSE 0 END) AS target_hit_count,
                 SUM(CASE WHEN do.exit_subreason = 'weakening_after_tp_zone' THEN 1 ELSE 0 END) AS weakening_exit_count,
                 SUM(CASE WHEN do.exit_subreason = 'macro_protection' THEN 1 ELSE 0 END) AS macro_protection_count,
                 SUM(CASE WHEN do.hit_invalidation = 1 THEN 1 ELSE 0 END) AS invalidation_hits,
+                SUM(CASE WHEN do.close_reason = 'hit_invalidation' THEN 1 ELSE 0 END) AS invalidation_exit_count,
                 SUM(CASE WHEN do.close_reason = 'window_complete' THEN 1 ELSE 0 END) AS window_complete_count,
+                SUM(CASE WHEN do.close_reason = 'window_complete' THEN 1 ELSE 0 END) AS window_close_evaluation_count,
                 SUM(CASE WHEN do.t_plus_3_return > 0 THEN 1 ELSE 0 END) AS positive_t3_count,
                 SUM(CASE WHEN do.t_plus_3_return IS NOT NULL THEN 1 ELSE 0 END) AS t_plus_3_sample_count,
                 SUM(CASE WHEN do.max_runup IS NOT NULL THEN 1 ELSE 0 END) AS max_runup_sample_count,
@@ -1169,12 +1325,18 @@ class Store:
                 COUNT(dr.decision_id) AS decision_count,
                 SUM(CASE WHEN do.decision_id IS NOT NULL THEN 1 ELSE 0 END) AS outcome_count,
                 SUM(CASE WHEN do.close_reason = 'insufficient_lookahead' THEN 1 ELSE 0 END) AS pending_count,
+                SUM(CASE WHEN do.close_reason = 'not_entered' AND do.exit_subreason = 'price_invalidated' THEN 1 ELSE 0 END) AS not_entered_price_invalidated_count,
+                SUM(CASE WHEN do.close_reason = 'not_entered' AND do.exit_subreason != 'price_invalidated' THEN 1 ELSE 0 END) AS not_entered_window_expired_count,
                 SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') THEN 1 ELSE 0 END) AS exit_pool_hits,
+                SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') THEN 1 ELSE 0 END) AS holding_management_hits,
                 SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') OR do.hit_take_profit = 1 THEN 1 ELSE 0 END) AS take_profit_hits,
+                SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') OR do.hit_take_profit = 1 THEN 1 ELSE 0 END) AS profit_protection_hits,
                 SUM(CASE WHEN do.exit_subreason = 'target_hit' THEN 1 ELSE 0 END) AS target_hit_count,
                 SUM(CASE WHEN do.exit_subreason = 'weakening_after_tp_zone' THEN 1 ELSE 0 END) AS weakening_exit_count,
                 SUM(CASE WHEN do.exit_subreason = 'macro_protection' THEN 1 ELSE 0 END) AS macro_protection_count,
                 SUM(CASE WHEN do.hit_invalidation = 1 THEN 1 ELSE 0 END) AS invalidation_hits,
+                SUM(CASE WHEN do.close_reason = 'hit_invalidation' THEN 1 ELSE 0 END) AS invalidation_exit_count,
+                SUM(CASE WHEN do.close_reason = 'window_complete' THEN 1 ELSE 0 END) AS window_close_evaluation_count,
                 SUM(CASE WHEN do.t_plus_3_return > 0 THEN 1 ELSE 0 END) AS positive_t3_count,
                 SUM(CASE WHEN do.t_plus_3_return IS NOT NULL THEN 1 ELSE 0 END) AS t_plus_3_sample_count,
                 SUM(CASE WHEN do.max_runup IS NOT NULL THEN 1 ELSE 0 END) AS max_runup_sample_count,
@@ -1214,13 +1376,19 @@ class Store:
                 SUM(CASE WHEN do.close_reason = 'insufficient_lookahead' THEN 1 ELSE 0 END) AS pending_count,
                 SUM(CASE WHEN do.entered = 1 THEN 1 ELSE 0 END) AS entered_count,
                 SUM(CASE WHEN do.close_reason = 'not_entered' THEN 1 ELSE 0 END) AS not_entered_count,
+                SUM(CASE WHEN do.close_reason = 'not_entered' AND do.exit_subreason = 'price_invalidated' THEN 1 ELSE 0 END) AS not_entered_price_invalidated_count,
+                SUM(CASE WHEN do.close_reason = 'not_entered' AND do.exit_subreason != 'price_invalidated' THEN 1 ELSE 0 END) AS not_entered_window_expired_count,
                 SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') THEN 1 ELSE 0 END) AS exit_pool_hits,
+                SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') THEN 1 ELSE 0 END) AS holding_management_hits,
                 SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') OR do.hit_take_profit = 1 THEN 1 ELSE 0 END) AS take_profit_hits,
+                SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') OR do.hit_take_profit = 1 THEN 1 ELSE 0 END) AS profit_protection_hits,
                 SUM(CASE WHEN do.exit_subreason = 'target_hit' THEN 1 ELSE 0 END) AS target_hit_count,
                 SUM(CASE WHEN do.exit_subreason = 'weakening_after_tp_zone' THEN 1 ELSE 0 END) AS weakening_exit_count,
                 SUM(CASE WHEN do.exit_subreason = 'macro_protection' THEN 1 ELSE 0 END) AS macro_protection_count,
                 SUM(CASE WHEN do.hit_invalidation = 1 THEN 1 ELSE 0 END) AS invalidation_hits,
+                SUM(CASE WHEN do.close_reason = 'hit_invalidation' THEN 1 ELSE 0 END) AS invalidation_exit_count,
                 SUM(CASE WHEN do.close_reason = 'window_complete' THEN 1 ELSE 0 END) AS window_complete_count,
+                SUM(CASE WHEN do.close_reason = 'window_complete' THEN 1 ELSE 0 END) AS window_close_evaluation_count,
                 SUM(CASE WHEN do.t_plus_3_return > 0 THEN 1 ELSE 0 END) AS positive_t3_count,
                 SUM(CASE WHEN do.t_plus_3_return IS NOT NULL THEN 1 ELSE 0 END) AS t_plus_3_sample_count,
                 SUM(CASE WHEN do.max_runup IS NOT NULL THEN 1 ELSE 0 END) AS max_runup_sample_count,
@@ -1263,12 +1431,18 @@ class Store:
                 COUNT(dr.decision_id) AS decision_count,
                 SUM(CASE WHEN do.decision_id IS NOT NULL THEN 1 ELSE 0 END) AS outcome_count,
                 SUM(CASE WHEN do.close_reason = 'insufficient_lookahead' THEN 1 ELSE 0 END) AS pending_count,
+                SUM(CASE WHEN do.close_reason = 'not_entered' AND do.exit_subreason = 'price_invalidated' THEN 1 ELSE 0 END) AS not_entered_price_invalidated_count,
+                SUM(CASE WHEN do.close_reason = 'not_entered' AND do.exit_subreason != 'price_invalidated' THEN 1 ELSE 0 END) AS not_entered_window_expired_count,
                 SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') THEN 1 ELSE 0 END) AS exit_pool_hits,
+                SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') THEN 1 ELSE 0 END) AS holding_management_hits,
                 SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') OR do.hit_take_profit = 1 THEN 1 ELSE 0 END) AS take_profit_hits,
+                SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') OR do.hit_take_profit = 1 THEN 1 ELSE 0 END) AS profit_protection_hits,
                 SUM(CASE WHEN do.exit_subreason = 'target_hit' THEN 1 ELSE 0 END) AS target_hit_count,
                 SUM(CASE WHEN do.exit_subreason = 'weakening_after_tp_zone' THEN 1 ELSE 0 END) AS weakening_exit_count,
                 SUM(CASE WHEN do.exit_subreason = 'macro_protection' THEN 1 ELSE 0 END) AS macro_protection_count,
                 SUM(CASE WHEN do.hit_invalidation = 1 THEN 1 ELSE 0 END) AS invalidation_hits,
+                SUM(CASE WHEN do.close_reason = 'hit_invalidation' THEN 1 ELSE 0 END) AS invalidation_exit_count,
+                SUM(CASE WHEN do.close_reason = 'window_complete' THEN 1 ELSE 0 END) AS window_close_evaluation_count,
                 SUM(CASE WHEN do.t_plus_3_return > 0 THEN 1 ELSE 0 END) AS positive_t3_count,
                 SUM(CASE WHEN do.t_plus_3_return IS NOT NULL THEN 1 ELSE 0 END) AS t_plus_3_sample_count,
                 SUM(CASE WHEN do.max_runup IS NOT NULL THEN 1 ELSE 0 END) AS max_runup_sample_count,
@@ -1306,13 +1480,18 @@ class Store:
                 SUM(CASE WHEN do.close_reason = 'insufficient_lookahead' THEN 1 ELSE 0 END) AS pending_count,
                 SUM(CASE WHEN do.entered = 1 THEN 1 ELSE 0 END) AS entered_count,
                 SUM(CASE WHEN do.close_reason = 'not_entered' THEN 1 ELSE 0 END) AS not_entered_count,
+                SUM(CASE WHEN do.close_reason = 'not_entered' AND do.exit_subreason = 'price_invalidated' THEN 1 ELSE 0 END) AS not_entered_price_invalidated_count,
+                SUM(CASE WHEN do.close_reason = 'not_entered' AND do.exit_subreason != 'price_invalidated' THEN 1 ELSE 0 END) AS not_entered_window_expired_count,
                 SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') THEN 1 ELSE 0 END) AS exit_pool_count,
+                SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') THEN 1 ELSE 0 END) AS holding_management_exit_count,
                 SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') THEN 1 ELSE 0 END) AS take_profit_exit_count,
+                SUM(CASE WHEN do.close_reason IN ('exit_pool', 'hit_take_profit') THEN 1 ELSE 0 END) AS profit_protection_exit_count,
                 SUM(CASE WHEN do.exit_subreason = 'target_hit' THEN 1 ELSE 0 END) AS target_hit_count,
                 SUM(CASE WHEN do.exit_subreason = 'weakening_after_tp_zone' THEN 1 ELSE 0 END) AS weakening_exit_count,
                 SUM(CASE WHEN do.exit_subreason = 'macro_protection' THEN 1 ELSE 0 END) AS macro_protection_count,
                 SUM(CASE WHEN do.close_reason = 'hit_invalidation' THEN 1 ELSE 0 END) AS invalidation_exit_count,
                 SUM(CASE WHEN do.close_reason = 'window_complete' THEN 1 ELSE 0 END) AS window_complete_count,
+                SUM(CASE WHEN do.close_reason = 'window_complete' THEN 1 ELSE 0 END) AS window_close_evaluation_count,
                 ROUND(AVG(do.realized_return), 2) AS avg_realized_return,
                 SUM(
                     CASE
@@ -1346,13 +1525,18 @@ class Store:
                     0 AS pending_count,
                     0 AS entered_count,
                     0 AS not_entered_count,
+                    0 AS not_entered_price_invalidated_count,
+                    0 AS not_entered_window_expired_count,
                     0 AS exit_pool_count,
+                    0 AS holding_management_exit_count,
                     0 AS take_profit_exit_count,
+                    0 AS profit_protection_exit_count,
                     0 AS target_hit_count,
                     0 AS weakening_exit_count,
                     0 AS macro_protection_count,
                     0 AS invalidation_exit_count,
                     0 AS window_complete_count,
+                    0 AS window_close_evaluation_count,
                     NULL AS avg_realized_return,
                     0 AS completed_count
                 """
@@ -1839,9 +2023,135 @@ class Store:
         """
         params: list[Any] = [run_id]
         if stage:
-            query += " AND stage = ?"
-            params.append(stage)
+            stage_aliases = _candidate_evaluation_stage_aliases(stage)
+            if len(stage_aliases) == 1:
+                query += " AND stage = ?"
+                params.append(stage_aliases[0])
+            else:
+                placeholders = ", ".join("?" for _ in stage_aliases)
+                query += f" AND stage IN ({placeholders})"
+                params.extend(stage_aliases)
         query += " ORDER BY created_at ASC, evaluation_id ASC"
+        cursor = self.connection.execute(query, tuple(params))
+        return cursor.fetchall()
+
+    def replace_symbol_cycle_audit(
+        self,
+        *,
+        symbol: str,
+        snapshot: dict[str, Any] | None,
+        events: list[dict[str, Any]],
+    ) -> None:
+        normalized_symbol = str(symbol or "").strip().upper()
+        self.connection.execute(
+            "DELETE FROM symbol_cycle_events WHERE symbol = ?",
+            (normalized_symbol,),
+        )
+        if snapshot is None:
+            self.connection.execute(
+                "DELETE FROM symbol_cycle_snapshots WHERE symbol = ?",
+                (normalized_symbol,),
+            )
+            self.connection.commit()
+            return
+        self.connection.execute(
+            """
+            INSERT OR REPLACE INTO symbol_cycle_snapshots
+            (symbol, cycle_id, status, previous_formal_action, last_formal_decision_id,
+             last_related_event_id, last_event_kind, last_terminal_reason,
+             current_cycle_started_at, last_transition_at, updated_at, snapshot_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                normalized_symbol,
+                str(snapshot.get("cycle_id") or ""),
+                str(snapshot.get("status") or "terminal"),
+                str(snapshot.get("previous_formal_action") or ""),
+                str(snapshot.get("last_formal_decision_id") or ""),
+                str(snapshot.get("last_related_event_id") or ""),
+                str(snapshot.get("last_event_kind") or ""),
+                str(snapshot.get("last_terminal_reason") or ""),
+                str(snapshot.get("current_cycle_started_at") or ""),
+                str(snapshot.get("last_transition_at") or ""),
+                str(snapshot.get("updated_at") or ""),
+                json.dumps(snapshot, sort_keys=True, ensure_ascii=False),
+            ),
+        )
+        if events:
+            self.connection.executemany(
+                """
+                INSERT INTO symbol_cycle_events
+                (symbol, cycle_id, event_kind, status_before, status_after, decision_id,
+                 related_event_id, pool, action_label, normalized_reason, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        normalized_symbol,
+                        str(item.get("cycle_id") or ""),
+                        str(item.get("event_kind") or ""),
+                        str(item.get("status_before") or ""),
+                        str(item.get("status_after") or ""),
+                        str(item.get("decision_id") or ""),
+                        str(item.get("related_event_id") or ""),
+                        str(item.get("pool") or ""),
+                        str(item.get("action_label") or ""),
+                        str(item.get("normalized_reason") or ""),
+                        json.dumps(dict(item.get("payload") or {}), sort_keys=True, ensure_ascii=False),
+                        str(item.get("created_at") or ""),
+                    )
+                    for item in events
+                ],
+            )
+        self.connection.commit()
+
+    def load_symbol_cycle_snapshots(
+        self,
+        *,
+        status: str = "",
+        symbols: Iterable[str] | None = None,
+    ) -> list[sqlite3.Row]:
+        query = """
+            SELECT *
+            FROM symbol_cycle_snapshots
+            WHERE 1 = 1
+        """
+        params: list[Any] = []
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        normalized_symbols = [str(symbol or "").strip().upper() for symbol in (symbols or []) if str(symbol or "").strip()]
+        if normalized_symbols:
+            placeholders = ", ".join("?" for _ in normalized_symbols)
+            query += f" AND symbol IN ({placeholders})"
+            params.extend(normalized_symbols)
+        query += " ORDER BY updated_at DESC, symbol ASC"
+        cursor = self.connection.execute(query, tuple(params))
+        return cursor.fetchall()
+
+    def load_symbol_cycle_events(
+        self,
+        *,
+        symbol: str = "",
+        cycle_id: str = "",
+        limit: int = 0,
+    ) -> list[sqlite3.Row]:
+        query = """
+            SELECT *
+            FROM symbol_cycle_events
+            WHERE 1 = 1
+        """
+        params: list[Any] = []
+        if symbol:
+            query += " AND symbol = ?"
+            params.append(symbol.upper())
+        if cycle_id:
+            query += " AND cycle_id = ?"
+            params.append(cycle_id)
+        query += " ORDER BY created_at ASC, cycle_event_id ASC"
+        if limit > 0:
+            query += " LIMIT ?"
+            params.append(limit)
         cursor = self.connection.execute(query, tuple(params))
         return cursor.fetchall()
 
@@ -1862,8 +2172,14 @@ class Store:
             query += " AND created_at < ?"
             params.append(until)
         if stage:
-            query += " AND stage = ?"
-            params.append(stage)
+            stage_aliases = _candidate_evaluation_stage_aliases(stage)
+            if len(stage_aliases) == 1:
+                query += " AND stage = ?"
+                params.append(stage_aliases[0])
+            else:
+                placeholders = ", ".join("?" for _ in stage_aliases)
+                query += f" AND stage IN ({placeholders})"
+                params.extend(stage_aliases)
         query += " ORDER BY created_at ASC, evaluation_id ASC"
         cursor = self.connection.execute(query, tuple(params))
         return cursor.fetchall()

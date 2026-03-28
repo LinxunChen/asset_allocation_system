@@ -162,23 +162,122 @@ class OpportunityCard:
     market_data_complete: bool = True
     market_data_note: str = ""
     promoted_from_prewatch: bool = False
-    prewatch_score: float = 0.0
-    prewatch_setup_type: str = ""
+    candidate_score: float = 0.0
+    candidate_setup_type: str = ""
     positioning_hint: str = ""
     execution_eligible: bool = True
     execution_note: str = ""
-    exit_pool_subreason: str = ""
-    exit_pool_source_decision_id: str = ""
-    prewatch_observation_count: int = 0
-    prewatch_alert_sent_count: int = 0
-    prewatch_first_seen_at: str = ""
-    prewatch_last_seen_at: str = ""
-    prewatch_last_alert_sent_at: str = ""
-    prewatch_source_decision_id: str = ""
-    prewatch_promotion_reason: str = ""
+    lifecycle_pool: str = ""
+    delivery_category: str = ""
+    normalized_close_reason: str = ""
+    holding_management_reason: str = ""
+    holding_management_subreason: str = ""
+    holding_management_source_decision_id: str = ""
+    candidate_observation_count: int = 0
+    candidate_alert_sent_count: int = 0
+    candidate_first_seen_at: str = ""
+    candidate_last_seen_at: str = ""
+    candidate_last_alert_sent_at: str = ""
+    candidate_source_decision_id: str = ""
+    candidate_promotion_reason: str = ""
+    active_cycle_status: str = ""
+    previous_formal_action: str = ""
+    previous_formal_sent: bool = False
+    downgraded_from_formal: bool = False
+    downgrade_explainer: str = ""
+    recent_candidate_observation_count_72h: int = 0
+    is_breakthrough_event: bool = False
 
     def ttl_delta(self) -> timedelta:
         return self.ttl - self.created_at
+
+    @property
+    def prewatch_score(self) -> float:
+        return self.candidate_score
+
+    @prewatch_score.setter
+    def prewatch_score(self, value: float) -> None:
+        self.candidate_score = float(value or 0.0)
+
+    @property
+    def prewatch_setup_type(self) -> str:
+        return self.candidate_setup_type
+
+    @prewatch_setup_type.setter
+    def prewatch_setup_type(self, value: str) -> None:
+        self.candidate_setup_type = str(value or "")
+
+    @property
+    def prewatch_observation_count(self) -> int:
+        return self.candidate_observation_count
+
+    @prewatch_observation_count.setter
+    def prewatch_observation_count(self, value: int) -> None:
+        self.candidate_observation_count = int(value or 0)
+
+    @property
+    def prewatch_alert_sent_count(self) -> int:
+        return self.candidate_alert_sent_count
+
+    @prewatch_alert_sent_count.setter
+    def prewatch_alert_sent_count(self, value: int) -> None:
+        self.candidate_alert_sent_count = int(value or 0)
+
+    @property
+    def prewatch_first_seen_at(self) -> str:
+        return self.candidate_first_seen_at
+
+    @prewatch_first_seen_at.setter
+    def prewatch_first_seen_at(self, value: str) -> None:
+        self.candidate_first_seen_at = str(value or "")
+
+    @property
+    def prewatch_last_seen_at(self) -> str:
+        return self.candidate_last_seen_at
+
+    @prewatch_last_seen_at.setter
+    def prewatch_last_seen_at(self, value: str) -> None:
+        self.candidate_last_seen_at = str(value or "")
+
+    @property
+    def prewatch_last_alert_sent_at(self) -> str:
+        return self.candidate_last_alert_sent_at
+
+    @prewatch_last_alert_sent_at.setter
+    def prewatch_last_alert_sent_at(self, value: str) -> None:
+        self.candidate_last_alert_sent_at = str(value or "")
+
+    @property
+    def prewatch_source_decision_id(self) -> str:
+        return self.candidate_source_decision_id
+
+    @prewatch_source_decision_id.setter
+    def prewatch_source_decision_id(self, value: str) -> None:
+        self.candidate_source_decision_id = str(value or "")
+
+    @property
+    def prewatch_promotion_reason(self) -> str:
+        return self.candidate_promotion_reason
+
+    @prewatch_promotion_reason.setter
+    def prewatch_promotion_reason(self, value: str) -> None:
+        self.candidate_promotion_reason = str(value or "")
+
+    @property
+    def exit_pool_subreason(self) -> str:
+        return self.holding_management_subreason
+
+    @exit_pool_subreason.setter
+    def exit_pool_subreason(self, value: str) -> None:
+        self.holding_management_subreason = str(value or "")
+
+    @property
+    def exit_pool_source_decision_id(self) -> str:
+        return self.holding_management_source_decision_id
+
+    @exit_pool_source_decision_id.setter
+    def exit_pool_source_decision_id(self, value: str) -> None:
+        self.holding_management_source_decision_id = str(value or "")
 
     def to_record(self) -> Dict[str, Any]:
         payload = asdict(self)
@@ -186,6 +285,35 @@ class OpportunityCard:
         payload["take_profit_range"] = asdict(self.take_profit_range)
         payload["created_at"] = ensure_utc(self.created_at).isoformat()
         payload["ttl"] = ensure_utc(self.ttl).isoformat()
+        payload["candidate_score"] = self.candidate_score
+        payload["candidate_setup_type"] = self.candidate_setup_type
+        payload["candidate_observation_count"] = self.candidate_observation_count
+        payload["candidate_alert_sent_count"] = self.candidate_alert_sent_count
+        payload["candidate_first_seen_at"] = self.candidate_first_seen_at
+        payload["candidate_last_seen_at"] = self.candidate_last_seen_at
+        payload["candidate_last_alert_sent_at"] = self.candidate_last_alert_sent_at
+        payload["candidate_source_decision_id"] = self.candidate_source_decision_id
+        payload["candidate_promotion_reason"] = self.candidate_promotion_reason
+        payload["active_cycle_status"] = self.active_cycle_status
+        payload["previous_formal_action"] = self.previous_formal_action
+        payload["previous_formal_sent"] = self.previous_formal_sent
+        payload["downgraded_from_formal"] = self.downgraded_from_formal
+        payload["downgrade_explainer"] = self.downgrade_explainer
+        payload["recent_candidate_observation_count_72h"] = self.recent_candidate_observation_count_72h
+        payload["is_breakthrough_event"] = self.is_breakthrough_event
+        payload["holding_management_subreason"] = self.holding_management_subreason
+        payload["holding_management_source_decision_id"] = self.holding_management_source_decision_id
+        payload["prewatch_score"] = self.prewatch_score
+        payload["prewatch_setup_type"] = self.prewatch_setup_type
+        payload["prewatch_observation_count"] = self.prewatch_observation_count
+        payload["prewatch_alert_sent_count"] = self.prewatch_alert_sent_count
+        payload["prewatch_first_seen_at"] = self.prewatch_first_seen_at
+        payload["prewatch_last_seen_at"] = self.prewatch_last_seen_at
+        payload["prewatch_last_alert_sent_at"] = self.prewatch_last_alert_sent_at
+        payload["prewatch_source_decision_id"] = self.prewatch_source_decision_id
+        payload["prewatch_promotion_reason"] = self.prewatch_promotion_reason
+        payload["exit_pool_subreason"] = self.exit_pool_subreason
+        payload["exit_pool_source_decision_id"] = self.exit_pool_source_decision_id
         return payload
 
 
@@ -218,7 +346,7 @@ class SourceHealthCheck:
 
 
 @dataclass
-class PrewatchCandidate:
+class CandidatePoolCandidate:
     symbol: str
     horizon: str
     setup_type: str
@@ -242,3 +370,6 @@ class PrewatchCandidate:
         payload = asdict(self)
         payload["as_of"] = ensure_utc(self.as_of).isoformat()
         return payload
+
+# Backward-compatible alias for older call sites and serialized references.
+PrewatchCandidate = CandidatePoolCandidate

@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Protocol
 
 from ..config import Settings
-from ..models import OpportunityCard, PrewatchCandidate, utcnow
+from ..models import CandidatePoolCandidate, OpportunityCard, utcnow
 from ..store import Store
 from ..theme_linkage import (
     build_theme_display_name_map_from_watchlist_payload,
@@ -25,13 +25,23 @@ class ThemeUnderstandingEngine(Protocol):
     def assess_confirmation(self, card: OpportunityCard, *, confirmed_symbols: set[str]) -> ThemeAssessment:
         ...
 
-    def assess_prewatch(self, candidate: PrewatchCandidate, *, confirmed_symbols: set[str], prewatch_symbols: set[str]) -> ThemeAssessment:
+    def assess_candidate_pool(
+        self,
+        candidate: CandidatePoolCandidate,
+        *,
+        confirmed_symbols: set[str],
+        candidate_symbols: set[str],
+    ) -> ThemeAssessment:
         ...
 
     def load_recent_theme_memory(self) -> dict[str, dict]:
         ...
 
-    def persist_theme_memory(self, confirmation_cards: list[OpportunityCard], prewatch_candidates: list[PrewatchCandidate]) -> None:
+    def persist_candidate_pool_memory(
+        self,
+        confirmation_cards: list[OpportunityCard],
+        candidate_pool_candidates: list[CandidatePoolCandidate],
+    ) -> None:
         ...
 
 
@@ -73,19 +83,25 @@ class StaticThemeUnderstandingEngine:
             theme_heat=float(len(context["confirmed_peer_symbols"]) * 2 + len(context["peer_symbols"])),
             theme_role=role,
             confirmed_peers=list(context["confirmed_peer_symbols"]),
-            prewatch_peers=[],
+            candidate_pool_peers=[],
             dynamic_theme_detected=False,
             theme_chain_note=note,
             theme_boosts={"confirmation_chain": boost} if boost else {},
         )
 
-    def assess_prewatch(self, candidate: PrewatchCandidate, *, confirmed_symbols: set[str], prewatch_symbols: set[str]) -> ThemeAssessment:
+    def assess_candidate_pool(
+        self,
+        candidate: CandidatePoolCandidate,
+        *,
+        confirmed_symbols: set[str],
+        candidate_symbols: set[str],
+    ) -> ThemeAssessment:
         context = summarize_symbol_theme_context(
             candidate.symbol,
             symbol_theme_map=self.symbol_theme_map,
             theme_memberships=self.theme_memberships,
             confirmed_symbols=confirmed_symbols,
-            prewatch_symbols=prewatch_symbols,
+            candidate_symbols=candidate_symbols,
         )
         note = ""
         role = "standalone"
@@ -103,17 +119,41 @@ class StaticThemeUnderstandingEngine:
             theme_heat=float(len(context["confirmed_peer_symbols"]) * 2 + len(context["prewatch_peer_symbols"])),
             theme_role=role,
             confirmed_peers=list(context["confirmed_peer_symbols"]),
-            prewatch_peers=list(context["prewatch_peer_symbols"]),
+            candidate_pool_peers=list(context["prewatch_peer_symbols"]),
             dynamic_theme_detected=False,
             theme_chain_note=note,
             theme_boosts=boosts,
         )
 
+    def assess_prewatch(
+        self,
+        candidate: CandidatePoolCandidate,
+        *,
+        confirmed_symbols: set[str],
+        prewatch_symbols: set[str],
+    ) -> ThemeAssessment:
+        return self.assess_candidate_pool(
+            candidate,
+            confirmed_symbols=confirmed_symbols,
+            candidate_symbols=prewatch_symbols,
+        )
+
     def load_recent_theme_memory(self) -> dict[str, dict]:
         return {}
 
-    def persist_theme_memory(self, confirmation_cards: list[OpportunityCard], prewatch_candidates: list[PrewatchCandidate]) -> None:
+    def persist_candidate_pool_memory(
+        self,
+        confirmation_cards: list[OpportunityCard],
+        candidate_pool_candidates: list[CandidatePoolCandidate],
+    ) -> None:
         return
+
+    def persist_theme_memory(
+        self,
+        confirmation_cards: list[OpportunityCard],
+        prewatch_candidates: list[CandidatePoolCandidate],
+    ) -> None:
+        self.persist_candidate_pool_memory(confirmation_cards, prewatch_candidates)
 
 
 @dataclass
@@ -133,7 +173,7 @@ class HybridThemeUnderstandingEngine(StaticThemeUnderstandingEngine):
             rows = payload.get("themes", [])
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             return {}
-        window_hours = max(getattr(self.settings, "prewatch_theme_memory_window_hours", 0), 0)
+        window_hours = max(getattr(self.settings, "candidate_pool_theme_memory_window_hours", 0), 0)
         if window_hours and (utcnow() - as_of).total_seconds() > window_hours * 3600:
             return {}
         memory: dict[str, dict] = {}
@@ -144,15 +184,22 @@ class HybridThemeUnderstandingEngine(StaticThemeUnderstandingEngine):
             memory[theme_key] = {
                 "heat_score": float(row.get("heat_score", 0.0)),
                 "confirmed_symbols": list(row.get("confirmed_symbols", [])),
-                "prewatch_symbols": list(row.get("prewatch_symbols", [])),
+                "candidate_pool_symbols": list(row.get("candidate_pool_symbols", row.get("prewatch_symbols", []))),
+                "prewatch_symbols": list(row.get("prewatch_symbols", row.get("candidate_pool_symbols", []))),
             }
         return memory
 
-    def assess_prewatch(self, candidate: PrewatchCandidate, *, confirmed_symbols: set[str], prewatch_symbols: set[str]) -> ThemeAssessment:
-        assessment = super().assess_prewatch(
+    def assess_candidate_pool(
+        self,
+        candidate: CandidatePoolCandidate,
+        *,
+        confirmed_symbols: set[str],
+        candidate_symbols: set[str],
+    ) -> ThemeAssessment:
+        assessment = super().assess_candidate_pool(
             candidate,
             confirmed_symbols=confirmed_symbols,
-            prewatch_symbols=prewatch_symbols,
+            candidate_symbols=candidate_symbols,
         )
         recent = self.load_recent_theme_memory()
         strongest_key = ""
@@ -167,7 +214,7 @@ class HybridThemeUnderstandingEngine(StaticThemeUnderstandingEngine):
         boosts = dict(assessment.theme_boosts)
         boosts["recent_theme_heat"] = min(
             strongest_heat,
-            getattr(self.settings, "prewatch_theme_memory_bonus", 3.0),
+            getattr(self.settings, "candidate_pool_theme_memory_bonus", 3.0),
         )
         note = assessment.theme_chain_note or f"题材近期持续活跃：{display_theme_name(strongest_key, self.theme_display_name_map)}"
         return ThemeAssessment(
@@ -175,13 +222,30 @@ class HybridThemeUnderstandingEngine(StaticThemeUnderstandingEngine):
             theme_heat=assessment.theme_heat + strongest_heat,
             theme_role=assessment.theme_role if assessment.theme_role != "standalone" else "memory_supported",
             confirmed_peers=assessment.confirmed_peers,
-            prewatch_peers=assessment.prewatch_peers,
-            dynamic_theme_detected=strongest_heat >= getattr(self.settings, "prewatch_theme_memory_min_heat_score", 4.0),
+            candidate_pool_peers=assessment.candidate_pool_peers,
+            dynamic_theme_detected=strongest_heat >= getattr(self.settings, "candidate_pool_theme_memory_min_heat_score", 4.0),
             theme_chain_note=note,
             theme_boosts=boosts,
         )
 
-    def persist_theme_memory(self, confirmation_cards: list[OpportunityCard], prewatch_candidates: list[PrewatchCandidate]) -> None:
+    def assess_prewatch(
+        self,
+        candidate: CandidatePoolCandidate,
+        *,
+        confirmed_symbols: set[str],
+        prewatch_symbols: set[str],
+    ) -> ThemeAssessment:
+        return self.assess_candidate_pool(
+            candidate,
+            confirmed_symbols=confirmed_symbols,
+            candidate_symbols=prewatch_symbols,
+        )
+
+    def persist_candidate_pool_memory(
+        self,
+        confirmation_cards: list[OpportunityCard],
+        candidate_pool_candidates: list[CandidatePoolCandidate],
+    ) -> None:
         if self.store is None:
             return
         theme_confirmed: dict[str, set[str]] = {}
@@ -195,7 +259,7 @@ class HybridThemeUnderstandingEngine(StaticThemeUnderstandingEngine):
                 theme_confirmed.setdefault(theme_key, set()).add(symbol)
                 if card.promoted_from_prewatch:
                     theme_promoted.setdefault(theme_key, set()).add(symbol)
-        for candidate in prewatch_candidates:
+        for candidate in candidate_pool_candidates:
             symbol = candidate.symbol.upper()
             for theme_key in self.symbol_theme_map.get(symbol, []):
                 theme_prewatch.setdefault(theme_key, set()).add(symbol)
@@ -204,17 +268,25 @@ class HybridThemeUnderstandingEngine(StaticThemeUnderstandingEngine):
         for theme_key in sorted(all_theme_keys):
             confirmed_symbols = sorted(theme_confirmed.get(theme_key, set()))
             promoted_symbols = sorted(theme_promoted.get(theme_key, set()))
-            prewatch_symbols = sorted(theme_prewatch.get(theme_key, set()))
-            heat_score = len(promoted_symbols) * 3 + len(confirmed_symbols) * 2 + len(prewatch_symbols)
+            candidate_pool_symbols = sorted(theme_prewatch.get(theme_key, set()))
+            heat_score = len(promoted_symbols) * 3 + len(confirmed_symbols) * 2 + len(candidate_pool_symbols)
             rows.append(
                 {
                     "theme_key": theme_key,
                     "heat_score": float(heat_score),
                     "confirmed_symbols": confirmed_symbols,
-                    "prewatch_symbols": prewatch_symbols,
+                    "candidate_pool_symbols": candidate_pool_symbols,
+                    "prewatch_symbols": candidate_pool_symbols,
                 }
             )
         self.store.set_state(
             THEME_MEMORY_STATE_KEY,
             json.dumps({"as_of": utcnow().isoformat(), "themes": rows}, sort_keys=True),
         )
+
+    def persist_theme_memory(
+        self,
+        confirmation_cards: list[OpportunityCard],
+        prewatch_candidates: list[CandidatePoolCandidate],
+    ) -> None:
+        self.persist_candidate_pool_memory(confirmation_cards, prewatch_candidates)

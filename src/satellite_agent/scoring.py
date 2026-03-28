@@ -139,7 +139,7 @@ class SignalScorer:
             confidence_score=confidence_score,
             reason_to_watch=(
                 f"{self._event_type_cn(insight.event_type)}强度 {event_score:.1f} 分；"
-                "当前行情确认缺失，请先加入观察名单，待价格位置与量价结构明确后再决定是否参与。"
+                "当前行情确认缺失，请先进入候选池，待价格位置与量价结构明确后再决定是否参与。"
             ),
             market_data_complete=False,
             market_data_note=market_note,
@@ -170,7 +170,7 @@ class SignalScorer:
         if bias != "long":
             return "当前仍以风险观察为主，暂不将其视为可直接执行的反向交易信号。"
         return {
-            "加入观察": "先纳入观察名单，优先等待价格结构或事件催化进一步明朗。",
+            "加入观察": "先进入候选池，优先等待价格结构或事件催化进一步明朗。",
             "试探建仓": "可先用观察仓或轻仓试错，优先等待回踩承接或放量确认。",
             "确认做多": "事件与市场确认已经成形，可按正式做多机会管理计划。",
         }.get(action_label, "")

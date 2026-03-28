@@ -16,6 +16,15 @@ from zoneinfo import ZoneInfo
 
 from .config import Settings
 from .archive import archive_decision_history
+from .cycle_audit import (
+    build_cycle_audit_payload,
+    build_historical_cycle_anomaly_cleanup_payload,
+    build_run_cycle_audit_payload,
+    format_active_cycle_report,
+    format_cycle_audit_report,
+    format_historical_cycle_anomaly_cleanup,
+    format_run_cycle_audit_report,
+)
 from .entry_exit import EntryExitEngine
 from .event_normalizer import EventNormalizer
 from .llm import OpenAIExtractor, OpenAINarrator
@@ -28,7 +37,12 @@ from .market_data import (
     YahooFinanceMarketDataProvider,
 )
 from .notifier import FeishuTransport, Notifier, build_render_view
-from .outcomes import backfill_decision_outcomes, backfill_recent_decision_outcomes, explain_decision_outcome
+from .outcomes import (
+    backfill_decision_outcomes,
+    backfill_recent_decision_outcomes,
+    explain_decision_outcome,
+    normalize_close_reason,
+)
 from .reporting import (
     _config_summary,
     format_batch_index,
@@ -74,7 +88,7 @@ from .sources import (
     StaticSourceAdapter,
 )
 from .store import Store
-from .models import Bar, EventInsight, PrewatchCandidate, utcnow
+from .models import Bar, CandidatePoolCandidate, EventInsight, utcnow
 from .models import OpportunityCard, PriceRange
 from .theme_linkage import build_symbol_theme_map_from_watchlist_payload, theme_tags_for_symbol
 from .timefmt import BEIJING_TZ, format_beijing_minute
@@ -128,6 +142,31 @@ def _parse_local_date(value: str) -> date:
         raise SystemExit(f"Invalid date: {value}. Expected YYYY-MM-DD.") from exc
 
 
+def _normalize_candidate_stage(stage: str) -> str:
+    normalized = str(stage or "").strip()
+    if normalized == "prewatch":
+        return "candidate_pool"
+    return normalized
+
+
+def _normalize_decision_pool(pool: str) -> str:
+    normalized = str(pool or "").strip()
+    if normalized == "prewatch":
+        return "candidate_pool"
+    return normalized
+
+
+def _is_candidate_optional_alert_record(row: dict[str, Any]) -> bool:
+    dedup_key = str(row.get("dedup_key") or "")
+    card_id = str(row.get("card_id") or "")
+    return (
+        dedup_key.startswith("candidate-notify:")
+        or card_id.startswith("candidate-notify:")
+        or dedup_key.startswith("prewatch-notify:")
+        or card_id.startswith("prewatch-notify:")
+    )
+
+
 def _historical_effect_event_type_label(event_type: str) -> str:
     return {
         "earnings": "财报",
@@ -138,18 +177,21 @@ def _historical_effect_event_type_label(event_type: str) -> str:
         "strategic": "战略合作",
         "product": "产品",
         "news": "新闻",
-        "prewatch": "预备观察",
+        "prewatch": "候选观察",
         "uncategorized": "未分类",
     }.get(event_type, event_type)
 
 
 def _historical_effect_pool_label(pool: str) -> str:
+    normalized = _normalize_decision_pool(pool)
     return {
-        "prewatch": "预备池",
-        "confirmation": "确认池",
-        "exit": "兑现池",
+        "candidate_pool": "第一池：候选池",
+        "prewatch": "第一池：候选池",
+        "confirmation": "第二池：确认池",
+        "exit": "第三池：持仓管理",
+        "holding_management": "第三池：持仓管理",
         "unknown": "未分类",
-    }.get(pool, pool or "未分类")
+    }.get(normalized, normalized or "未分类")
 
 
 def _historical_effect_action_label(action: str) -> str:
@@ -182,10 +224,12 @@ def _historical_effect_priority_label(priority: str) -> str:
 
 
 def _candidate_evaluation_stage_label(stage: str) -> str:
+    normalized = _normalize_candidate_stage(stage)
     return {
-        "prewatch": "预备池",
+        "candidate_pool": "第一池：候选池",
+        "prewatch": "第一池：候选池",
         "confirmation": "确认机会",
-    }.get(stage, stage or "未分类")
+    }.get(normalized, normalized or "未分类")
 
 
 def _candidate_evaluation_reason_label(reason: str) -> str:
@@ -199,7 +243,7 @@ def _candidate_evaluation_reason_label(reason: str) -> str:
         "execution_ineligible": "不满足执行条件",
         "event_only_below_threshold": "事件降级分数不足",
         "confirmation_opportunity": "形成确认机会",
-        "passed_scan_threshold": "通过预备池初筛",
+        "passed_scan_threshold": "通过候选池初筛",
         "ranked_in_run": "进入本轮观察",
     }
     if normalized in mapping:
@@ -261,16 +305,27 @@ def _build_candidate_evaluation_summary(
     limit: int = 3,
 ) -> dict[str, Any]:
     grouped: dict[str, list[dict[str, Any]]] = {
-        "prewatch": [],
+        "candidate_pool": [],
         "confirmation": [],
     }
     for row in rows:
-        stage = str(row.get("stage") or "").strip()
+        stage = _normalize_candidate_stage(str(row.get("stage") or ""))
         if stage in grouped:
             grouped[stage].append(row)
+    candidate_pool_summary = _summarize_candidate_evaluation_rows(
+        grouped["candidate_pool"],
+        stage="candidate_pool",
+        limit=limit,
+    )
+    confirmation_summary = _summarize_candidate_evaluation_rows(
+        grouped["confirmation"],
+        stage="confirmation",
+        limit=limit,
+    )
     return {
-        "prewatch": _summarize_candidate_evaluation_rows(grouped["prewatch"], stage="prewatch", limit=limit),
-        "confirmation": _summarize_candidate_evaluation_rows(grouped["confirmation"], stage="confirmation", limit=limit),
+        "candidate_pool": candidate_pool_summary,
+        "prewatch": dict(candidate_pool_summary),
+        "confirmation": confirmation_summary,
     }
 
 
@@ -329,26 +384,26 @@ def _build_candidate_evaluation_trend_summary(
     limit: int = 3,
 ) -> dict[str, Any]:
     grouped_recent: dict[str, list[dict[str, Any]]] = {
-        "prewatch": [],
+        "candidate_pool": [],
         "confirmation": [],
     }
     grouped_baseline: dict[str, list[dict[str, Any]]] = {
-        "prewatch": [],
+        "candidate_pool": [],
         "confirmation": [],
     }
     for row in recent_rows:
-        stage = str(row.get("stage") or "").strip()
+        stage = _normalize_candidate_stage(str(row.get("stage") or ""))
         if stage in grouped_recent:
             grouped_recent[stage].append(row)
     for row in baseline_rows:
-        stage = str(row.get("stage") or "").strip()
+        stage = _normalize_candidate_stage(str(row.get("stage") or ""))
         if stage in grouped_baseline:
             grouped_baseline[stage].append(row)
     result: dict[str, Any] = {
         "recent_window_days": recent_window_days,
         "baseline_window_days": baseline_window_days,
     }
-    for stage in ("prewatch", "confirmation"):
+    for stage in ("candidate_pool", "confirmation"):
         result[stage] = {
             "stage": stage,
             "stage_label": _candidate_evaluation_stage_label(stage),
@@ -360,14 +415,18 @@ def _build_candidate_evaluation_trend_summary(
                 limit=limit,
             ),
         }
+    result["prewatch"] = dict(result["candidate_pool"])
     return result
 
 
 def _parameter_label(parameter_key: str) -> str:
     return {
-        "prewatch_min_score": "观察门槛",
-        "max_prewatch_candidates_per_run": "观察候选上限",
-        "prewatch_event_min_score": "事件预热观察门槛",
+        "candidate_pool_min_score": "候选池门槛",
+        "max_candidate_pool_candidates_per_run": "候选池容量上限",
+        "candidate_pool_event_min_score": "事件候选门槛",
+        "prewatch_min_score": "候选池门槛",
+        "max_prewatch_candidates_per_run": "候选池容量上限",
+        "prewatch_event_min_score": "事件候选门槛",
         "event_score_threshold": "确认阈值",
         "confirmation_bonus": "确认加分项",
         "execution_entry_buffer_pct": "入场缓冲",
@@ -423,31 +482,31 @@ def _build_recommendation_item(
 
 def _candidate_trend_recommendation_for_reason(*, stage: str, reason: str) -> dict[str, Any] | None:
     normalized = str(reason or "").strip()
-    if stage == "prewatch":
+    if _normalize_candidate_stage(stage) == "candidate_pool":
         if normalized == "below_min_score":
             return _build_recommendation_item(
-                text="近 7 天预备池更多卡在低于观察阈值，优先回看观察门槛是否偏高。",
+                text="近 7 天候选池更多卡在低于观察卡阈值，优先回看观察卡门槛是否偏高。",
                 priority=10,
-                parameter_hints=[("prewatch_min_score", "high")],
+                parameter_hints=[("candidate_pool_min_score", "high")],
                 source="candidate_trend",
             )
         if normalized == "ranked_below_run_cap":
             return _build_recommendation_item(
-                text="近 7 天预备池更常排在候选上限之外，优先回看候选上限或预备池排序逻辑。",
+                text="近 7 天候选池更常排在候选上限之外，优先回看候选上限或候选池排序逻辑。",
                 priority=10,
-                parameter_hints=[("max_prewatch_candidates_per_run", "low")],
+                parameter_hints=[("max_candidate_pool_candidates_per_run", "low")],
                 source="candidate_trend",
             )
         if normalized in {"bearish_trend", "overheated_without_breakout"}:
             return _build_recommendation_item(
-                text="近 7 天预备池更多被市场结构挡掉，优先检查趋势与过热过滤是否过严。",
+                text="近 7 天候选池更多被市场结构挡掉，优先检查趋势与过热过滤是否过严。",
                 priority=10,
                 parameter_hints=[("trend_filter_strength", "inspect")],
                 source="candidate_trend",
             )
         if normalized.startswith("build_failed:"):
             return _build_recommendation_item(
-                text="近 7 天预备池构建异常增多，优先排查预备池快照或指标生成链路。",
+                text="近 7 天候选池构建异常增多，优先排查候选池快照或指标生成链路。",
                 priority=10,
                 source="candidate_trend",
             )
@@ -473,7 +532,7 @@ def _candidate_trend_recommendation_for_reason(*, stage: str, reason: str) -> di
             return _build_recommendation_item(
                 text="近 7 天事件降级样本更常卡在分数不足，优先回看事件降级阈值和文案降级逻辑。",
                 priority=10,
-                parameter_hints=[("prewatch_event_min_score", "high"), ("event_score_threshold", "high")],
+                parameter_hints=[("candidate_pool_event_min_score", "high"), ("event_score_threshold", "high")],
                 source="candidate_trend",
             )
         if normalized.startswith("scoring_failed:"):
@@ -491,7 +550,7 @@ def _build_candidate_trend_recommendations(summary: dict[str, Any]) -> list[dict
     if recent_window_days <= 0 or baseline_window_days <= 0:
         return []
     recommendations: list[dict[str, Any]] = []
-    for stage in ("prewatch", "confirmation"):
+    for stage in ("candidate_pool", "confirmation"):
         stage_summary = summary.get(stage) or {}
         for item in stage_summary.get("reason_trends") or []:
             recent_count = int(item.get("recent_count", 0) or 0)
@@ -527,24 +586,53 @@ def _prioritize_recommendations(items: list[dict[str, Any]]) -> list[dict[str, A
 
 
 def _historical_effect_exit_reason_label(reason: str) -> str:
+    normalized = normalize_close_reason(str(reason or ""))
     return {
-        "exit_pool": "兑现池退出（含达标止盈 / 提前锁盈 / 宏观保护）",
-        "hit_take_profit": "兑现池退出（含达标止盈 / 提前锁盈 / 宏观保护）",
-        "hit_invalidation": "失效退出",
-        "window_complete": "复盘窗口结算",
-        "insufficient_lookahead": "观察中",
-        "not_entered": "未成交",
-    }.get(reason, reason or "未回补")
+        "profit_protection_exit": "利润保护退出",
+        "hit_take_profit": "止盈退出",
+        "invalidation_exit": "失效价退出",
+        "window_close_evaluation": "窗口到期结算",
+        "holding_active": "持仓中",
+        "not_entered_price_invalidated": "失效未成交",
+        "not_entered_window_expired": "窗口内未成交",
+        "not_entered": "未成交结束",
+    }.get(normalized, normalized or "未回补")
 
 
 def _historical_effect_status_label(*, entered: bool, close_reason: str) -> str:
     if not entered:
-        return "未成交"
+        normalized = normalize_close_reason(close_reason, entered=False)
+        return {
+            "not_entered_price_invalidated": "失效未成交",
+            "not_entered_window_expired": "窗口内未成交",
+        }.get(normalized, "未成交结束")
     return _historical_effect_exit_reason_label(close_reason)
 
 
 def _is_profit_exit_reason(reason: str) -> bool:
-    return str(reason or "").strip() in {"exit_pool", "hit_take_profit"}
+    normalized = normalize_close_reason(str(reason or ""), entered=True)
+    return normalized in {"profit_protection_exit", "hit_take_profit"}
+
+
+def _normalized_close_reason_from_row(row: dict[str, Any]) -> str:
+    return normalize_close_reason(
+        str(row.get("close_reason") or ""),
+        exit_subreason=str(row.get("exit_subreason") or ""),
+        entered=bool(row.get("entered")),
+    )
+
+
+def _is_real_exited_row(row: dict[str, Any]) -> bool:
+    normalized = _normalized_close_reason_from_row(row)
+    return (
+        normalized in {
+            "profit_protection_exit",
+            "hit_take_profit",
+            "invalidation_exit",
+            "window_close_evaluation",
+        }
+        and row.get("realized_return") is not None
+    )
 
 
 def _close_reason_equivalent_for_audit(
@@ -615,10 +703,10 @@ def _serialize_ranked_decision_rows(
                 ),
                 "entered": bool(row.get("entered")),
                 "close_reason": str(row.get("close_reason") or ""),
+                "normalized_close_reason": _normalized_close_reason_from_row(row),
                 "real_exit_label": (
                     "已真实退出"
-                if str(row.get("close_reason") or "") in {"exit_pool", "hit_take_profit", "hit_invalidation", "window_complete"}
-                    and row.get("realized_return") is not None
+                    if _is_real_exited_row(row)
                     else "未真实退出"
                 ),
                 "entry_price": row.get("entry_price"),
@@ -1467,6 +1555,42 @@ def format_write_llm_usage_report_result(payload: dict[str, Any]) -> str:
     )
 
 
+def build_write_cycle_audit_payload(
+    store: Store,
+    *,
+    workspace_dir: Path,
+    status: str = "",
+    limit: int = 200,
+) -> dict[str, Any]:
+    payload = build_cycle_audit_payload(store, status=status, limit=limit, refresh=True)
+    workspace_dir = workspace_dir.resolve()
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    cycle_audit_dir = workspace_dir / "cycle_audit"
+    report_path = cycle_audit_dir / "cycle_audit.md"
+    payload_path = cycle_audit_dir / "cycle_audit_payload.json"
+    _write_report(report_path, format_cycle_audit_report(payload))
+    _write_json(payload_path, payload)
+    return {
+        "workspace_dir": str(workspace_dir),
+        "report_path": str(report_path),
+        "payload_path": str(payload_path),
+        "audit": payload,
+    }
+
+
+def format_write_cycle_audit_result(payload: dict[str, Any]) -> str:
+    audit = payload.get("audit") or {}
+    return "\n".join(
+        [
+            "周期链路审计：",
+            f"工作目录：{payload.get('workspace_dir', '-')}",
+            f"样本数：{len(audit.get('items') or [])}",
+            f"记录文件：{payload.get('report_path', '-')}",
+            f"结构化数据：{payload.get('payload_path', '-')}",
+        ]
+    )
+
+
 def format_theme_reference_payload(payload: dict[str, Any]) -> str:
     meta = payload.get("_meta") or {}
     lines = [
@@ -1530,25 +1654,33 @@ def _aggregate_historical_effect_rows(
         exited_rows = [
             row
             for row in entered_rows
-            if str(row.get("close_reason") or "") in {"exit_pool", "hit_invalidation", "window_complete"}
-            and row.get("realized_return") is not None
+            if _is_real_exited_row(row)
         ]
         realized_values = [float(row["realized_return"]) for row in exited_rows]
         take_profit_count = sum(1 for row in entered_rows if _is_profit_exit_reason(str(row.get("close_reason") or "")))
-        invalidation_count = sum(1 for row in entered_rows if str(row.get("close_reason") or "") == "hit_invalidation")
-        window_complete_count = sum(1 for row in entered_rows if str(row.get("close_reason") or "") == "window_complete")
+        invalidation_count = sum(
+            1 for row in entered_rows if _normalized_close_reason_from_row(row) == "invalidation_exit"
+        )
+        window_complete_count = sum(
+            1 for row in entered_rows if _normalized_close_reason_from_row(row) == "window_close_evaluation"
+        )
         items.append(
-            {
+            _with_legacy_aliases(
+                {
                 "key": key,
                 "label": label_fn(key),
                 "decision_count": len(group_rows),
                 "entered_count": len(entered_rows),
                 "take_profit_exit_count": take_profit_count,
                 "invalidation_exit_count": invalidation_count,
-                "window_complete_count": window_complete_count,
+                "window_close_evaluation_count": window_complete_count,
                 "avg_realized_return": _mean(realized_values),
                 "win_rate": _percentage(sum(1 for value in realized_values if value > 0), len(realized_values)),
-            }
+                },
+                {
+                    "window_complete_count": "window_close_evaluation_count",
+                },
+            )
         )
     return sorted(
         items,
@@ -1558,6 +1690,13 @@ def _aggregate_historical_effect_rows(
             str(row["label"]),
         ),
     )
+
+
+def _with_legacy_aliases(payload: dict[str, Any], aliases: dict[str, str]) -> dict[str, Any]:
+    merged = dict(payload)
+    for legacy_key, canonical_key in aliases.items():
+        merged[legacy_key] = payload.get(canonical_key)
+    return merged
 
 
 def _best_completed_group(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -1681,12 +1820,24 @@ def _build_historical_effect_review_data(
     entered_rows, auxiliary_deduped_merge_count = _dedupe_representative_rows(entered_rows)
     not_entered_rows = [row for row in rows if not bool(row.get("entered"))]
     take_profit_rows = [row for row in entered_rows if _is_profit_exit_reason(str(row.get("close_reason") or ""))]
-    invalidation_rows = [row for row in entered_rows if str(row.get("close_reason") or "") == "hit_invalidation"]
-    window_complete_rows = [row for row in entered_rows if str(row.get("close_reason") or "") == "window_complete"]
+    invalidation_rows = [
+        row for row in entered_rows if _normalized_close_reason_from_row(row) == "invalidation_exit"
+    ]
+    window_complete_rows = [
+        row for row in entered_rows if _normalized_close_reason_from_row(row) == "window_close_evaluation"
+    ]
     exited_rows = take_profit_rows + invalidation_rows + window_complete_rows
     open_rows = [row for row in rows if bool(row.get("entered")) and str(row.get("close_reason") or "") == "insufficient_lookahead"]
-    completed_rows = [row for row in rows if str(row.get("close_reason") or "") not in {"", "insufficient_lookahead"}]
-    pending_rows = [row for row in rows if str(row.get("close_reason") or "") in {"", "insufficient_lookahead"}]
+    completed_rows = [
+        row
+        for row in rows
+        if _normalized_close_reason_from_row(row) not in {"", "holding_active"}
+    ]
+    pending_rows = [
+        row
+        for row in rows
+        if _normalized_close_reason_from_row(row) in {"", "holding_active"}
+    ]
     realized_values = [float(row["realized_return"]) for row in exited_rows if row.get("realized_return") is not None]
     positive_values = [value for value in realized_values if value > 0]
     negative_values = [value for value in realized_values if value < 0]
@@ -1954,20 +2105,21 @@ def _build_historical_effect_review_data(
         ),
         reverse=True,
     )[:20]
-    exit_pool_transition_rows = [
+    holding_management_transition_rows = [
         row
         for row in rows
-        if bool(row.get("entered")) and str(row.get("close_reason") or "") == "exit_pool"
+        if bool(row.get("entered"))
+        and _normalized_close_reason_from_row(row) == "profit_protection_exit"
     ]
-    exit_pool_transition_holding_days = [
+    holding_management_transition_holding_days = [
         float(row.get("holding_days"))
-        for row in exit_pool_transition_rows
+        for row in holding_management_transition_rows
         if row.get("holding_days") is not None
     ]
-    exit_pool_transition_by_action: list[dict[str, Any]] = []
+    holding_management_transition_by_action: list[dict[str, Any]] = []
     for action in EXECUTABLE_DECISION_ACTIONS:
         action_rows = [
-            row for row in exit_pool_transition_rows
+            row for row in holding_management_transition_rows
             if str(row.get("action") or "").strip() == action
         ]
         holding_values = [
@@ -1977,7 +2129,7 @@ def _build_historical_effect_review_data(
         ]
         if not action_rows:
             continue
-        exit_pool_transition_by_action.append(
+        holding_management_transition_by_action.append(
             {
                 "action": action,
                 "action_display": _historical_effect_action_label(action),
@@ -1986,22 +2138,22 @@ def _build_historical_effect_review_data(
                 "median_holding_days": _median(holding_values),
             }
         )
-    fastest_exit_pool_transition = None
-    slowest_exit_pool_transition = None
+    fastest_holding_management_transition = None
+    slowest_holding_management_transition = None
     transition_rows_with_days = [
-        row for row in exit_pool_transition_rows
+        row for row in holding_management_transition_rows
         if row.get("holding_days") is not None
     ]
     if transition_rows_with_days:
-        fastest_exit_pool_transition = min(
+        fastest_holding_management_transition = min(
             transition_rows_with_days,
             key=lambda row: (float(row.get("holding_days") or 0.0), str(row.get("created_at") or "")),
         )
-        slowest_exit_pool_transition = max(
+        slowest_holding_management_transition = max(
             transition_rows_with_days,
             key=lambda row: (float(row.get("holding_days") or 0.0), str(row.get("created_at") or "")),
         )
-    recent_exit_pool_samples = [
+    recent_holding_management_samples = [
         {
             "symbol": str(row.get("symbol") or ""),
             "event_type": str(row.get("event_type") or ""),
@@ -2016,7 +2168,7 @@ def _build_historical_effect_review_data(
             "created_at": str(row.get("created_at") or ""),
         }
         for row in sorted(
-            exit_pool_transition_rows,
+            holding_management_transition_rows,
             key=lambda row: (
                 str(row.get("created_at") or ""),
                 str(row.get("symbol") or ""),
@@ -2024,8 +2176,8 @@ def _build_historical_effect_review_data(
             reverse=True,
         )[:3]
     ]
-    exit_pool_samples_with_return = [
-        row for row in exit_pool_transition_rows
+    holding_management_samples_with_return = [
+        row for row in holding_management_transition_rows
         if row.get("realized_return") is not None
     ]
 
@@ -2044,10 +2196,10 @@ def _build_historical_effect_review_data(
             "created_at": str(row.get("created_at") or ""),
         }
 
-    best_exit_pool_samples = [
+    best_holding_management_samples = [
         _serialize_trade_path_sample(row)
         for row in sorted(
-            exit_pool_samples_with_return,
+            holding_management_samples_with_return,
             key=lambda row: (
                 float(row.get("realized_return") or 0.0),
                 str(row.get("created_at") or ""),
@@ -2055,10 +2207,10 @@ def _build_historical_effect_review_data(
             reverse=True,
         )[:3]
     ]
-    worst_exit_pool_samples = [
+    worst_holding_management_samples = [
         _serialize_trade_path_sample(row)
         for row in sorted(
-            exit_pool_samples_with_return,
+            holding_management_samples_with_return,
             key=lambda row: (
                 float(row.get("realized_return") or 0.0),
                 str(row.get("created_at") or ""),
@@ -2075,20 +2227,23 @@ def _build_historical_effect_review_data(
     promoted_after_light_push_rows = [
         row
         for row in promoted_confirmation_rows
-        if int(_load_json_dict(row.get("packet_json")).get("prewatch_alert_sent_count") or 0) > 0
+        if int(
+            _load_json_dict(row.get("packet_json")).get(
+                "candidate_alert_sent_count",
+                _load_json_dict(row.get("packet_json")).get("prewatch_alert_sent_count") or 0,
+            )
+            or 0
+        ) > 0
     ]
-    prewatch_alert_rows = [
+    candidate_optional_alert_rows = [
         row
         for row in historical_alert_rows
         if bool(row.get("sent"))
-        and (
-            str(row.get("dedup_key") or "").startswith("prewatch-notify:")
-            or str(row.get("card_id") or "").startswith("prewatch-notify:")
-        )
+        and _is_candidate_optional_alert_record(row)
     ]
-    prewatch_alert_symbols = {
+    candidate_optional_alert_symbols = {
         str(row.get("symbol") or "").strip().upper()
-        for row in prewatch_alert_rows
+        for row in candidate_optional_alert_rows
         if str(row.get("symbol") or "").strip()
     }
     promoted_confirmation_symbols = {
@@ -2123,7 +2278,15 @@ def _build_historical_effect_review_data(
     for row in recent_observation_rows:
         symbol = str(row.get("symbol") or "").strip().upper()
         packet = _load_json_dict(row.get("packet_json"))
-        lifecycle = packet.get("prewatch_lifecycle") if isinstance(packet.get("prewatch_lifecycle"), dict) else {}
+        lifecycle = (
+            packet.get("candidate_lifecycle")
+            if isinstance(packet.get("candidate_lifecycle"), dict)
+            else (
+                packet.get("prewatch_lifecycle")
+                if isinstance(packet.get("prewatch_lifecycle"), dict)
+                else {}
+            )
+        )
         recent_observation_samples.append(
             {
                 "symbol": symbol,
@@ -2135,7 +2298,7 @@ def _build_historical_effect_review_data(
                 "theme_ids": list(row.get("theme_ids") or []),
                 "observation_count": int(lifecycle.get("observation_count") or 0),
                 "alert_sent_count": int(lifecycle.get("alert_sent_count") or 0),
-                "observation_status": "已触发观察提醒" if symbol in prewatch_alert_symbols else "仅后台观察",
+                "observation_status": "已触发观察卡" if symbol in candidate_optional_alert_symbols else "仅后台观察",
                 "confirmation_status": "已形成确认机会" if symbol in promoted_confirmation_symbols else "仍在观察",
             }
         )
@@ -2161,45 +2324,46 @@ def _build_historical_effect_review_data(
                 "created_at": str(row.get("created_at") or ""),
                 "action": str(row.get("action") or ""),
                 "action_display": _historical_effect_action_label(str(row.get("action") or "")),
-                "prewatch_score": float(packet.get("prewatch_score") or 0.0),
-                "prewatch_setup_type": str(packet.get("prewatch_setup_type") or ""),
-                "prewatch_alert_sent_count": int(packet.get("prewatch_alert_sent_count") or 0),
-                "prewatch_observation_count": int(packet.get("prewatch_observation_count") or 0),
+                "prewatch_score": float(packet.get("candidate_score", packet.get("prewatch_score") or 0.0) or 0.0),
+                "prewatch_setup_type": str(packet.get("candidate_setup_type", packet.get("prewatch_setup_type") or "")),
+                "prewatch_alert_sent_count": int(packet.get("candidate_alert_sent_count", packet.get("prewatch_alert_sent_count") or 0) or 0),
+                "prewatch_observation_count": int(packet.get("candidate_observation_count", packet.get("prewatch_observation_count") or 0) or 0),
             }
         )
-    exit_from_promoted_rows = [
+    holding_management_from_promoted_rows = [
         row
         for row in promoted_confirmation_rows
-        if bool(row.get("entered")) and str(row.get("close_reason") or "").strip() == "exit_pool"
+        if bool(row.get("entered")) and _normalized_close_reason_from_row(row) == "profit_protection_exit"
     ]
     simulated_entry_rows = [row for row in promoted_confirmation_rows if bool(row.get("entered"))]
     simulated_pending_entry_rows = [row for row in promoted_confirmation_rows if not bool(row.get("entered"))]
     simulated_completed_exit_rows = [
         row
         for row in promoted_confirmation_rows
-        if bool(row.get("entered")) and str(row.get("close_reason") or "").strip() not in {"", "insufficient_lookahead"}
+        if bool(row.get("entered"))
+        and _normalized_close_reason_from_row(row) not in {"", "holding_active"}
     ]
     simulated_open_rows = [
         row
         for row in promoted_confirmation_rows
-        if bool(row.get("entered")) and str(row.get("close_reason") or "").strip() == "insufficient_lookahead"
+        if bool(row.get("entered")) and _normalized_close_reason_from_row(row) == "holding_active"
     ]
     simulated_exit_breakdown = {
-        "exit_pool": sum(
+        "profit_protection_exit": sum(
             1 for row in simulated_completed_exit_rows
-            if str(row.get("close_reason") or "").strip() == "exit_pool"
+            if _normalized_close_reason_from_row(row) == "profit_protection_exit"
         ),
         "hit_take_profit": sum(
             1 for row in simulated_completed_exit_rows
-            if str(row.get("close_reason") or "").strip() == "hit_take_profit"
+            if _normalized_close_reason_from_row(row) == "hit_take_profit"
         ),
-        "hit_invalidation": sum(
+        "invalidation_exit": sum(
             1 for row in simulated_completed_exit_rows
-            if str(row.get("close_reason") or "").strip() == "hit_invalidation"
+            if _normalized_close_reason_from_row(row) == "invalidation_exit"
         ),
-        "window_complete": sum(
+        "window_close_evaluation": sum(
             1 for row in simulated_completed_exit_rows
-            if str(row.get("close_reason") or "").strip() == "window_complete"
+            if _normalized_close_reason_from_row(row) == "window_close_evaluation"
         ),
     }
     confirmation_to_entry_days = []
@@ -2251,45 +2415,64 @@ def _build_historical_effect_review_data(
                     "median_holding_days": _median(action_completed_exit_days),
                 }
             )
-    pool_funnel_summary = {
-        "prewatch_candidate_count": len(observation_rows_merged),
-        "prewatch_light_push_count": len(prewatch_alert_rows),
-        "promoted_confirmation_count": len(promoted_confirmation_rows),
-        "promoted_after_light_push_count": len(promoted_after_light_push_rows),
-        "promoted_without_light_push_count": max(
-            len(promoted_confirmation_rows) - len(promoted_after_light_push_rows),
-            0,
-        ),
-        "exit_from_promoted_count": len(exit_from_promoted_rows),
-        "observation_to_light_push_rate": _percentage(len(prewatch_alert_rows), len(observation_rows_merged)),
-        "observation_to_confirmation_rate": _percentage(len(promoted_confirmation_rows), len(observation_rows_merged)),
-        "light_push_to_confirmation_rate": _percentage(len(promoted_after_light_push_rows), len(prewatch_alert_rows)),
-        "confirmation_to_exit_rate": _percentage(len(exit_from_promoted_rows), len(promoted_confirmation_rows)),
-    }
-    simulation_funnel_summary = {
-        "prewatch_candidate_count": len(observation_rows_merged),
-        "prewatch_light_push_count": len(prewatch_alert_rows),
-        "promoted_confirmation_count": len(promoted_confirmation_rows),
-        "promoted_confirmation_deduped_merge_count": promoted_confirmation_deduped_merge_count,
-        "simulated_entry_count": len(simulated_entry_rows),
-        "simulated_pending_entry_count": len(simulated_pending_entry_rows),
-        "exit_pool_transition_count": len(exit_from_promoted_rows),
-        "simulated_completed_exit_count": len(simulated_completed_exit_rows),
-        "simulated_open_count": len(simulated_open_rows),
-        "observation_to_light_push_rate": _percentage(len(prewatch_alert_rows), len(observation_rows_merged)),
-        "observation_to_confirmation_rate": _percentage(len(promoted_confirmation_rows), len(observation_rows_merged)),
-        "confirmation_to_entry_rate": _percentage(len(simulated_entry_rows), len(promoted_confirmation_rows)),
-        "entry_to_exit_pool_rate": _percentage(len(exit_from_promoted_rows), len(simulated_entry_rows)),
-        "entry_to_completed_exit_rate": _percentage(len(simulated_completed_exit_rows), len(simulated_entry_rows)),
-        "avg_confirmation_to_entry_days": _mean(confirmation_to_entry_days),
-        "median_confirmation_to_entry_days": _median(confirmation_to_entry_days),
-        "confirmation_to_entry_timing_anomaly_count": confirmation_to_entry_timing_anomaly_count,
-        "avg_entry_to_completed_exit_days": _mean(entry_to_completed_exit_days),
-        "median_entry_to_completed_exit_days": _median(entry_to_completed_exit_days),
-        "entry_timing_by_action": entry_timing_by_action,
-        "completed_exit_timing_by_action": completed_exit_timing_by_action,
-        "completed_exit_breakdown": simulated_exit_breakdown,
-    }
+    pool_funnel_summary = _with_legacy_aliases(
+        {
+            "candidate_pool_count": len(observation_rows_merged),
+            "candidate_optional_alert_count": len(candidate_optional_alert_rows),
+            "promoted_confirmation_count": len(promoted_confirmation_rows),
+            "promoted_after_light_push_count": len(promoted_after_light_push_rows),
+            "promoted_without_light_push_count": max(
+                len(promoted_confirmation_rows) - len(promoted_after_light_push_rows),
+                0,
+            ),
+            "holding_management_from_promoted_count": len(holding_management_from_promoted_rows),
+            "observation_to_light_push_rate": _percentage(len(candidate_optional_alert_rows), len(observation_rows_merged)),
+            "candidate_to_optional_alert_rate": _percentage(len(candidate_optional_alert_rows), len(observation_rows_merged)),
+            "observation_to_confirmation_rate": _percentage(len(promoted_confirmation_rows), len(observation_rows_merged)),
+            "candidate_optional_alert_to_confirmation_rate": _percentage(len(promoted_after_light_push_rows), len(candidate_optional_alert_rows)),
+            "confirmation_to_holding_management_rate": _percentage(len(holding_management_from_promoted_rows), len(promoted_confirmation_rows)),
+        },
+        {
+            "prewatch_candidate_count": "candidate_pool_count",
+            "prewatch_light_push_count": "candidate_optional_alert_count",
+            "exit_from_promoted_count": "holding_management_from_promoted_count",
+            "light_push_to_confirmation_rate": "candidate_optional_alert_to_confirmation_rate",
+            "confirmation_to_exit_rate": "confirmation_to_holding_management_rate",
+        },
+    )
+    simulation_funnel_summary = _with_legacy_aliases(
+        {
+            "candidate_pool_count": len(observation_rows_merged),
+            "candidate_optional_alert_count": len(candidate_optional_alert_rows),
+            "promoted_confirmation_count": len(promoted_confirmation_rows),
+            "promoted_confirmation_deduped_merge_count": promoted_confirmation_deduped_merge_count,
+            "simulated_entry_count": len(simulated_entry_rows),
+            "simulated_pending_entry_count": len(simulated_pending_entry_rows),
+            "holding_management_transition_count": len(holding_management_from_promoted_rows),
+            "simulated_completed_exit_count": len(simulated_completed_exit_rows),
+            "simulated_open_count": len(simulated_open_rows),
+            "observation_to_light_push_rate": _percentage(len(candidate_optional_alert_rows), len(observation_rows_merged)),
+            "candidate_to_optional_alert_rate": _percentage(len(candidate_optional_alert_rows), len(observation_rows_merged)),
+            "observation_to_confirmation_rate": _percentage(len(promoted_confirmation_rows), len(observation_rows_merged)),
+            "confirmation_to_entry_rate": _percentage(len(simulated_entry_rows), len(promoted_confirmation_rows)),
+            "entry_to_holding_management_rate": _percentage(len(holding_management_from_promoted_rows), len(simulated_entry_rows)),
+            "entry_to_completed_exit_rate": _percentage(len(simulated_completed_exit_rows), len(simulated_entry_rows)),
+            "avg_confirmation_to_entry_days": _mean(confirmation_to_entry_days),
+            "median_confirmation_to_entry_days": _median(confirmation_to_entry_days),
+            "confirmation_to_entry_timing_anomaly_count": confirmation_to_entry_timing_anomaly_count,
+            "avg_entry_to_completed_exit_days": _mean(entry_to_completed_exit_days),
+            "median_entry_to_completed_exit_days": _median(entry_to_completed_exit_days),
+            "entry_timing_by_action": entry_timing_by_action,
+            "completed_exit_timing_by_action": completed_exit_timing_by_action,
+            "completed_exit_breakdown": simulated_exit_breakdown,
+        },
+        {
+            "prewatch_candidate_count": "candidate_pool_count",
+            "prewatch_light_push_count": "candidate_optional_alert_count",
+            "exit_pool_transition_count": "holding_management_transition_count",
+            "entry_to_exit_pool_rate": "entry_to_holding_management_rate",
+        },
+    )
     review = {
         "status": "正式" if formal_ready else "草稿",
         "status_label": "历史效果复盘（正式）" if formal_ready else "历史效果复盘（草稿）",
@@ -2308,65 +2491,86 @@ def _build_historical_effect_review_data(
         },
         "draft_reasons": [] if formal_ready else draft_reasons,
         "archive_db_path": str(archive_db_path) if archive_db_path is not None else "",
-        "overview": {
-            "decision_count": len(rows),
-            "entered_count": len(entered_rows),
-            "not_entered_count": len(not_entered_rows),
-            "take_profit_exit_count": len(take_profit_rows),
-            "invalidation_exit_count": len(invalidation_rows),
-            "window_complete_count": len(window_complete_rows),
-            "open_position_count": len(open_rows),
-            "avg_realized_return": _mean(realized_values),
-            "median_realized_return": _median(realized_values),
-            "win_rate": _percentage(sum(1 for value in realized_values if value > 0), len(realized_values)),
-            "profit_loss_ratio": (
-                round((_mean(positive_values) or 0.0) / abs(_mean(negative_values) or 0.0), 2)
-                if positive_values and negative_values and (_mean(negative_values) or 0.0) != 0.0
-                else None
-            ),
-        },
-        "execution_quality": {
-            "entry_hit_rate": _percentage(len(entered_rows), len(rows)),
-            "take_profit_hit_rate": _percentage(len(take_profit_rows), len(entered_rows)),
-            "invalidation_hit_rate": _percentage(len(invalidation_rows), len(entered_rows)),
-            "window_complete_rate": _percentage(len(window_complete_rows), len(entered_rows)),
-            "avg_holding_days": _mean([float(value) for value in holding_days]),
-            "completed_outcome_count": len(completed_rows),
-            "pending_outcome_count": len(pending_rows),
-        },
-        "trade_path_summary": {
-            "exit_pool_transition_count": len(exit_pool_transition_rows),
-            "avg_days_to_exit_pool": _mean(exit_pool_transition_holding_days),
-            "median_days_to_exit_pool": _median(exit_pool_transition_holding_days),
-            "by_action": exit_pool_transition_by_action,
-            "fastest_sample": (
+        "overview": _with_legacy_aliases(
+            {
+                "decision_count": len(rows),
+                "entered_count": len(entered_rows),
+                "not_entered_count": len(not_entered_rows),
+                "take_profit_exit_count": len(take_profit_rows),
+                "profit_protection_exit_count": len(take_profit_rows),
+                "holding_management_exit_count": len(take_profit_rows),
+                "invalidation_exit_count": len(invalidation_rows),
+                "window_close_evaluation_count": len(window_complete_rows),
+                "open_position_count": len(open_rows),
+                "holding_active_count": len(open_rows),
+                "avg_realized_return": _mean(realized_values),
+                "median_realized_return": _median(realized_values),
+                "win_rate": _percentage(sum(1 for value in realized_values if value > 0), len(realized_values)),
+                "profit_loss_ratio": (
+                    round((_mean(positive_values) or 0.0) / abs(_mean(negative_values) or 0.0), 2)
+                    if positive_values and negative_values and (_mean(negative_values) or 0.0) != 0.0
+                    else None
+                ),
+            },
+            {
+                "window_complete_count": "window_close_evaluation_count",
+            },
+        ),
+        "execution_quality": _with_legacy_aliases(
+            {
+                "entry_hit_rate": _percentage(len(entered_rows), len(rows)),
+                "take_profit_hit_rate": _percentage(len(take_profit_rows), len(entered_rows)),
+                "profit_protection_hit_rate": _percentage(len(take_profit_rows), len(entered_rows)),
+                "invalidation_hit_rate": _percentage(len(invalidation_rows), len(entered_rows)),
+                "window_close_evaluation_rate": _percentage(len(window_complete_rows), len(entered_rows)),
+                "avg_holding_days": _mean([float(value) for value in holding_days]),
+                "completed_outcome_count": len(completed_rows),
+                "pending_outcome_count": len(pending_rows),
+            },
+            {
+                "window_complete_rate": "window_close_evaluation_rate",
+            },
+        ),
+        "trade_path_summary": _with_legacy_aliases(
+            {
+                "holding_management_transition_count": len(holding_management_transition_rows),
+                "avg_days_to_holding_management": _mean(holding_management_transition_holding_days),
+                "median_days_to_holding_management": _median(holding_management_transition_holding_days),
+                "by_action": holding_management_transition_by_action,
+                "fastest_sample": (
                 {
-                    "symbol": str(fastest_exit_pool_transition.get("symbol") or ""),
-                    "event_type": str(fastest_exit_pool_transition.get("event_type") or ""),
-                    "action": str(fastest_exit_pool_transition.get("action") or ""),
-                    "action_display": _historical_effect_action_label(str(fastest_exit_pool_transition.get("action") or "")),
-                    "holding_days": fastest_exit_pool_transition.get("holding_days"),
-                    "created_at": str(fastest_exit_pool_transition.get("created_at") or ""),
+                    "symbol": str(fastest_holding_management_transition.get("symbol") or ""),
+                    "event_type": str(fastest_holding_management_transition.get("event_type") or ""),
+                    "action": str(fastest_holding_management_transition.get("action") or ""),
+                    "action_display": _historical_effect_action_label(str(fastest_holding_management_transition.get("action") or "")),
+                    "holding_days": fastest_holding_management_transition.get("holding_days"),
+                    "created_at": str(fastest_holding_management_transition.get("created_at") or ""),
                 }
-                if fastest_exit_pool_transition is not None
+                if fastest_holding_management_transition is not None
                 else {}
             ),
             "slowest_sample": (
                 {
-                    "symbol": str(slowest_exit_pool_transition.get("symbol") or ""),
-                    "event_type": str(slowest_exit_pool_transition.get("event_type") or ""),
-                    "action": str(slowest_exit_pool_transition.get("action") or ""),
-                    "action_display": _historical_effect_action_label(str(slowest_exit_pool_transition.get("action") or "")),
-                    "holding_days": slowest_exit_pool_transition.get("holding_days"),
-                    "created_at": str(slowest_exit_pool_transition.get("created_at") or ""),
+                    "symbol": str(slowest_holding_management_transition.get("symbol") or ""),
+                    "event_type": str(slowest_holding_management_transition.get("event_type") or ""),
+                    "action": str(slowest_holding_management_transition.get("action") or ""),
+                    "action_display": _historical_effect_action_label(str(slowest_holding_management_transition.get("action") or "")),
+                    "holding_days": slowest_holding_management_transition.get("holding_days"),
+                    "created_at": str(slowest_holding_management_transition.get("created_at") or ""),
                 }
-                if slowest_exit_pool_transition is not None
+                if slowest_holding_management_transition is not None
                 else {}
             ),
-            "recent_samples": recent_exit_pool_samples,
-            "best_samples": best_exit_pool_samples,
-            "worst_samples": worst_exit_pool_samples,
-        },
+            "recent_samples": recent_holding_management_samples,
+            "best_samples": best_holding_management_samples,
+            "worst_samples": worst_holding_management_samples,
+            },
+            {
+                "exit_pool_transition_count": "holding_management_transition_count",
+                "avg_days_to_exit_pool": "avg_days_to_holding_management",
+                "median_days_to_exit_pool": "median_days_to_holding_management",
+            },
+        ),
         "pool_funnel_summary": pool_funnel_summary,
         "simulation_funnel_summary": simulation_funnel_summary,
         "path_quality_summary": path_quality_summary,
@@ -2376,7 +2580,8 @@ def _build_historical_effect_review_data(
         "recent_observation_samples": recent_observation_samples,
         "observation_after_summary": {
             "observation_count": len(observation_rows_merged),
-            "observation_alert_count": len(prewatch_alert_rows),
+            "observation_alert_count": len(candidate_optional_alert_rows),
+            "candidate_optional_alert_count": len(candidate_optional_alert_rows),
             "promoted_confirmation_count": len(promoted_confirmation_rows),
             "promoted_after_alert_count": len(promoted_after_light_push_rows),
             "promoted_without_alert_count": max(
@@ -2384,9 +2589,10 @@ def _build_historical_effect_review_data(
                 0,
             ),
             "still_observing_symbol_count": len(still_observing_symbols),
-            "observation_to_alert_rate": _percentage(len(prewatch_alert_rows), len(observation_rows_merged)),
+            "observation_to_alert_rate": _percentage(len(candidate_optional_alert_rows), len(observation_rows_merged)),
+            "candidate_to_optional_alert_rate": _percentage(len(candidate_optional_alert_rows), len(observation_rows_merged)),
             "observation_to_confirmation_rate": _percentage(len(promoted_confirmation_rows), len(observation_rows_merged)),
-            "alert_to_confirmation_rate": _percentage(len(promoted_after_light_push_rows), len(prewatch_alert_rows)),
+            "alert_to_confirmation_rate": _percentage(len(promoted_after_light_push_rows), len(candidate_optional_alert_rows)),
             "avg_days_to_confirmation": _mean(observation_to_confirmation_days),
             "median_days_to_confirmation": _median(observation_to_confirmation_days),
             "representative_samples": observation_after_samples,
@@ -2687,13 +2893,15 @@ def _summarize_adjusted_price_readiness(store: Store, rows: list[dict[str, Any]]
 def _sample_status_label(row: dict[str, Any]) -> str:
     mapping = {
         "hit_take_profit": "止盈退出",
-        "exit_pool": "止盈退出",
-        "hit_invalidation": "失效退出",
-        "window_complete": "复盘窗口结算",
-        "insufficient_lookahead": "观察中",
+        "profit_protection_exit": "利润保护退出",
+        "invalidation_exit": "失效退出",
+        "window_close_evaluation": "复盘窗口结算",
+        "holding_active": "持仓中",
+        "not_entered_price_invalidated": "失效未成交",
+        "not_entered_window_expired": "窗口内未成交",
         "not_entered": "未成交",
     }
-    return mapping.get(str(row.get("close_reason") or "").strip(), "未回补")
+    return mapping.get(_normalized_close_reason_from_row(row), "未回补")
 
 
 def build_outcome_sample_payload(
@@ -3033,9 +3241,9 @@ def build_service(
     _sync_watchlist_if_needed(store, settings, runtime_config)
     watchlist = store.load_watchlist()
     stock_watchlist = store.load_watchlist(asset_type="stock")
-    prewatch_symbols = _resolve_prewatch_symbols(runtime_config, watchlist)
+    candidate_pool_symbols = _resolve_candidate_pool_symbols(runtime_config, watchlist)
     google_feed_symbols = _limit_symbols_for_source(
-        _prioritize_symbols_for_source(prewatch_symbols, watchlist),
+        _prioritize_symbols_for_source(candidate_pool_symbols, watchlist),
         settings.max_google_feed_symbols_per_run,
     )
     adapters = []
@@ -3076,7 +3284,7 @@ def build_service(
         },
         run_name=run_name,
         note=note,
-        prewatch_symbols=prewatch_symbols,
+        prewatch_symbols=candidate_pool_symbols,
     )
 
 
@@ -3111,7 +3319,7 @@ def _is_sec_eligible_symbol(symbol: str) -> bool:
     return True
 
 
-def _resolve_prewatch_symbols(runtime_config: AgentRuntimeConfig, watchlist: set[str]) -> list[str]:
+def _resolve_candidate_pool_symbols(runtime_config: AgentRuntimeConfig, watchlist: set[str]) -> list[str]:
     ordered: list[str] = []
     seen: set[str] = set()
 
@@ -3136,6 +3344,10 @@ def _resolve_prewatch_symbols(runtime_config: AgentRuntimeConfig, watchlist: set
         ordered.extend(sorted(watchlist))
 
     return ordered
+
+
+def _resolve_prewatch_symbols(runtime_config: AgentRuntimeConfig, watchlist: set[str]) -> list[str]:
+    return _resolve_candidate_pool_symbols(runtime_config, watchlist)
 
 
 def _prioritize_symbols_for_source(preferred_symbols: list[str], watchlist: set[str]) -> list[str]:
@@ -3638,12 +3850,14 @@ def build_replay_evaluation_payload(store: Store, *, run_id: str, days: int, lim
         event_type_context=event_type_context,
         pool_context=pool_context,
     )
+    cycle_audit = build_run_cycle_audit_payload(store, run_id=run_id, limit=limit)
     return serialize_replay_evaluation(
         run_detail,
         strategy_report,
         source_health,
         card_diagnostics,
         decision_diagnostics,
+        cycle_audit,
     )
 
 
@@ -3751,6 +3965,15 @@ def _build_card_diagnostics(
                 "valid_until_text": delivery["valid_until_text"],
                 "market_data_complete": delivery["market_data_complete"],
                 "promoted_from_prewatch": card.get("promoted_from_prewatch", False),
+                "candidate_score": card.get("candidate_score", card.get("prewatch_score", 0.0)),
+                "candidate_setup_type": card.get("candidate_setup_type", card.get("prewatch_setup_type", "")),
+                "candidate_observation_count": card.get("candidate_observation_count", card.get("prewatch_observation_count", 0)),
+                "candidate_alert_sent_count": card.get("candidate_alert_sent_count", card.get("prewatch_alert_sent_count", 0)),
+                "candidate_first_seen_at": card.get("candidate_first_seen_at", card.get("prewatch_first_seen_at", "")),
+                "candidate_last_seen_at": card.get("candidate_last_seen_at", card.get("prewatch_last_seen_at", "")),
+                "candidate_last_alert_sent_at": card.get("candidate_last_alert_sent_at", card.get("prewatch_last_alert_sent_at", "")),
+                "candidate_source_decision_id": card.get("candidate_source_decision_id", card.get("prewatch_source_decision_id", "")),
+                "candidate_promotion_reason": card.get("candidate_promotion_reason", card.get("prewatch_promotion_reason", "")),
                 "prewatch_score": card.get("prewatch_score", 0.0),
                 "prewatch_setup_type": card.get("prewatch_setup_type", ""),
                 "prewatch_observation_count": card.get("prewatch_observation_count", 0),
@@ -3856,9 +4079,11 @@ def _build_decision_diagnostics(
                 "event_type": event_type,
                 "pool": row["pool"],
                 "pool_label": {
-                    "prewatch": "预备池",
-                    "confirmation": "确认池",
-                    "exit": "兑现池",
+                    "candidate_pool": "第一池：候选池",
+                    "prewatch": "第一池：候选池",
+                    "confirmation": "第二池：确认池",
+                    "exit": "第三池：持仓管理",
+                    "holding_management": "第三池：持仓管理",
                 }.get(row["pool"], row["pool"]),
                 "action": action,
                 "priority": row["priority"],
@@ -3873,6 +4098,15 @@ def _build_decision_diagnostics(
                 "packet": packet,
                 "source_decision_id": str(packet.get("source_decision_id") or ""),
                 "promoted_from_prewatch": bool(packet.get("promoted_from_prewatch")),
+                "candidate_score": float(packet.get("candidate_score", packet.get("prewatch_score") or 0.0) or 0.0),
+                "candidate_setup_type": str(packet.get("candidate_setup_type", packet.get("prewatch_setup_type") or "")),
+                "candidate_observation_count": int(packet.get("candidate_observation_count", packet.get("prewatch_observation_count") or 0) or 0),
+                "candidate_alert_sent_count": int(packet.get("candidate_alert_sent_count", packet.get("prewatch_alert_sent_count") or 0) or 0),
+                "candidate_first_seen_at": str(packet.get("candidate_first_seen_at", packet.get("prewatch_first_seen_at") or "")),
+                "candidate_last_seen_at": str(packet.get("candidate_last_seen_at", packet.get("prewatch_last_seen_at") or "")),
+                "candidate_last_alert_sent_at": str(packet.get("candidate_last_alert_sent_at", packet.get("prewatch_last_alert_sent_at") or "")),
+                "candidate_source_decision_id": str(packet.get("candidate_source_decision_id", packet.get("prewatch_source_decision_id") or "")),
+                "candidate_promotion_reason": str(packet.get("candidate_promotion_reason", packet.get("prewatch_promotion_reason") or "")),
                 "prewatch_score": float(packet.get("prewatch_score") or 0.0),
                 "prewatch_setup_type": str(packet.get("prewatch_setup_type") or ""),
                 "prewatch_observation_count": int(packet.get("prewatch_observation_count") or 0),
@@ -3923,6 +4157,15 @@ def _build_decision_diagnostics(
             "final_score": source_item.get("final_score"),
             "created_at": source_item.get("created_at"),
             "promoted_from_prewatch": bool(source_item.get("promoted_from_prewatch")),
+            "candidate_score": source_item.get("candidate_score", source_item.get("prewatch_score")),
+            "candidate_setup_type": source_item.get("candidate_setup_type", source_item.get("prewatch_setup_type")),
+            "candidate_observation_count": source_item.get("candidate_observation_count", source_item.get("prewatch_observation_count")),
+            "candidate_alert_sent_count": source_item.get("candidate_alert_sent_count", source_item.get("prewatch_alert_sent_count")),
+            "candidate_first_seen_at": source_item.get("candidate_first_seen_at", source_item.get("prewatch_first_seen_at")),
+            "candidate_last_seen_at": source_item.get("candidate_last_seen_at", source_item.get("prewatch_last_seen_at")),
+            "candidate_last_alert_sent_at": source_item.get("candidate_last_alert_sent_at", source_item.get("prewatch_last_alert_sent_at")),
+            "candidate_source_decision_id": source_item.get("candidate_source_decision_id", source_item.get("prewatch_source_decision_id")),
+            "candidate_promotion_reason": source_item.get("candidate_promotion_reason", source_item.get("prewatch_promotion_reason")),
             "prewatch_score": source_item.get("prewatch_score"),
             "prewatch_setup_type": source_item.get("prewatch_setup_type"),
             "prewatch_observation_count": source_item.get("prewatch_observation_count"),
@@ -5158,7 +5401,6 @@ def _build_preview_notification_card(
     *,
     symbol: str = "NVDA",
     watch_mode: bool = False,
-    degraded_formal_mode: bool = False,
 ) -> OpportunityCard:
     now = utcnow()
     normalized_symbol = symbol.upper()
@@ -5171,8 +5413,8 @@ def _build_preview_notification_card(
             symbol=normalized_symbol,
             horizon="position",
             event_type="strategic",
-            headline_summary="模拟预备池卡片，用于预览当前文案与展示层效果。",
-            bull_case="若题材发酵持续、价格结构继续转强，后续有机会升级为正式操作卡。",
+            headline_summary="模拟候选池卡片，用于预览当前文案与展示层效果。",
+            bull_case="若题材发酵持续、价格结构继续转强，后续有机会升级为正式卡。",
             bear_case="若量能衰减或结构转弱，观察价值会快速下降。",
             event_score=74.0,
             market_score=61.0,
@@ -5203,59 +5445,9 @@ def _build_preview_notification_card(
             geopolitical_risk="low",
             macro_risk_score=35.0,
             promoted_from_prewatch=True,
-            prewatch_score=78.0,
-            prewatch_setup_type="pullback_watch",
-            positioning_hint="当前先放入观察名单，不追价，等结构和催化进一步确认后再升级。",
-        )
-    if degraded_formal_mode:
-        return OpportunityCard(
-            card_id=f"preview-formal-degraded:{normalized_symbol}",
-            event_id=f"preview-formal-degraded-event:{normalized_symbol}",
-            symbol=normalized_symbol,
-            horizon="swing",
-            event_type="earnings",
-            headline_summary="模拟正式信号降级场景，用于预览执行信号被自动降级后的展示效果。",
-            bull_case="若盘后关键数据继续超预期，且次日放量脱离震荡区，后续仍可能重新升级为正式机会。",
-            bear_case="若结构继续横盘且预期盈亏比不足，贸然按正式卡执行更容易陷入低质量交易。",
-            event_score=84.0,
-            market_score=66.0,
-            final_score=77.8,
-            entry_range=PriceRange(199.85, 204.28),
-            take_profit_range=PriceRange(207.50, 211.40),
-            invalidation_level=194.08,
-            invalidation_reason="若价格跌破事件触发后的关键支撑位，做多逻辑失效。",
-            risk_notes=["财报后波动往往放大，过紧止损容易被噪音触发。"],
-            source_refs=[
-                "https://www.sec.gov/ixviewer/doc",
-                "https://www.reuters.com/world/us/example",
-                "https://news.google.com/articles/preview-amd",
-            ],
-            created_at=now,
-            ttl=now + timedelta(days=4),
-            priority="high",
-            dedup_key=f"preview-formal-degraded:{normalized_symbol}",
-            bias="long",
-            display_name=display_name,
-            action_label="确认做多",
-            confidence_label="高",
-            confidence_score=82.0,
-            reason_to_watch="事件强度已经够，但当前价格结构和预期盈亏比还不够理想，适合先看次日量价确认。",
-            trend_state="neutral",
-            rsi_14=49.6,
-            relative_volume=0.26,
-            theme_tags=theme_tags,
-            chain_summary="今日试探建仓 -> 今日确认做多",
-            market_regime="neutral",
-            rate_risk="medium",
-            geopolitical_risk="low",
-            macro_risk_score=40.0,
-            positioning_hint="先盯次日量价是否转强，再决定是否重新升级为正式机会。",
-            execution_eligible=False,
-            execution_note="按当前入场区、止盈区和失效价估算，预期盈亏比不足，先降级为观察。",
-            llm_summary="AMD 财报事件本身较强，但当前仍处在震荡区，且量能明显不足。",
-            llm_impact_inference="若次日放量脱离震荡区，才更像可重新升级的正式机会。",
-            llm_reasoning="财报催化够强，但当前预期盈亏比不足，先观察比直接执行更稳。",
-            llm_uncertainty="若管理层指引偏保守，股价可能快速回落。",
+            candidate_score=78.0,
+            candidate_setup_type="pullback_watch",
+            positioning_hint="当前先放入候选池，不追价，等结构和催化进一步确认后再升级。",
         )
     return OpportunityCard(
         card_id=f"preview-formal:{normalized_symbol}",
@@ -5353,7 +5545,7 @@ def _build_preview_notification_card(
     )
 
 
-def _build_preview_exit_pool_card(
+def _build_preview_holding_management_card(
     runtime_config: AgentRuntimeConfig,
     *,
     symbol: str = "NVDA",
@@ -5368,9 +5560,9 @@ def _build_preview_exit_pool_card(
         symbol=normalized_symbol,
         horizon="position",
         event_type="strategic",
-        headline_summary="模拟兑现池卡片，用于预览从确认到兑现的完整提示效果。",
+        headline_summary="模拟退出卡片，用于预览从确认到持仓管理退出的完整提示效果。",
         bull_case="前期进攻逻辑已兑现一部分，当前重点不再是找新买点，而是管好已有利润。",
-        bear_case="若继续把兑现卡当成新开仓信号，容易在高位追入或回吐已有浮盈。",
+        bear_case="若继续把退出卡当成新开仓信号，容易在高位追入或回吐已有浮盈。",
         event_score=79.0,
         market_score=73.0,
         final_score=81.0,
@@ -5378,7 +5570,7 @@ def _build_preview_exit_pool_card(
         take_profit_range=PriceRange(110.0, 116.0),
         invalidation_level=97.0,
         invalidation_reason="模拟卡片，不作为真实交易依据。",
-        risk_notes=["模拟预览用卡片", "兑现池卡不代表新的开仓信号"],
+        risk_notes=["模拟预览用卡片", "退出卡不代表新的开仓信号"],
         source_refs=["https://example.com/preview-alert"],
         created_at=now,
         ttl=now + timedelta(days=2),
@@ -5386,7 +5578,7 @@ def _build_preview_exit_pool_card(
         dedup_key=f"preview-exit:{normalized_symbol}",
         bias="long",
         display_name=display_name,
-        action_label="进入兑现池",
+        action_label="利润保护退出",
         confidence_label="高",
         confidence_score=86.0,
         reason_to_watch="价格已进入目标区更深位置，当前更适合按计划兑现利润，而不是继续当作进攻卡处理。",
@@ -5394,17 +5586,25 @@ def _build_preview_exit_pool_card(
         rsi_14=67.3,
         relative_volume=1.46,
         theme_tags=theme_tags,
-        chain_summary="3天前确认做多 -> 今日进入兑现池",
+        chain_summary="3天前确认做多 -> 今日利润保护退出",
         market_regime="neutral",
         rate_risk="medium",
         geopolitical_risk="low",
         macro_risk_score=42.0,
         positioning_hint="已到达目标区更深位置，优先兑现利润，不再继续追新仓。",
         execution_eligible=False,
-        execution_note="兑现池卡只面向已有仓位管理。",
-        exit_pool_subreason="target_hit",
-        exit_pool_source_decision_id="preview-confirm-decision",
+        execution_note="退出卡只面向已有仓位管理。",
+        holding_management_subreason="target_hit",
+        holding_management_source_decision_id="preview-confirm-decision",
     )
+
+
+def _build_preview_exit_pool_card(
+    runtime_config: AgentRuntimeConfig,
+    *,
+    symbol: str = "NVDA",
+) -> OpportunityCard:
+    return _build_preview_holding_management_card(runtime_config, symbol=symbol)
 
 
 def _build_preview_event_insight(symbol: str) -> EventInsight:
@@ -5460,11 +5660,16 @@ def build_preview_alert_payload(
     *,
     symbol: str = "NVDA",
     watch_mode: bool = False,
+    candidate_optional_mode: bool = False,
+    holding_management_mode: bool = False,
+    candidate_optional_light: bool = False,
     prewatch_light: bool = False,
     exit_pool_mode: bool = False,
-    degraded_formal_mode: bool = False,
 ) -> dict[str, Any]:
     llm_used = False
+    candidate_optional_light = bool(candidate_optional_light or prewatch_light)
+    candidate_optional_mode = bool(candidate_optional_mode or candidate_optional_light)
+    holding_management_mode = bool(holding_management_mode or exit_pool_mode)
 
     def _merge_preview_narrative(base_card: OpportunityCard, narrative) -> OpportunityCard:
         return OpportunityCard(
@@ -5489,18 +5694,18 @@ def build_preview_alert_payload(
             }
         )
 
-    if prewatch_light:
+    if candidate_optional_mode:
         service = build_service(
             settings,
             runtime_config=runtime_config,
             apply_runtime_config=False,
         )
-        candidate = PrewatchCandidate(
+        candidate = CandidatePoolCandidate(
             symbol=symbol.upper(),
             horizon="position",
             setup_type="pullback_watch",
             score=78.0,
-            headline_summary="模拟观察提醒，用于预览当前提醒正文与 LLM 文案效果。",
+            headline_summary="模拟观察卡，用于预览当前提醒正文与 LLM 文案效果。",
             action_hint="轻仓观察",
             reason_to_watch="先盯合作细节、订单金额和时间表是否继续落地，再决定是否升级。",
             last_price=100.0,
@@ -5513,7 +5718,7 @@ def build_preview_alert_payload(
             trigger_event_type="strategic",
             as_of=utcnow(),
         )
-        card = service._build_prewatch_notification_card(  # type: ignore[attr-defined]
+        card = service._build_candidate_optional_notification_card(  # type: ignore[attr-defined]
             candidate,
             macro_context={
                 "market_regime": "neutral",
@@ -5521,7 +5726,7 @@ def build_preview_alert_payload(
                 "geopolitical_risk": "low",
                 "macro_risk_score": 35.0,
             },
-            run_id="preview-prewatch-light",
+            run_id="preview-candidate-optional",
         )
         llm_used = any(
             [
@@ -5531,8 +5736,8 @@ def build_preview_alert_payload(
                 card.llm_uncertainty,
             ]
         )
-    elif exit_pool_mode:
-        card = _build_preview_exit_pool_card(runtime_config, symbol=symbol)
+    elif holding_management_mode:
+        card = _build_preview_holding_management_card(runtime_config, symbol=symbol)
         insight = _build_preview_event_insight(card.symbol)
         if settings.openai_api_key and settings.use_llm_narration:
             narrator = OpenAINarrator(
@@ -5563,7 +5768,6 @@ def build_preview_alert_payload(
             runtime_config,
             symbol=symbol,
             watch_mode=watch_mode,
-            degraded_formal_mode=degraded_formal_mode,
         )
         insight = _build_preview_event_insight(card.symbol)
         if settings.openai_api_key and settings.use_llm_narration:
@@ -5596,12 +5800,14 @@ def build_preview_alert_payload(
     return {
         "symbol": card.symbol,
         "watch_mode": watch_mode,
-        "prewatch_light": prewatch_light,
+        "candidate_optional_mode": candidate_optional_mode,
+        "holding_management_mode": holding_management_mode,
+        "candidate_optional_light": candidate_optional_light,
+        "prewatch_light": candidate_optional_light,
         "exit_pool_mode": exit_pool_mode,
-        "degraded_formal_mode": degraded_formal_mode,
         "llm_enabled": bool(settings.openai_api_key and settings.use_llm_narration),
         "llm_used": llm_used,
-        "title": f"[预备池] {notifier._title(card)}" if prewatch_light else notifier._title(card),
+        "title": f"[候选池] {notifier._title(card)}" if candidate_optional_mode else notifier._title(card),
         "body": notifier._body(card),
         "delivery_view": build_delivery_view_from_record(card.to_record()),
         "render_view": {
@@ -5619,40 +5825,38 @@ def build_preview_alert_payload(
 def _preview_mode_metadata(
     *,
     watch_mode: bool = False,
+    candidate_optional_light: bool = False,
     prewatch_light: bool = False,
     exit_pool_mode: bool = False,
-    degraded_formal_mode: bool = False,
+    candidate_optional_mode: bool = False,
+    holding_management_mode: bool = False,
 ) -> dict[str, str]:
-    if prewatch_light:
+    candidate_optional_light = bool(candidate_optional_light or prewatch_light)
+    candidate_optional_mode = bool(candidate_optional_mode or candidate_optional_light)
+    holding_management_mode = bool(holding_management_mode or exit_pool_mode)
+    if candidate_optional_mode:
         return {
-            "mode_label": "观察提醒",
-            "use_case": "预备池分数已经够高，但还没到正式执行阶段，适合用低打扰方式提醒你先盯住。",
+            "mode_label": "观察卡",
+            "use_case": "第一池候选已经够强，但还没到正式执行阶段，适合用低打扰方式提醒你先盯住。",
             "not_for": "不适合拿来直接开仓，也不适合替代完整观察卡做深度判断。",
             "operator_hint": "先看催化是否继续落地，再决定是否升级成确认机会。",
         }
-    if exit_pool_mode:
+    if holding_management_mode:
         return {
-            "mode_label": "兑现池管理卡",
+            "mode_label": "退出卡",
             "use_case": "已有浮盈仓位进入止盈或利润保护阶段，适合用来管理仓位和兑现节奏。",
             "not_for": "不适合当成新的开仓信号，也不适合在没有持仓时单独使用。",
             "operator_hint": "优先结合原目标区和当前强弱，决定分批止盈还是先锁定大部分利润。",
         }
-    if degraded_formal_mode:
-        return {
-            "mode_label": "自动降级观察卡",
-            "use_case": "事件强度已接近正式卡，但因为盈亏比、结构或量能条件不够，被系统自动降级为观察卡。",
-            "not_for": "不适合把高事件分误当成可直接执行的正式机会，也不适合忽略降级原因盲目追单。",
-            "operator_hint": "重点看降级原因和次日量价是否改善，只有条件补齐后再重新升级为正式机会。",
-        }
     if watch_mode:
         return {
-            "mode_label": "预备池观察卡",
-            "use_case": "事件或结构开始有苗头，但确认度还不够，适合先纳入观察名单。",
+            "mode_label": "观察卡",
+            "use_case": "事件或结构开始有苗头，但确认度还不够，适合先进入候选池继续跟踪。",
             "not_for": "不适合把这张卡直接当成执行依据，也不适合在信号尚弱时追价。",
-            "operator_hint": "重点盯后续催化、量能和结构确认，满足条件后再升级为正式操作卡。",
+            "operator_hint": "重点盯后续催化、量能和结构确认，满足条件后再升级为正式卡。",
         }
     return {
-        "mode_label": "正式操作卡",
+        "mode_label": "正式卡",
         "use_case": "事件强度和市场确认已经基本过线，适合结合价格计划做执行判断。",
         "not_for": "不适合脱离价格计划盲目追高，也不适合忽略失效位单独看多。",
         "operator_hint": "把它当成可执行机会，但仍要按入场区、止盈区和失效位来处理仓位。",
@@ -5693,15 +5897,15 @@ def format_test_notification_result(payload: dict) -> str:
 def format_preview_alert_result(payload: dict) -> str:
     mode_text = _preview_mode_metadata(
         watch_mode=bool(payload.get("watch_mode")),
+        candidate_optional_mode=bool(payload.get("candidate_optional_mode")),
+        holding_management_mode=bool(payload.get("holding_management_mode")),
+        candidate_optional_light=bool(payload.get("candidate_optional_light", payload.get("prewatch_light"))),
         prewatch_light=bool(payload.get("prewatch_light")),
         exit_pool_mode=bool(payload.get("exit_pool_mode")),
-        degraded_formal_mode=bool(payload.get("degraded_formal_mode")),
     )["mode_label"]
     render_view = payload.get("render_view") or {}
     card_type = str(render_view.get("card_type") or "-")
     action_label = str(render_view.get("action_label") or "-")
-    downgraded = bool(render_view.get("downgraded_to_watch"))
-    downgrade_reason = str(render_view.get("downgrade_reason") or "")
     return "\n".join(
         [
             "本地预览卡片：",
@@ -5709,8 +5913,6 @@ def format_preview_alert_result(payload: dict) -> str:
             f"标的：{payload.get('symbol', '-')}",
             f"最终卡型：{card_type}",
             f"最终动作：{action_label}",
-            f"自动降级：{'是' if downgraded else '否'}",
-            *( [f"降级原因：{downgrade_reason}"] if downgrade_reason else [] ),
             f"LLM 已启用：{'是' if payload.get('llm_enabled') else '否'}",
             f"LLM 实际参与：{'是' if payload.get('llm_used') else '否'}",
             "",
@@ -5762,6 +5964,7 @@ def build_demo_flow_payload(
         replay_payload["source_health"],
         replay_payload["card_diagnostics"],
         replay_payload.get("decision_diagnostics", []),
+        replay_payload.get("cycle_audit"),
     )
     _write_report(replay_report_path, replay_report)
     _write_json(replay_json_path, replay_payload)
@@ -5793,14 +5996,10 @@ def build_demo_flow_payload(
     preview_store = Store(workspace_dir / "demo_preview.db")
     preview_store.initialize()
     preview_specs = [
-        ("formal", {"symbol": "PLTR", "watch_mode": False, "prewatch_light": False, "exit_pool_mode": False}),
-        (
-            "formal_downgraded",
-            {"symbol": "AMD", "watch_mode": False, "prewatch_light": False, "exit_pool_mode": False, "degraded_formal_mode": True},
-        ),
-        ("watch", {"symbol": "NVDA", "watch_mode": True, "prewatch_light": False, "exit_pool_mode": False}),
-        ("prewatch_light", {"symbol": "NBIS", "watch_mode": False, "prewatch_light": True, "exit_pool_mode": False}),
-        ("exit_pool", {"symbol": "NVDA", "watch_mode": False, "prewatch_light": False, "exit_pool_mode": True}),
+        ("formal", {"symbol": "PLTR", "watch_mode": False, "candidate_optional_mode": False, "holding_management_mode": False}),
+        ("watch", {"symbol": "NVDA", "watch_mode": True, "candidate_optional_mode": False, "holding_management_mode": False}),
+        ("candidate_optional", {"symbol": "NBIS", "watch_mode": False, "candidate_optional_mode": True, "holding_management_mode": False}),
+        ("holding_management", {"symbol": "NVDA", "watch_mode": False, "candidate_optional_mode": False, "holding_management_mode": True}),
     ]
     preview_payloads: list[dict[str, Any]] = []
     preview_lines = ["卡片预览联调："]
@@ -5812,15 +6011,13 @@ def build_demo_flow_payload(
                 preview_store,
                 symbol=spec["symbol"],
                 watch_mode=spec["watch_mode"],
-                prewatch_light=spec["prewatch_light"],
-                exit_pool_mode=spec["exit_pool_mode"],
-                degraded_formal_mode=spec.get("degraded_formal_mode", False),
+                candidate_optional_mode=spec["candidate_optional_mode"],
+                holding_management_mode=spec["holding_management_mode"],
             )
             mode_metadata = _preview_mode_metadata(
                 watch_mode=spec["watch_mode"],
-                prewatch_light=spec["prewatch_light"],
-                exit_pool_mode=spec["exit_pool_mode"],
-                degraded_formal_mode=spec.get("degraded_formal_mode", False),
+                candidate_optional_mode=spec["candidate_optional_mode"],
+                holding_management_mode=spec["holding_management_mode"],
             )
             preview_payload["mode_name"] = mode_name
             preview_payload.update(mode_metadata)
@@ -5834,8 +6031,6 @@ def build_demo_flow_payload(
                     f"标的：{preview_payload.get('symbol', '-')}",
                     f"最终卡型：{render_view.get('card_type', '-')}",
                     f"最终动作：{render_view.get('action_label', '-')}",
-                    f"自动降级：{'是' if render_view.get('downgraded_to_watch') else '否'}",
-                    *([f"降级原因：{render_view.get('downgrade_reason', '')}"] if render_view.get("downgrade_reason") else []),
                     f"适用场景：{mode_metadata['use_case']}",
                     f"不适用场景：{mode_metadata['not_for']}",
                     f"使用提示：{mode_metadata['operator_hint']}",
@@ -5971,6 +6166,41 @@ def main() -> None:
     write_llm_usage_parser.add_argument("--days", type=int, default=LLM_USAGE_REPORT_WINDOW_DAYS)
     write_llm_usage_parser.add_argument("--json", action="store_true")
 
+    report_active_cycles_parser = subparsers.add_parser("report-active-cycles")
+    report_active_cycles_parser.add_argument(
+        "--status",
+        choices=("pending_entry", "holding_active", "terminal"),
+        default="",
+    )
+    report_active_cycles_parser.add_argument("--limit", type=int, default=50)
+    report_active_cycles_parser.add_argument("--json", action="store_true")
+
+    write_cycle_audit_parser = subparsers.add_parser("write-cycle-audit")
+    write_cycle_audit_parser.add_argument("--workspace-dir", default=SERVE_WORKSPACE_DIR)
+    write_cycle_audit_parser.add_argument(
+        "--status",
+        choices=("pending_entry", "holding_active", "terminal"),
+        default="",
+    )
+    write_cycle_audit_parser.add_argument("--limit", type=int, default=200)
+    write_cycle_audit_parser.add_argument("--json", action="store_true")
+
+    report_run_cycle_audit_parser = subparsers.add_parser("report-run-cycle-audit")
+    report_run_cycle_audit_parser.add_argument("--run-id", required=True)
+    report_run_cycle_audit_parser.add_argument("--limit", type=int, default=20)
+    report_run_cycle_audit_parser.add_argument("--json", action="store_true")
+
+    cleanup_cycle_anomaly_parser = subparsers.add_parser("cleanup-historical-cycle-anomalies")
+    cleanup_cycle_anomaly_parser.add_argument("--run-id", required=True)
+    cleanup_cycle_anomaly_parser.add_argument(
+        "--anomaly-type",
+        action="append",
+        dest="anomaly_types",
+        choices=("formal_send_during_holding",),
+    )
+    cleanup_cycle_anomaly_parser.add_argument("--apply", action="store_true")
+    cleanup_cycle_anomaly_parser.add_argument("--json", action="store_true")
+
     watchlist_review_parser = subparsers.add_parser("report-watchlist-config")
     watchlist_review_parser.add_argument("--json", action="store_true")
 
@@ -6094,9 +6324,11 @@ def main() -> None:
     preview_alert_parser = subparsers.add_parser("preview-alert-render")
     preview_alert_parser.add_argument("--symbol", default="NVDA")
     preview_alert_parser.add_argument("--watch", action="store_true")
-    preview_alert_parser.add_argument("--prewatch-light", action="store_true")
+    preview_alert_parser.add_argument("--candidate-optional", action="store_true")
+    preview_alert_parser.add_argument("--holding-management", action="store_true")
+    preview_alert_parser.add_argument("--candidate-optional-light", action="store_true")
+    preview_alert_parser.add_argument("--prewatch-light", dest="candidate_optional_light", action="store_true")
     preview_alert_parser.add_argument("--exit-pool", action="store_true")
-    preview_alert_parser.add_argument("--formal-downgraded", action="store_true")
     preview_alert_parser.add_argument("--json", action="store_true")
 
     promote_batch_parser = subparsers.add_parser("promote-batch")
@@ -6211,6 +6443,54 @@ def main() -> None:
             print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
             return
         print(format_write_llm_usage_report_result(payload))
+        return
+    if args.command == "report-active-cycles":
+        payload = build_cycle_audit_payload(
+            store,
+            status=args.status,
+            limit=args.limit,
+            refresh=True,
+            active_only=not bool(args.status),
+        )
+        if args.json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+            return
+        print(format_active_cycle_report(payload))
+        return
+    if args.command == "write-cycle-audit":
+        payload = build_write_cycle_audit_payload(
+            store,
+            workspace_dir=Path(args.workspace_dir),
+            status=args.status,
+            limit=args.limit,
+        )
+        if args.json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+            return
+        print(format_write_cycle_audit_result(payload))
+        return
+    if args.command == "report-run-cycle-audit":
+        payload = build_run_cycle_audit_payload(
+            store,
+            run_id=args.run_id,
+            limit=args.limit,
+        )
+        if args.json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+            return
+        print(format_run_cycle_audit_report(payload))
+        return
+    if args.command == "cleanup-historical-cycle-anomalies":
+        payload = build_historical_cycle_anomaly_cleanup_payload(
+            store,
+            run_id=args.run_id,
+            anomaly_types=args.anomaly_types,
+            apply=args.apply,
+        )
+        if args.json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))
+            return
+        print(format_historical_cycle_anomaly_cleanup(payload))
         return
     if args.command == "report-watchlist-config":
         payload = build_watchlist_config_review_payload(runtime_config, config_path=settings.config_path)
@@ -6461,6 +6741,7 @@ def main() -> None:
                 payload["source_health"],
                 payload["card_diagnostics"],
                 payload.get("decision_diagnostics", []),
+                payload.get("cycle_audit"),
             )
         )
         return
@@ -6551,9 +6832,10 @@ def main() -> None:
             store,
             symbol=args.symbol,
             watch_mode=args.watch,
-            prewatch_light=args.prewatch_light,
+            candidate_optional_mode=bool(args.candidate_optional or args.candidate_optional_light),
+            holding_management_mode=bool(args.holding_management or args.exit_pool),
+            candidate_optional_light=args.candidate_optional_light,
             exit_pool_mode=args.exit_pool,
-            degraded_formal_mode=args.formal_downgraded,
         )
         if args.json:
             print(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True))

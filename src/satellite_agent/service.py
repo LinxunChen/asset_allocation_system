@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import time
@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict
 
 from .config import Settings
+from .cycle_audit import rebuild_cycle_audit
 from .decision_engines import (
     DecisionPacket,
     HybridEventUnderstandingEngine,
@@ -27,15 +28,27 @@ from .market_data import (
     StooqDailyMarketDataProvider,
     YahooFinanceMarketDataProvider,
 )
-from .models import EventInsight, OpportunityCard, PriceRange, SourceHealthCheck, utcnow
+from .models import (
+    CandidatePoolCandidate,
+    EventInsight,
+    OpportunityCard,
+    PriceRange,
+    SourceHealthCheck,
+    utcnow,
+)
 from .notifier import Notifier
 from .observability import RunContext, StructuredLogger
-from .outcomes import compute_decision_outcome
-from .prewatch import build_prewatch_candidate, evaluate_prewatch_snapshot, sort_prewatch_candidates
+from .outcomes import compute_decision_outcome, normalize_close_reason
+from .prewatch import (
+    build_candidate_pool_candidate,
+    evaluate_candidate_snapshot,
+    sort_candidate_pool_candidates,
+)
 from .scoring import SignalScorer
 from .sources import SourceAdapter
 from .store import Store
 from .theme_linkage import (
+    build_candidate_pool_peer_map,
     build_theme_display_name_map_from_watchlist_payload,
     build_symbol_theme_map_from_watchlist_payload,
     build_theme_memberships,
@@ -119,6 +132,29 @@ EXIT_POOL_SUBREASON_DISPLAY: dict[str, str] = {
     "macro_protection": "宏观保护",
 }
 
+HOLDING_MANAGEMENT_REASON_DISPLAY: dict[str, str] = {
+    "profit_protection_exit": "利润保护退出",
+    "invalidation_exit": "失效价退出",
+    "window_close_evaluation": "窗口到期结算",
+    "not_entered_price_invalidated": "失效未成交",
+    "not_entered_window_expired": "窗口内未成交",
+    "holding_active": "持仓中",
+}
+
+FORMAL_ACTION_RANK: dict[str, int] = {
+    "加入观察": 0,
+    "试探建仓": 1,
+    "确认做多": 2,
+}
+
+TERMINAL_CYCLE_REASONS = {
+    "not_entered_price_invalidated",
+    "not_entered_window_expired",
+    "profit_protection_exit",
+    "invalidation_exit",
+    "window_close_evaluation",
+}
+
 EVENT_TYPE_DISPLAY_NAMES: dict[str, str] = {
     "earnings": "财报",
     "guidance": "指引",
@@ -194,6 +230,16 @@ def _load_symbol_display_names(watchlist_payload: dict) -> dict[str, str]:
     return mapping
 
 
+@dataclass
+class PoolRoutingInput:
+    source_kind: str
+    card: OpportunityCard
+    insight: EventInsight
+    event_assessment: Any
+    market_assessment: Any
+    candidate_pool_context: dict[str, Any] | None
+
+
 class SatelliteAgentService:
     def __init__(
         self,
@@ -225,7 +271,8 @@ class SatelliteAgentService:
         self.strategy_version = str(self.runtime_snapshot.get("strategy_version") or SATELLITE_STRATEGY_VERSION)
         self.run_name = run_name
         self.note = note
-        self.prewatch_symbols = [symbol.upper() for symbol in (prewatch_symbols or [])]
+        self.candidate_pool_symbols = [symbol.upper() for symbol in (prewatch_symbols or [])]
+        self.prewatch_symbols = self.candidate_pool_symbols
         runtime_watchlist = self.runtime_snapshot.get("runtime_config", {}).get("watchlist", {})
         self.symbol_display_names = _load_symbol_display_names(runtime_watchlist)
         self.symbol_theme_map = build_symbol_theme_map_from_watchlist_payload(runtime_watchlist)
@@ -252,7 +299,7 @@ class SatelliteAgentService:
             if self.settings.openai_api_key and self.settings.use_llm_narration
             else None
         )
-        self.prewatch_market_data = MarketDataEngine(
+        self.candidate_pool_market_data = MarketDataEngine(
             MultiSourceMarketDataProvider(
                 [
                     YahooFinanceMarketDataProvider(),
@@ -260,10 +307,23 @@ class SatelliteAgentService:
                 ]
             )
         )
+        self.prewatch_market_data = self.candidate_pool_market_data
 
     def _display_name_for(self, symbol: str) -> str:
         normalized = str(symbol).strip().upper()
         return self.symbol_display_names.get(normalized, normalized)
+
+    def _candidate_pool_watch_symbols(self) -> list[str]:
+        legacy_symbols = getattr(self, "prewatch_symbols", None)
+        if isinstance(legacy_symbols, list):
+            return [str(symbol).upper() for symbol in legacy_symbols]
+        return [str(symbol).upper() for symbol in getattr(self, "candidate_pool_symbols", [])]
+
+    def _candidate_pool_market_data_engine(self) -> MarketDataEngine:
+        legacy_engine = getattr(self, "prewatch_market_data", None)
+        if isinstance(legacy_engine, MarketDataEngine):
+            return legacy_engine
+        return self.candidate_pool_market_data
 
     def _build_macro_context(self) -> dict[str, object]:
         if not self.settings.use_macro_risk_overlay:
@@ -277,7 +337,7 @@ class SatelliteAgentService:
         scores: list[int] = []
         for symbol in MACRO_PROXY_SYMBOLS:
             try:
-                snapshot = self.prewatch_market_data.snapshot(symbol, "position", include_intraday=False)
+                snapshot = self._candidate_pool_market_data_engine().snapshot(symbol, "position", include_intraday=False)
             except Exception:
                 continue
             snapshots[symbol] = snapshot
@@ -354,10 +414,13 @@ class SatelliteAgentService:
         ]
         if not rows:
             return "首次出现"
-        terminal_reasons = {"exit_pool", "hit_invalidation", "window_complete"}
         active_cycle: list[dict | object] = []
         for row in rows:
-            if str(row["close_reason"] or "") in terminal_reasons:
+            if normalize_close_reason(
+                str(row["close_reason"] or ""),
+                exit_subreason=str(row["exit_subreason"] or "") if "exit_subreason" in row.keys() else "",
+                entered=bool(row["entered"]) if "entered" in row.keys() else False,
+            ) in {"profit_protection_exit", "invalidation_exit", "window_close_evaluation"}:
                 active_cycle = []
                 continue
             active_cycle.append(row)
@@ -401,6 +464,153 @@ class SatelliteAgentService:
             action_nodes.append(f"今日{current_action}")
         return " -> ".join(action_nodes)
 
+    def _formal_action_rank(self, action_label: str) -> int:
+        return FORMAL_ACTION_RANK.get(str(action_label or "").strip(), -1)
+
+    def _load_active_cycle_state(self, symbol: str) -> dict[str, Any]:
+        rows = self.store.load_latest_decision_records(limit=300)
+        normalized_symbol = str(symbol or "").strip().upper()
+        for row in rows:
+            row_symbol = str(row["symbol"] or "").strip().upper()
+            if row_symbol != normalized_symbol:
+                continue
+            normalized_reason = normalize_close_reason(
+                str(row["close_reason"] or ""),
+                exit_subreason=str(row["exit_subreason"] or ""),
+                entered=bool(row["entered"]) if "entered" in row.keys() else False,
+            )
+            if str(row["pool"] or "").strip() in {"holding_management", "exit"} or normalized_reason in TERMINAL_CYCLE_REASONS:
+                return {"status": "terminal"}
+            if str(row["pool"] or "").strip() != "confirmation":
+                continue
+            action_label = str(row["action"] or "").strip()
+            if action_label not in {"确认做多", "试探建仓"}:
+                continue
+            status = "holding_active" if normalized_reason == "holding_active" or bool(row["entered"]) else "pending_entry"
+            return {
+                "status": status,
+                "previous_formal_action": action_label,
+                "entered": bool(row["entered"]),
+                "decision_id": str(row["decision_id"] or ""),
+                "event_id": str(row["event_id"] or ""),
+            }
+        return {"status": "terminal"}
+
+    def _recent_candidate_observation_count_72h(self, symbol: str) -> int:
+        since = (utcnow() - timedelta(hours=72)).isoformat()
+        rows = self.store.load_candidate_evaluations_for_window(since=since, stage="candidate_pool")
+        run_ids = {
+            str(row["run_id"] or "")
+            for row in rows
+            if str(row["symbol"] or "").strip().upper() == str(symbol or "").strip().upper()
+            and str(row["outcome"] or "").strip() == "selected"
+        }
+        return len({run_id for run_id in run_ids if run_id})
+
+    def _build_formal_downgraded_watch_card(
+        self,
+        card: OpportunityCard,
+        *,
+        previous_formal_action: str,
+    ) -> OpportunityCard:
+        downgrade_explainer = (
+            f"前次正式机会给出「{previous_formal_action}」但尚未进场，"
+            "当前结构/量能/宏观条件已转弱，本次判断下调为观察。"
+        )
+        reason_to_watch = f"{downgrade_explainer} 建议撤销此前设置的买入挂单，等待新结构确立。"
+        return replace(
+            card,
+            action_label="加入观察",
+            priority="normal",
+            confidence_label="中",
+            lifecycle_pool="candidate",
+            delivery_category="watch",
+            active_cycle_status="pending_entry",
+            previous_formal_action=previous_formal_action,
+            previous_formal_sent=True,
+            downgraded_from_formal=True,
+            downgrade_explainer=downgrade_explainer,
+            reason_to_watch=reason_to_watch,
+            positioning_hint="建议撤销此前设置的买入挂单，等待新结构确立。",
+            dedup_key=f"{card.symbol.upper()}:{card.event_id}:{card.event_type}:downgraded-watch",
+        )
+
+    def _apply_formal_card_cycle_policies(
+        self,
+        cards: list[OpportunityCard],
+        packets: list[DecisionPacket],
+        *,
+        logger: StructuredLogger,
+    ) -> tuple[list[OpportunityCard], list[DecisionPacket]]:
+        if not cards:
+            return cards, packets
+        allowed_packets = {(packet.symbol, packet.horizon, packet.event_id): packet for packet in packets}
+        adjusted_cards: list[OpportunityCard] = []
+        adjusted_packet_keys: set[tuple[str, str, str]] = set()
+        virtual_cycle_state: dict[str, dict[str, Any]] = {}
+        for card in self._rank_notification_candidates(cards):
+            if str(getattr(card, "delivery_category", "") or "").strip() != "formal":
+                adjusted_cards.append(card)
+                adjusted_packet_keys.add((card.symbol, card.horizon, card.event_id))
+                continue
+            symbol = card.symbol.upper()
+            cycle_state = dict(virtual_cycle_state.get(symbol) or self._load_active_cycle_state(symbol))
+            status = str(cycle_state.get("status") or "terminal")
+            current_action = self._resolved_confirmation_action(card)
+            current_rank = self._formal_action_rank(current_action)
+            previous_formal_action = str(cycle_state.get("previous_formal_action") or "")
+            previous_rank = self._formal_action_rank(previous_formal_action)
+            base_card = replace(
+                card,
+                active_cycle_status=status,
+                previous_formal_action=previous_formal_action,
+                previous_formal_sent=bool(previous_formal_action),
+                recent_candidate_observation_count_72h=self._recent_candidate_observation_count_72h(symbol),
+            )
+            # `is_breakthrough_event` is intentionally kept as a dormant hook for
+            # future add-on / pyramid logic. For the current rollout, any active
+            # holding cycle still suppresses fresh entry-style cards.
+            if status == "holding_active":
+                logger.info(
+                    "formal_suppressed_active_holding",
+                    "Skipped a weaker formal entry because the symbol is already in an active holding cycle.",
+                    stage="route_into_pools",
+                    symbol=symbol,
+                    event_id=card.event_id,
+                    context={"action_label": current_action, "previous_formal_action": previous_formal_action},
+                )
+                continue
+            if status == "pending_entry" and previous_rank > current_rank:
+                downgraded_card = self._build_formal_downgraded_watch_card(
+                    base_card,
+                    previous_formal_action=previous_formal_action,
+                )
+                adjusted_cards.append(downgraded_card)
+                logger.info(
+                    "formal_downgraded_to_watch_unentered",
+                    "Downgraded a weaker formal entry into a watch card because the previous formal order is still unfilled.",
+                    stage="route_into_pools",
+                    symbol=symbol,
+                    event_id=card.event_id,
+                    context={"action_label": current_action, "previous_formal_action": previous_formal_action},
+                )
+                continue
+            adjusted_cards.append(base_card)
+            adjusted_packet_keys.add((card.symbol, card.horizon, card.event_id))
+            virtual_cycle_state[symbol] = {
+                "status": "pending_entry",
+                "previous_formal_action": current_action,
+                "entered": False,
+                "decision_id": "",
+                "event_id": card.event_id,
+            }
+        filtered_packets = [
+            packet
+            for packet in packets
+            if (packet.symbol, packet.horizon, packet.event_id) in adjusted_packet_keys
+        ]
+        return adjusted_cards, filtered_packets
+
     def _json_object(self, raw: Any) -> dict[str, Any]:
         if not raw:
             return {}
@@ -418,20 +628,35 @@ class SatelliteAgentService:
             for symbol in MACRO_PROXY_SYMBOLS
         }
 
-    def _active_confirmation_rows_for_exit_pool(self) -> list[Any]:
+    @staticmethod
+    def _with_legacy_run_summary_aliases(summary: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(summary)
+        merged["prewatch_candidates_count"] = int(summary.get("candidate_pool_candidates_count", 0) or 0)
+        merged["prewatch_candidates"] = list(summary.get("candidate_pool_candidates", []))
+        merged["prewatch_alerts_sent_count"] = int(summary.get("candidate_optional_alerts_sent_count", 0) or 0)
+        merged["prewatch_alert_symbols"] = list(summary.get("candidate_optional_alert_symbols", []))
+        merged["exit_pool_cards_count"] = int(summary.get("holding_management_cards_count", 0) or 0)
+        merged["exit_pool_symbols"] = list(summary.get("holding_management_symbols", []))
+        merged["exit_pool_cards"] = list(summary.get("holding_management_cards", []))
+        return merged
+
+    def _active_confirmation_rows_for_holding_management(self) -> list[Any]:
         rows = self.store.load_latest_decision_records(limit=300)
         selected: list[Any] = []
         closed_symbols: set[str] = set()
         selected_symbols: set[str] = set()
-        terminal_reasons = {"exit_pool", "hit_invalidation", "window_complete"}
         for row in rows:
             symbol = str(row["symbol"] or "").strip().upper()
             if not symbol or symbol in closed_symbols or symbol in selected_symbols:
                 continue
-            if str(row["pool"] or "").strip() == "exit":
+            if str(row["pool"] or "").strip() in {"exit", "holding_management"}:
                 closed_symbols.add(symbol)
                 continue
-            if str(row["close_reason"] or "").strip() in terminal_reasons:
+            if normalize_close_reason(
+                str(row["close_reason"] or ""),
+                exit_subreason=str(row["exit_subreason"] or "") if "exit_subreason" in row.keys() else "",
+                entered=bool(row["entered"]) if "entered" in row.keys() else False,
+            ) in {"profit_protection_exit", "invalidation_exit", "window_close_evaluation"}:
                 closed_symbols.add(symbol)
                 continue
             if str(row["pool"] or "").strip() != "confirmation":
@@ -442,7 +667,7 @@ class SatelliteAgentService:
             selected_symbols.add(symbol)
         return selected
 
-    def _exit_pool_reason_text(self, subreason: str, take_profit_range: PriceRange) -> tuple[str, str]:
+    def _profit_protection_reason_text(self, subreason: str, take_profit_range: PriceRange) -> tuple[str, str]:
         if subreason == "target_hit":
             return (
                 "价格已进入止盈区较深位置，计划内利润目标基本兑现。",
@@ -458,20 +683,54 @@ class SatelliteAgentService:
             "外部风险抬升时，先把已有利润锁住，比继续硬扛更重要。",
         )
 
-    def _exit_pool_subreason_display(self, subreason: str) -> str:
-        return EXIT_POOL_SUBREASON_DISPLAY.get(subreason, "兑现管理")
+    def _exit_pool_reason_text(self, subreason: str, take_profit_range: PriceRange) -> tuple[str, str]:
+        return self._profit_protection_reason_text(subreason, take_profit_range)
 
-    def _build_exit_pool_cards(
+    def _holding_management_reason_text(
+        self,
+        normalized_reason: str,
+        *,
+        take_profit_range: PriceRange,
+        invalidation_level: float,
+        exit_subreason: str = "",
+    ) -> tuple[str, str]:
+        if normalized_reason == "profit_protection_exit":
+            return self._profit_protection_reason_text(exit_subreason, take_profit_range)
+        if normalized_reason == "invalidation_exit":
+            return (
+                "价格触发失效价，本次进攻逻辑结束。",
+                f"价格已跌破失效价 {invalidation_level:.2f}，优先按纪律结束这次仓位。",
+            )
+        return (
+            "持仓在观察窗口内未触发止盈或失效，当前进入窗口结算评估。",
+            "窗口到期结算只用于后验复盘提供统一截止时间，不代表真实自动卖出。",
+        )
+
+    def _holding_management_subreason_display(self, subreason: str) -> str:
+        return EXIT_POOL_SUBREASON_DISPLAY.get(subreason, "持仓管理")
+
+    def _exit_pool_subreason_display(self, subreason: str) -> str:
+        return self._holding_management_subreason_display(subreason)
+
+    def _build_holding_management_actions(
         self,
         *,
         macro_context: dict[str, object],
         run_id: str,
         logger: StructuredLogger,
-    ) -> tuple[list[OpportunityCard], list[dict[str, Any]]]:
+    ) -> tuple[list[OpportunityCard], list[dict[str, Any]], dict[str, int]]:
         cards: list[OpportunityCard] = []
         records: list[dict[str, Any]] = []
+        summary = {
+            "profit_protection_exit_count": 0,
+            "invalidation_exit_count": 0,
+            "window_close_evaluation_count": 0,
+            "holding_active_count": 0,
+            "not_entered_price_invalidated_count": 0,
+            "not_entered_window_expired_count": 0,
+        }
         proxy_bars_by_symbol = self._load_local_proxy_bars()
-        for row in self._active_confirmation_rows_for_exit_pool():
+        for row in self._active_confirmation_rows_for_holding_management():
             symbol = str(row["symbol"] or "").strip().upper()
             bars = self.store.load_price_bars(symbol, "1d", 400)
             if not bars:
@@ -481,7 +740,17 @@ class SatelliteAgentService:
                 bars,
                 proxy_bars_by_symbol=proxy_bars_by_symbol,
             )
-            if outcome is None or not outcome.entered or outcome.close_reason != "exit_pool":
+            if outcome is None:
+                continue
+            normalized_reason = normalize_close_reason(
+                outcome.close_reason,
+                exit_subreason=outcome.exit_subreason,
+                entered=bool(outcome.entered),
+            )
+            summary_key = f"{normalized_reason}_count"
+            if summary_key in summary:
+                summary[summary_key] += 1
+            if normalized_reason not in {"profit_protection_exit", "invalidation_exit"}:
                 continue
             exit_subreason = str(outcome.exit_subreason or "")
             packet_payload = self._json_object(row["packet_json"])
@@ -503,11 +772,21 @@ class SatelliteAgentService:
                 or row["entry_price"]
                 or 0.0
             )
-            reason_summary, positioning_hint = self._exit_pool_reason_text(exit_subreason, take_profit_range)
-            dedup_key = f"exit_pool:{row['decision_id']}:{exit_subreason}"
+            reason_summary, positioning_hint = self._holding_management_reason_text(
+                normalized_reason,
+                take_profit_range=take_profit_range,
+                invalidation_level=invalidation_level,
+                exit_subreason=exit_subreason,
+            )
+            action_label = HOLDING_MANAGEMENT_REASON_DISPLAY.get(normalized_reason, "持仓管理")
+            if normalized_reason == "profit_protection_exit":
+                dedup_suffix = exit_subreason or normalized_reason
+            else:
+                dedup_suffix = normalized_reason
+            dedup_key = f"holding_management:{row['decision_id']}:{dedup_suffix}"
             card = OpportunityCard(
                 card_id=hashlib.sha1(f"{run_id}:{dedup_key}".encode("utf-8")).hexdigest(),
-                event_id=f"exit_pool:{row['decision_id']}:{exit_subreason}",
+                event_id=f"holding_management:{row['decision_id']}:{dedup_suffix}",
                 symbol=symbol,
                 horizon=str(packet_payload.get("horizon") or "position"),
                 event_type=str(row["event_type"] or "news"),
@@ -520,24 +799,40 @@ class SatelliteAgentService:
                 entry_range=entry_range,
                 take_profit_range=take_profit_range,
                 invalidation_level=round(invalidation_level, 2),
-                invalidation_reason="原进攻逻辑已切换到兑现管理。",
+                invalidation_reason=(
+                    "本次仓位已从进攻阶段切换到持仓管理。"
+                    if normalized_reason == "profit_protection_exit"
+                    else "价格已跌破失效价，本次进攻逻辑结束。"
+                ),
                 risk_notes=[
-                    f"兑现池退出：{self._exit_pool_subreason_display(exit_subreason)}",
-                    "这是一张兑现管理卡，不再代表适合新开仓。",
+                    (
+                        f"持仓管理：{self._holding_management_subreason_display(exit_subreason)}"
+                        if normalized_reason == "profit_protection_exit"
+                        else "持仓管理：触发失效价后结束本次仓位。"
+                    ),
+                    "这是一张持仓管理卡，不再代表适合新开仓。",
                 ],
                 source_refs=[],
                 created_at=utcnow(),
                 ttl=utcnow() + timedelta(days=2),
-                priority="high" if exit_subreason in {"target_hit", "macro_protection"} else "normal",
+                priority=(
+                    "high"
+                    if normalized_reason == "profit_protection_exit" and exit_subreason in {"target_hit", "macro_protection"}
+                    else "normal"
+                ),
                 dedup_key=dedup_key,
                 bias="long",
                 display_name=self._display_name_for(symbol),
-                action_label="进入兑现池",
-                confidence_label="高" if exit_subreason in {"target_hit", "macro_protection"} else "中",
+                action_label=action_label,
+                confidence_label=(
+                    "高"
+                    if normalized_reason == "profit_protection_exit" and exit_subreason in {"target_hit", "macro_protection"}
+                    else "中"
+                ),
                 confidence_score=min(max(float(row["final_score"] or 0.0), 72.0), 92.0),
                 reason_to_watch=reason_summary,
                 theme_tags=list(json.loads(str(row["theme_ids_json"] or "[]"))),
-                chain_summary=self._chain_summary_for_symbol(symbol, current_action="进入兑现池"),
+                chain_summary=self._chain_summary_for_symbol(symbol, current_action=action_label),
                 market_regime=str(macro_context.get("market_regime", "")),
                 rate_risk=str(macro_context.get("rate_risk", "")),
                 geopolitical_risk=str(macro_context.get("geopolitical_risk", "")),
@@ -546,8 +841,12 @@ class SatelliteAgentService:
                 positioning_hint=positioning_hint,
                 execution_eligible=False,
                 execution_note=positioning_hint,
-                exit_pool_subreason=exit_subreason,
-                exit_pool_source_decision_id=str(row["decision_id"] or ""),
+                lifecycle_pool="holding_management",
+                delivery_category="exit",
+                normalized_close_reason=normalized_reason,
+                holding_management_reason=normalized_reason,
+                holding_management_subreason=exit_subreason,
+                holding_management_source_decision_id=str(row["decision_id"] or ""),
             )
             cards.append(card)
             records.append(
@@ -564,7 +863,7 @@ class SatelliteAgentService:
                     "market_score": card.market_score,
                     "theme_score": float(row["theme_score"] or 0.0),
                     "final_score": card.final_score,
-                    "trigger_mode": exit_subreason,
+                    "trigger_mode": dedup_suffix,
                     "theme_ids": list(card.theme_tags),
                     "entry_plan": {
                         "entry_range": {"low": entry_range.low, "high": entry_range.high},
@@ -573,29 +872,34 @@ class SatelliteAgentService:
                     },
                     "invalidation": {
                         "level": invalidation_level,
-                        "reason": "原进攻逻辑已切换到兑现管理。",
+                        "reason": card.invalidation_reason,
                     },
                     "packet": {
-                        "pool": "exit",
-                        "action": "进入兑现池",
+                        "pool": "holding_management",
+                        "action": action_label,
                         "source_decision_id": row["decision_id"],
                         "exit_subreason": exit_subreason,
                         "close_reason": outcome.close_reason,
+                        "normalized_close_reason": normalized_reason,
                         "realized_return": outcome.realized_return,
                     },
                 }
             )
             logger.info(
-                "exit_pool_selected",
-                "Position moved into the exit pool.",
-                stage="exit_pool",
+                "holding_management_selected",
+                "Position entered holding management.",
+                stage="holding_management",
                 symbol=symbol,
                 event_id=card.event_id,
-                context={"subreason": exit_subreason, "source_decision_id": row["decision_id"]},
+                context={
+                    "normalized_reason": normalized_reason,
+                    "subreason": exit_subreason,
+                    "source_decision_id": row["decision_id"],
+                },
             )
-        return cards, records
+        return cards, records, summary
 
-    def _record_exit_pool_decisions(self, records: list[dict[str, Any]], *, run_id: str) -> None:
+    def _record_holding_management_decisions(self, records: list[dict[str, Any]], *, run_id: str) -> None:
         for record in records:
             self.store.save_decision_record(
                 decision_id=record["decision_id"],
@@ -603,8 +907,8 @@ class SatelliteAgentService:
                 event_id=record["event_id"],
                 symbol=record["symbol"],
                 event_type=record["event_type"],
-                pool="exit",
-                action="进入兑现池",
+                pool="holding_management",
+                action=record["packet"].get("action", "持仓管理"),
                 priority=record["priority"],
                 confidence=record["confidence"],
                 event_score=record["event_score"],
@@ -620,6 +924,314 @@ class SatelliteAgentService:
                 packet=record["packet"],
                 created_at=utcnow().isoformat(),
             )
+
+    def _route_into_pools(
+        self,
+        *,
+        watchlist: set[str],
+        routing_inputs: list[PoolRoutingInput],
+        confirmation_evaluation_extras: list[dict[str, Any]],
+        snapshot_cache: dict[tuple[str, str], object],
+        saved_snapshot_keys: set[tuple[str, str]],
+        macro_context: dict[str, object],
+        run_context: RunContext,
+        logger: StructuredLogger,
+    ) -> tuple[list[OpportunityCard], list[DecisionPacket], list[CandidatePoolCandidate], list[DecisionPacket]]:
+        confirmation_candidates: list[OpportunityCard] = []
+        rerouted_event_cards: list[OpportunityCard] = []
+        card_contexts: dict[str, dict[str, Any]] = {}
+        rerouted_candidate_inputs: list[CandidatePoolCandidate] = []
+        for routing_input in routing_inputs:
+            promoted_card = self._apply_candidate_pool_promotion(
+                routing_input.card,
+                insight=routing_input.insight,
+                candidate_pool_context=routing_input.candidate_pool_context,
+            )
+            if promoted_card.promoted_from_prewatch:
+                logger.info(
+                    "candidate_pool_promoted",
+                    "Candidate-pool opportunity upgraded into the confirmation pool.",
+                    stage="route_into_pools",
+                    symbol=promoted_card.symbol,
+                    event_id=promoted_card.event_id,
+                    context={
+                        "horizon": promoted_card.horizon,
+                        "final_score": promoted_card.final_score,
+                        "priority": promoted_card.priority,
+                        "candidate_score": promoted_card.candidate_score,
+                        "candidate_setup_type": promoted_card.candidate_setup_type,
+                        "source_kind": routing_input.source_kind,
+                    },
+                )
+            decorated_card = self._decorate_card_with_runtime_context(
+                replace(promoted_card, lifecycle_pool="confirmation", delivery_category="formal"),
+                insight=routing_input.insight,
+                macro_context=macro_context,
+                run_id=run_context.run_id,
+            )
+            decorated_card = replace(
+                decorated_card,
+                dedup_key=self._formal_confirmation_dedup_key(decorated_card),
+            )
+            card_contexts[decorated_card.card_id] = {
+                "event_assessment": routing_input.event_assessment,
+                "market_assessment": routing_input.market_assessment,
+                "insight": routing_input.insight,
+            }
+            if self._card_belongs_to_confirmation_pool(decorated_card):
+                confirmation_candidates.append(decorated_card)
+                continue
+            rerouted_event_cards.append(decorated_card)
+            rerouted_candidate_inputs.append(
+                self._build_candidate_from_confirmation_card(decorated_card)
+            )
+        confirmation_candidates = self._apply_theme_linkage_to_confirmation_candidates(confirmation_candidates)
+        confirmation_packets = self._build_confirmation_decision_packets(
+            confirmation_candidates,
+            card_contexts=card_contexts,
+        )
+        confirmation_candidates = self._apply_confirmation_packets(
+            confirmation_candidates,
+            confirmation_packets,
+        )
+        (
+            confirmation_candidates,
+            confirmation_packets,
+        ) = self._deduplicate_confirmation_pool_candidates(
+            confirmation_candidates,
+            confirmation_packets,
+            logger=logger,
+        )
+        (
+            confirmation_candidates,
+            confirmation_packets,
+        ) = self._apply_formal_card_cycle_policies(
+            confirmation_candidates,
+            confirmation_packets,
+            logger=logger,
+        )
+        active_confirmation_cards = [
+            card
+            for card in confirmation_candidates
+            if str(getattr(card, "delivery_category", "") or "").strip() == "formal"
+        ]
+        scan_candidates = self._build_candidate_pool_candidates(
+            watchlist,
+            confirmation_cards=active_confirmation_cards,
+            snapshot_cache=snapshot_cache,
+            saved_snapshot_keys=saved_snapshot_keys,
+            run_context=run_context,
+            logger=logger,
+        )
+        candidate_pool_candidates = self._merge_candidate_pool_inputs(
+            scan_candidates,
+            rerouted_candidate_inputs,
+        )
+        confirmation_evaluation_cards = list(confirmation_candidates) + rerouted_event_cards
+        self._record_confirmation_candidate_evaluations(
+            confirmation_evaluation_cards,
+            run_id=run_context.run_id,
+            extras=confirmation_evaluation_extras,
+        )
+        candidate_pool_packets = self._build_candidate_pool_decision_packets(
+            candidate_pool_candidates,
+            confirmation_cards=active_confirmation_cards,
+        )
+        return confirmation_candidates, confirmation_packets, candidate_pool_candidates, candidate_pool_packets
+
+    def _card_belongs_to_confirmation_pool(self, card: OpportunityCard) -> bool:
+        if str(getattr(card, "delivery_category", "") or "").strip() == "candidate_optional":
+            return False
+        if self._resolved_confirmation_action(card) not in {"确认做多", "试探建仓"}:
+            return False
+        if not bool(getattr(card, "execution_eligible", True)):
+            return False
+        if str(getattr(card, "priority", "") or "").strip() == "suppressed":
+            return False
+        if self._formal_structure_incompatible_for_confirmation(card):
+            return False
+        return True
+
+    def _formal_confirmation_dedup_key(self, card: OpportunityCard) -> str:
+        return f"{card.symbol.upper()}:{card.event_id}:{card.event_type}:formal"
+
+    def _formal_structure_incompatible_for_confirmation(self, card: OpportunityCard) -> bool:
+        trend_state = str(getattr(card, "trend_state", "") or "").strip().lower()
+        relative_volume = getattr(card, "relative_volume", None)
+        return trend_state in {"neutral", "bearish", "downtrend"} and relative_volume is not None and float(relative_volume) < 1.0
+
+    def _confirmation_candidate_rank_key(self, card: OpportunityCard) -> tuple[float, float, float, float, int]:
+        action_rank = {"确认做多": 2, "试探建仓": 1}.get(self._resolved_confirmation_action(card), 0)
+        horizon_rank = {"position": 1, "swing": 0}.get(str(getattr(card, "horizon", "") or "").strip(), 0)
+        return (
+            float(getattr(card, "final_score", 0.0) or 0.0),
+            float(getattr(card, "market_score", 0.0) or 0.0),
+            float(getattr(card, "event_score", 0.0) or 0.0),
+            float(getattr(card, "relative_volume", 0.0) or 0.0),
+            action_rank + horizon_rank,
+        )
+
+    def _deduplicate_confirmation_pool_candidates(
+        self,
+        cards: list[OpportunityCard],
+        packets: list[DecisionPacket],
+        *,
+        logger: StructuredLogger,
+    ) -> tuple[list[OpportunityCard], list[DecisionPacket]]:
+        if len(cards) <= 1:
+            return cards, packets
+        grouped: dict[tuple[str, str], list[OpportunityCard]] = {}
+        for card in cards:
+            grouped.setdefault((card.symbol.upper(), card.event_id), []).append(card)
+        selected_keys: set[tuple[str, str, str]] = set()
+        selected_cards: list[OpportunityCard] = []
+        for group_key, group_cards in grouped.items():
+            ranked_cards = sorted(
+                group_cards,
+                key=self._confirmation_candidate_rank_key,
+                reverse=True,
+            )
+            selected = ranked_cards[0]
+            selected_cards.append(selected)
+            selected_keys.add((selected.symbol, selected.horizon, selected.event_id))
+            if len(ranked_cards) > 1:
+                logger.info(
+                    "confirmation_candidate_collapsed",
+                    "Collapsed duplicate confirmation candidates for the same symbol and event.",
+                    stage="route_into_pools",
+                    symbol=selected.symbol,
+                    event_id=selected.event_id,
+                    context={
+                        "kept_horizon": selected.horizon,
+                        "kept_final_score": selected.final_score,
+                        "dropped_horizons": [item.horizon for item in ranked_cards[1:]],
+                    },
+                )
+        filtered_packets = [
+            packet
+            for packet in packets
+            if (packet.symbol, packet.horizon, packet.event_id) in selected_keys
+        ]
+        selected_cards.sort(
+            key=lambda card: (
+                -float(getattr(card, "final_score", 0.0) or 0.0),
+                card.symbol,
+                card.horizon,
+            )
+        )
+        return selected_cards, filtered_packets
+
+    def _resolved_confirmation_action(self, card: OpportunityCard) -> str:
+        action_label = str(getattr(card, "action_label", "") or "").strip()
+        if action_label:
+            return action_label
+        if not bool(getattr(card, "market_data_complete", True)):
+            return "加入观察"
+        priority = str(getattr(card, "priority", "") or "").strip()
+        return {"high": "确认做多", "normal": "试探建仓", "suppressed": "加入观察"}.get(
+            priority,
+            "加入观察",
+        )
+
+    def _build_candidate_from_confirmation_card(self, card: OpportunityCard) -> CandidatePoolCandidate:
+        reason_to_watch = str(card.reason_to_watch or "").strip()
+        if not reason_to_watch:
+            reason_to_watch = "当前值得继续跟踪，但还不适合正式出手。"
+        if not bool(getattr(card, "market_data_complete", True)):
+            degraded_hint = "行情快照暂不可用，先进入候选池继续跟踪。"
+            if degraded_hint not in reason_to_watch:
+                reason_to_watch = f"{degraded_hint} {reason_to_watch}".strip()
+        if getattr(card, "macro_overlay_note", ""):
+            reason_to_watch = f"{reason_to_watch} {card.macro_overlay_note}".strip()
+        return CandidatePoolCandidate(
+            symbol=card.symbol.upper(),
+            horizon=card.horizon,
+            setup_type="event_watch",
+            score=round(float(card.final_score or card.event_score or 0.0), 2),
+            headline_summary=card.headline_summary,
+            action_hint="先进入候选池继续跟踪，等待催化和盘面进一步确认。",
+            reason_to_watch=reason_to_watch,
+            last_price=float(card.entry_range.low or 0.0),
+            rsi_14=float(card.rsi_14 or 0.0),
+            relative_volume=float(card.relative_volume or 0.0),
+            trend_state=str(card.trend_state or ""),
+            support_20=float(card.invalidation_level or 0.0),
+            resistance_20=float(card.take_profit_range.high or card.take_profit_range.low or 0.0),
+            trigger_mode="event",
+            trigger_event_type=card.event_type,
+            as_of=utcnow(),
+        )
+
+    def _merge_candidate_pool_inputs(
+        self,
+        scan_candidates: list[CandidatePoolCandidate],
+        event_candidates: list[CandidatePoolCandidate],
+    ) -> list[CandidatePoolCandidate]:
+        if not scan_candidates:
+            return list(event_candidates)
+        if not event_candidates:
+            return list(scan_candidates)
+        merged: dict[tuple[str, str], CandidatePoolCandidate] = {
+            (candidate.symbol.upper(), candidate.horizon): candidate for candidate in scan_candidates
+        }
+        for candidate in event_candidates:
+            key = (candidate.symbol.upper(), candidate.horizon)
+            existing = merged.get(key)
+            if existing is None:
+                merged[key] = candidate
+                continue
+            if candidate.trigger_mode == "event" and existing.trigger_mode != "event":
+                merged[key] = candidate
+                continue
+            if candidate.score > existing.score:
+                merged[key] = candidate
+        return list(merged.values())
+
+    def _persist_and_review(
+        self,
+        *,
+        confirmation_cards: list[OpportunityCard],
+        confirmation_packets: list[DecisionPacket],
+        candidate_pool_candidates: list[CandidatePoolCandidate],
+        candidate_pool_packets: list[DecisionPacket],
+        macro_context: dict[str, object],
+        run_context: RunContext,
+        logger: StructuredLogger,
+    ) -> tuple[list[str], list[OpportunityCard], list[dict[str, Any]], dict[str, int]]:
+        for card in confirmation_cards:
+            self.store.save_opportunity_card(card, run_id=run_context.run_id)
+        run_context.metrics.cards_generated += len(confirmation_cards)
+        self._record_decision_packets(confirmation_packets, run_id=run_context.run_id)
+        self._record_decision_packets(candidate_pool_packets, run_id=run_context.run_id)
+        self._dispatch_notifications(confirmation_cards, run_context, logger)
+        candidate_optional_alert_symbols = self._dispatch_candidate_optional_notifications(
+            candidate_pool_candidates,
+            macro_context=macro_context,
+            run_context=run_context,
+            logger=logger,
+        )
+        holding_management_cards, holding_management_records, holding_management_summary = (
+            self._build_holding_management_actions(
+                macro_context=macro_context,
+                run_id=run_context.run_id,
+                logger=logger,
+            )
+        )
+        if holding_management_cards:
+            for card in holding_management_cards:
+                self.store.save_opportunity_card(card, run_id=run_context.run_id)
+            self._record_holding_management_decisions(
+                holding_management_records,
+                run_id=run_context.run_id,
+            )
+            self._dispatch_notifications(holding_management_cards, run_context, logger)
+            run_context.metrics.cards_generated += len(holding_management_cards)
+        return (
+            candidate_optional_alert_symbols,
+            holding_management_cards,
+            holding_management_records,
+            holding_management_summary,
+        )
 
     def _decorate_card_with_runtime_context(
         self,
@@ -692,6 +1304,12 @@ class SatelliteAgentService:
             overlay_note = f"{overlay_note}，{action_note}" if overlay_note else f"宏观风险覆盖已生效：{action_note}"
         if macro_note not in risk_notes:
             risk_notes.append(macro_note)
+        lifecycle_pool = str(getattr(card, "lifecycle_pool", "") or "")
+        delivery_category = str(getattr(card, "delivery_category", "") or "")
+        if not lifecycle_pool:
+            lifecycle_pool = "confirmation"
+        if not delivery_category:
+            delivery_category = "formal"
         return replace(
             card,
             display_name=display_name,
@@ -716,6 +1334,8 @@ class SatelliteAgentService:
                 else 0.0
             ),
             risk_notes=risk_notes,
+            lifecycle_pool=lifecycle_pool,
+            delivery_category=delivery_category,
         )
 
     def run_once(self) -> Dict[str, int]:
@@ -766,16 +1386,16 @@ class SatelliteAgentService:
         newest_seen = since
         dedup_after = (now - timedelta(hours=self.settings.cross_source_dedup_hours)).isoformat()
         status = "success"
-        notification_candidates = []
+        routing_inputs: list[PoolRoutingInput] = []
         snapshot_cache: dict[tuple[str, str], object] = {}
         saved_snapshot_keys: set[tuple[str, str]] = set()
-        prewatch_candidates = []
-        prewatch_alert_symbols: list[str] = []
-        exit_pool_cards: list[OpportunityCard] = []
-        exit_pool_symbols: list[str] = []
+        candidate_pool_candidates: list[CandidatePoolCandidate] = []
+        candidate_pool_packets: list[DecisionPacket] = []
+        candidate_optional_alert_symbols: list[str] = []
+        holding_management_cards: list[OpportunityCard] = []
+        holding_management_summary: dict[str, int] = {}
         llm_requests_used = 0
         llm_daily_requests_used = self._llm_daily_usage_count(now)
-        card_contexts: dict[str, dict] = {}
         confirmation_evaluation_extras: list[dict[str, Any]] = []
         try:
             for raw_event in events:
@@ -844,7 +1464,7 @@ class SatelliteAgentService:
                         context={"error": exc.__class__.__name__},
                         )
                     continue
-                prewatch_context = self._load_recent_prewatch_candidate(event.symbol)
+                candidate_pool_context = self._load_recent_candidate_pool_context(event.symbol)
                 for horizon in self.settings.horizons:
                     try:
                         snapshot_key = (event.symbol, horizon)
@@ -876,33 +1496,16 @@ class SatelliteAgentService:
                             failure_reason=exc.__class__.__name__,
                         )[1]
                         if degraded_card.priority != "suppressed":
-                            degraded_card = self._apply_prewatch_promotion(
-                                degraded_card,
-                                insight=insight,
-                                prewatch_context=prewatch_context,
-                            )
-                            self.store.save_opportunity_card(degraded_card, run_id=run_context.run_id)
-                            run_context.metrics.cards_generated += 1
-                            notification_candidates.append(degraded_card)
-                            card_contexts[degraded_card.card_id] = {
-                                "event_assessment": event_assessment,
-                                "market_assessment": degraded_market_assessment,
-                                "insight": insight,
-                            }
-                            if degraded_card.promoted_from_prewatch:
-                                logger.info(
-                                    "prewatch_promoted",
-                                    "Prewatch candidate upgraded into the confirmation pool.",
-                                    stage="score",
-                                    symbol=event.symbol,
-                                    event_id=event.event_id,
-                                    context={
-                                        "horizon": horizon,
-                                        "event_score": degraded_card.event_score,
-                                        "prewatch_score": degraded_card.prewatch_score,
-                                        "prewatch_setup_type": degraded_card.prewatch_setup_type,
-                                    },
+                            routing_inputs.append(
+                                PoolRoutingInput(
+                                    source_kind="event",
+                                    card=degraded_card,
+                                    insight=insight,
+                                    event_assessment=event_assessment,
+                                    market_assessment=degraded_market_assessment,
+                                    candidate_pool_context=candidate_pool_context,
                                 )
+                            )
                             logger.warning(
                                 "event_only_card_generated",
                                 "Generated an event-only degraded card because market data was unavailable.",
@@ -940,34 +1543,16 @@ class SatelliteAgentService:
                         continue
                     try:
                         card, market_assessment = self.market_engine.score_confirmation(insight, snapshot)
-                        card = self._apply_prewatch_promotion(
-                            card,
-                            insight=insight,
-                            prewatch_context=prewatch_context,
-                        )
-                        self.store.save_opportunity_card(card, run_id=run_context.run_id)
-                        run_context.metrics.cards_generated += 1
-                        notification_candidates.append(card)
-                        card_contexts[card.card_id] = {
-                            "event_assessment": event_assessment,
-                            "market_assessment": market_assessment,
-                            "insight": insight,
-                        }
-                        if card.promoted_from_prewatch:
-                            logger.info(
-                                "prewatch_promoted",
-                                "Prewatch candidate upgraded into the confirmation pool.",
-                                stage="score",
-                                symbol=event.symbol,
-                                event_id=event.event_id,
-                                context={
-                                    "horizon": horizon,
-                                    "final_score": card.final_score,
-                                    "priority": card.priority,
-                                    "prewatch_score": card.prewatch_score,
-                                    "prewatch_setup_type": card.prewatch_setup_type,
-                                },
+                        routing_inputs.append(
+                            PoolRoutingInput(
+                                source_kind="event",
+                                card=card,
+                                insight=insight,
+                                event_assessment=event_assessment,
+                                market_assessment=market_assessment,
+                                candidate_pool_context=candidate_pool_context,
                             )
+                        )
                     except Exception as exc:
                         run_context.metrics.scoring_failures += 1
                         logger.error(
@@ -993,71 +1578,31 @@ class SatelliteAgentService:
                             )
                         )
                         continue
-            notification_candidates = self._apply_theme_linkage_to_confirmation_candidates(
-                notification_candidates
-            )
-            confirmation_packets = self._build_confirmation_decision_packets(
-                notification_candidates,
-                card_contexts=card_contexts,
-            )
-            notification_candidates = self._apply_confirmation_packets(
+            (
                 notification_candidates,
                 confirmation_packets,
-            )
-            self._record_confirmation_candidate_evaluations(
-                notification_candidates,
-                run_id=run_context.run_id,
-                extras=confirmation_evaluation_extras,
-            )
-            notification_candidates = [
-                self._decorate_card_with_runtime_context(
-                    card,
-                    insight=card_contexts.get(card.card_id, {}).get("insight"),
-                    macro_context=macro_context,
-                    run_id=run_context.run_id,
-                )
-                if card_contexts.get(card.card_id, {}).get("insight") is not None
-                else replace(
-                    card,
-                    display_name=self._display_name_for(card.symbol),
-                    market_regime=str(macro_context.get("market_regime", "")),
-                    rate_risk=str(macro_context.get("rate_risk", "")),
-                    geopolitical_risk=str(macro_context.get("geopolitical_risk", "")),
-                    macro_risk_score=float(macro_context.get("macro_risk_score", 0.0)),
-                )
-                for card in notification_candidates
-            ]
-            for card in notification_candidates:
-                self.store.save_opportunity_card(card, run_id=run_context.run_id)
-            self._record_decision_packets(confirmation_packets, run_id=run_context.run_id)
-            self._dispatch_notifications(notification_candidates, run_context, logger)
-            exit_pool_cards, exit_pool_records = self._build_exit_pool_cards(
-                macro_context=macro_context,
-                run_id=run_context.run_id,
-                logger=logger,
-            )
-            if exit_pool_cards:
-                for card in exit_pool_cards:
-                    self.store.save_opportunity_card(card, run_id=run_context.run_id)
-                self._record_exit_pool_decisions(exit_pool_records, run_id=run_context.run_id)
-                self._dispatch_notifications(exit_pool_cards, run_context, logger)
-                exit_pool_symbols = [card.symbol for card in exit_pool_cards]
-                run_context.metrics.cards_generated += len(exit_pool_cards)
-            prewatch_candidates = self._build_prewatch_candidates(
-                watchlist,
-                confirmation_cards=notification_candidates,
+                candidate_pool_candidates,
+                candidate_pool_packets,
+            ) = self._route_into_pools(
+                watchlist=watchlist,
+                routing_inputs=routing_inputs,
+                confirmation_evaluation_extras=confirmation_evaluation_extras,
                 snapshot_cache=snapshot_cache,
                 saved_snapshot_keys=saved_snapshot_keys,
+                macro_context=macro_context,
                 run_context=run_context,
                 logger=logger,
             )
-            prewatch_packets = self._build_prewatch_decision_packets(
-                prewatch_candidates,
+            (
+                candidate_optional_alert_symbols,
+                holding_management_cards,
+                _holding_management_records,
+                holding_management_summary,
+            ) = self._persist_and_review(
                 confirmation_cards=notification_candidates,
-            )
-            self._record_decision_packets(prewatch_packets, run_id=run_context.run_id)
-            prewatch_alert_symbols = self._dispatch_prewatch_notifications(
-                prewatch_candidates,
+                confirmation_packets=confirmation_packets,
+                candidate_pool_candidates=candidate_pool_candidates,
+                candidate_pool_packets=candidate_pool_packets,
                 macro_context=macro_context,
                 run_context=run_context,
                 logger=logger,
@@ -1074,33 +1619,53 @@ class SatelliteAgentService:
             raise
         finally:
             finished_at = utcnow()
-            summary = run_context.metrics.as_dict()
-            summary["last_event_poll_at"] = newest_seen.isoformat()
-            summary["prewatch_candidates_count"] = len(prewatch_candidates)
-            summary["prewatch_candidates"] = [candidate.to_record() for candidate in prewatch_candidates]
-            summary["prewatch_alerts_sent_count"] = run_context.metrics.prewatch_alerts_sent
-            summary["prewatch_alert_symbols"] = list(prewatch_alert_symbols)
-            summary["exit_pool_cards_count"] = len(exit_pool_cards)
-            summary["exit_pool_symbols"] = list(exit_pool_symbols)
-            summary["exit_pool_cards"] = [
+            active_confirmation_cards = [
+                card
+                for card in notification_candidates
+                if str(getattr(card, "delivery_category", "") or "").strip() == "formal"
+            ]
+            holding_management_card_records = [
                 {
                     "symbol": card.symbol,
                     "display_name": card.display_name,
                     "horizon": card.horizon,
-                    "subreason": card.exit_pool_subreason,
+                    "holding_management_reason": card.holding_management_reason or card.normalized_close_reason,
+                    "subreason": card.holding_management_subreason,
                     "reason_to_watch": card.reason_to_watch,
                     "positioning_hint": card.positioning_hint,
                     "chain_summary": card.chain_summary,
-                    "source_decision_id": card.exit_pool_source_decision_id,
+                    "source_decision_id": card.holding_management_source_decision_id,
+                    "action_label": card.action_label,
                     "take_profit_range": {
                         "low": card.take_profit_range.low,
                         "high": card.take_profit_range.high,
                     },
                 }
-                for card in exit_pool_cards
+                for card in holding_management_cards
             ]
+            summary = run_context.metrics.as_dict()
+            summary["last_event_poll_at"] = newest_seen.isoformat()
+            summary["candidate_pool_count"] = len(candidate_pool_candidates)
+            summary["candidate_pool_candidates_count"] = len(candidate_pool_candidates)
+            summary["candidate_pool_candidates"] = [candidate.to_record() for candidate in candidate_pool_candidates]
+            summary["candidate_optional_alerts_sent_count"] = run_context.metrics.candidate_optional_alerts_sent_count
+            summary["candidate_optional_alert_symbols"] = list(candidate_optional_alert_symbols)
+            summary["confirmation_pool_count"] = len(active_confirmation_cards)
+            summary["holding_management_cards_count"] = len(holding_management_cards)
+            summary["holding_management_symbols"] = [card.symbol for card in holding_management_cards]
+            summary["holding_management_cards"] = holding_management_card_records
+            summary.update(holding_management_summary)
+            summary["profit_protection_cards_count"] = len(
+                [
+                    card
+                    for card in holding_management_cards
+                    if str(card.holding_management_reason or card.normalized_close_reason or "").strip()
+                    == "profit_protection_exit"
+                ]
+            )
+            summary = self._with_legacy_run_summary_aliases(summary)
             if status == "success":
-                self.theme_engine.persist_theme_memory(notification_candidates, prewatch_candidates)
+                self.theme_engine.persist_candidate_pool_memory(active_confirmation_cards, candidate_pool_candidates)
             self.store.record_run(
                 run_id=run_context.run_id,
                 started_at=run_context.started_at,
@@ -1111,6 +1676,23 @@ class SatelliteAgentService:
                 config_snapshot=self.runtime_snapshot,
                 summary=summary,
             )
+            touched_symbols = sorted(
+                {
+                    card.symbol.upper()
+                    for card in [*notification_candidates, *holding_management_cards]
+                }
+                | {candidate.symbol.upper() for candidate in candidate_pool_candidates}
+            )
+            if touched_symbols:
+                try:
+                    rebuild_cycle_audit(self.store, symbols=touched_symbols)
+                except Exception as exc:
+                    logger.warning(
+                        "cycle_audit_refresh_failed",
+                        "Cycle audit refresh failed after run completion.",
+                        stage="run",
+                        context={"error": exc.__class__.__name__, "symbol_count": len(touched_symbols)},
+                    )
             logger.info(
                 "run_finished",
                 "Satellite agent run finished.",
@@ -1121,8 +1703,10 @@ class SatelliteAgentService:
             "events_processed": run_context.metrics.events_processed,
             "cards_generated": run_context.metrics.cards_generated,
             "alerts_sent": run_context.metrics.alerts_sent,
-            "prewatch_candidates": run_context.metrics.prewatch_candidates,
-            "prewatch_alerts_sent": run_context.metrics.prewatch_alerts_sent,
+            "candidate_pool_count": run_context.metrics.candidate_pool_count,
+            "candidate_optional_alerts_sent_count": run_context.metrics.candidate_optional_alerts_sent_count,
+            "prewatch_candidates": run_context.metrics.candidate_pool_count,
+            "prewatch_alerts_sent": run_context.metrics.candidate_optional_alerts_sent_count,
         }
 
     def _extract_insight(
@@ -1417,7 +2001,7 @@ class SatelliteAgentService:
                 score += weight
         if any(token in text for token in ("ai", "data center", "chip", "gpu", "cloud")):
             score += 6.0
-        if event.symbol in self.prewatch_symbols:
+        if event.symbol in self._candidate_pool_watch_symbols():
             score += 4.0
         theme_context = summarize_symbol_theme_context(
             event.symbol,
@@ -1502,7 +2086,10 @@ class SatelliteAgentService:
         alerts_sent = 0
         symbol_alert_counts: dict[str, int] = {}
         for card in self._rank_notification_candidates(cards):
-            if card.priority == "suppressed":
+            delivery_category = str(getattr(card, "delivery_category", "") or "").strip()
+            if delivery_category == "formal":
+                decision = self.notifier.send(card, run_id=run_context.run_id)
+            elif card.priority == "suppressed":
                 decision = self.notifier.skip(card, reason="threshold_not_met", run_id=run_context.run_id)
             elif (
                 card.priority != "high"
@@ -1588,7 +2175,7 @@ class SatelliteAgentService:
             context={"horizon": card.horizon, "reason": decision.reason},
         )
 
-    def _build_prewatch_candidates(
+    def _build_candidate_pool_candidates(
         self,
         watchlist: set[str],
         *,
@@ -1597,20 +2184,20 @@ class SatelliteAgentService:
         saved_snapshot_keys: set[tuple[str, str]],
         run_context: RunContext,
         logger: StructuredLogger,
-    ) -> list:
+    ) -> list[CandidatePoolCandidate]:
         if not watchlist:
             return []
         candidates = []
-        prewatch_evaluations: dict[str, dict[str, Any]] = {}
+        candidate_evaluations: dict[str, dict[str, Any]] = {}
         near_miss_snapshots: dict[str, object] = {}
         horizon = "position"
         horizon_settings = self.settings.horizons[horizon]
-        scan_symbols = self._select_prewatch_scan_symbols(watchlist, snapshot_cache)
-        max_workers = min(len(scan_symbols), max(self.settings.prewatch_concurrency, 1))
+        scan_symbols = self._select_candidate_pool_scan_symbols(watchlist, snapshot_cache)
+        max_workers = min(len(scan_symbols), max(self.settings.candidate_pool_concurrency, 1))
         with ThreadPoolExecutor(max_workers=max_workers or 1) as executor:
             futures = {
                 executor.submit(
-                    self._build_single_prewatch_candidate,
+                    self._build_single_candidate_pool_candidate,
                     symbol,
                     horizon,
                     horizon_settings,
@@ -1624,9 +2211,9 @@ class SatelliteAgentService:
                 try:
                     snapshot, candidate = future.result()
                 except Exception as exc:
-                    self._record_prewatch_failure(symbol)
-                    run_context.metrics.prewatch_failures += 1
-                    prewatch_evaluations[symbol.upper()] = {
+                    self._record_candidate_pool_failure(symbol)
+                    run_context.metrics.candidate_pool_failures += 1
+                    candidate_evaluations[symbol.upper()] = {
                         "symbol": symbol.upper(),
                         "horizon": horizon,
                         "outcome": "error",
@@ -1635,36 +2222,36 @@ class SatelliteAgentService:
                         "payload": {
                             "source": "scan",
                             "error": exc.__class__.__name__,
-                            "min_score": round(float(self.settings.prewatch_min_score), 2),
+                            "min_score": round(float(self.settings.candidate_pool_min_score), 2),
                         },
                     }
                     logger.warning(
-                        "prewatch_failed",
-                        "Prewatch candidate generation failed for symbol.",
-                        stage="prewatch",
+                        "candidate_pool_failed",
+                        "Candidate-pool generation failed for symbol.",
+                        stage="candidate_pool",
                         symbol=symbol,
                         context={"error": exc.__class__.__name__},
                     )
                     continue
-                self._clear_prewatch_failure(symbol)
+                self._clear_candidate_pool_failure(symbol)
                 snapshot_cache[snapshot_key] = snapshot
                 if snapshot_key not in saved_snapshot_keys:
                     self.store.save_indicator_snapshot(snapshot)
                     saved_snapshot_keys.add(snapshot_key)
-                evaluation = evaluate_prewatch_snapshot(
+                evaluation = evaluate_candidate_snapshot(
                     snapshot,
                     horizon_settings,
-                    min_score=self.settings.prewatch_min_score,
+                    min_score=self.settings.candidate_pool_min_score,
                 )
                 if candidate is None:
                     near_miss_snapshots[symbol] = snapshot
-                    prewatch_evaluations[symbol.upper()] = {
+                    candidate_evaluations[symbol.upper()] = {
                         "symbol": symbol.upper(),
                         "horizon": horizon,
                         "outcome": "rejected",
                         "reason": str(evaluation.get("rejection_reason") or "rejected"),
                         "score": float(evaluation.get("total_score") or 0.0),
-                        "payload": self._build_prewatch_evaluation_payload(
+                        "payload": self._build_candidate_pool_evaluation_payload(
                             snapshot=snapshot,
                             evaluation=evaluation,
                             source="scan",
@@ -1672,13 +2259,13 @@ class SatelliteAgentService:
                     }
                     continue
                 candidates.append(candidate)
-                prewatch_evaluations[symbol.upper()] = {
+                candidate_evaluations[symbol.upper()] = {
                     "symbol": symbol.upper(),
                     "horizon": horizon,
                     "outcome": "pending",
                     "reason": "passed_scan_threshold",
                     "score": round(float(candidate.score), 2),
-                    "payload": self._build_prewatch_evaluation_payload(
+                    "payload": self._build_candidate_pool_evaluation_payload(
                         snapshot=snapshot,
                         candidate=candidate,
                         evaluation=evaluation,
@@ -1687,14 +2274,14 @@ class SatelliteAgentService:
                 }
         if near_miss_snapshots:
             candidates.extend(
-                self._build_theme_supported_prewatch_candidates(
+                self._build_theme_supported_candidate_pool_candidates(
                     near_miss_snapshots,
                     horizon_settings=horizon_settings,
                     confirmation_cards=confirmation_cards,
                     existing_symbols={candidate.symbol.upper() for candidate in candidates},
                 )
             )
-        event_supported_candidates = self._build_event_supported_prewatch_candidates(
+        event_supported_candidates = self._build_event_supported_candidate_pool_candidates(
             watchlist,
             horizon_settings=horizon_settings,
             confirmation_cards=confirmation_cards,
@@ -1706,13 +2293,13 @@ class SatelliteAgentService:
         )
         if event_supported_candidates:
             candidates.extend(event_supported_candidates)
-        candidates = self._apply_theme_linkage_to_prewatch_candidates(
+        candidates = self._apply_theme_linkage_to_candidate_pool_candidates(
             candidates,
             confirmation_cards=confirmation_cards,
         )
-        ranked = sort_prewatch_candidates(
+        ranked = sort_candidate_pool_candidates(
             candidates,
-            max_candidates=self.settings.max_prewatch_candidates_per_run,
+            max_candidates=self.settings.max_candidate_pool_candidates_per_run,
         )
         selected_ranks = {
             candidate.symbol.upper(): index + 1
@@ -1720,10 +2307,10 @@ class SatelliteAgentService:
         }
         for candidate in candidates:
             symbol = candidate.symbol.upper()
-            existing = prewatch_evaluations.get(symbol, {})
+            existing = candidate_evaluations.get(symbol, {})
             payload = dict(existing.get("payload") or {})
             if not payload:
-                payload = self._build_prewatch_evaluation_payload(
+                payload = self._build_candidate_pool_evaluation_payload(
                     candidate=candidate,
                     source="event_support" if candidate.trigger_mode == "event" else "candidate_pool",
                 )
@@ -1734,7 +2321,7 @@ class SatelliteAgentService:
             else:
                 outcome = "not_selected"
                 reason = "ranked_below_run_cap"
-            prewatch_evaluations[symbol] = {
+            candidate_evaluations[symbol] = {
                 "symbol": symbol,
                 "horizon": candidate.horizon,
                 "outcome": outcome,
@@ -1742,13 +2329,13 @@ class SatelliteAgentService:
                 "score": round(float(candidate.score), 2),
                 "payload": payload,
             }
-        run_context.metrics.prewatch_candidates = len(ranked)
+        run_context.metrics.candidate_pool_count = len(ranked)
         for candidate in ranked:
-            self._record_prewatch_candidate(candidate)
+            self._record_candidate_pool_candidate(candidate)
             logger.info(
-                "prewatch_selected",
-                "Symbol selected into the prewatch candidate pool.",
-                stage="prewatch",
+                "candidate_pool_selected",
+                "Symbol selected into the candidate pool.",
+                stage="candidate_pool",
                 symbol=candidate.symbol,
                 context={
                     "horizon": candidate.horizon,
@@ -1757,10 +2344,10 @@ class SatelliteAgentService:
                 },
             )
         evaluation_created_at = utcnow().isoformat()
-        for item in sorted(prewatch_evaluations.values(), key=lambda row: (str(row.get("symbol") or ""), str(row.get("outcome") or ""))):
+        for item in sorted(candidate_evaluations.values(), key=lambda row: (str(row.get("symbol") or ""), str(row.get("outcome") or ""))):
             self.store.record_candidate_evaluation(
                 run_id=run_context.run_id,
-                stage="prewatch",
+                stage="candidate_pool",
                 symbol=str(item.get("symbol") or ""),
                 horizon=str(item.get("horizon") or horizon),
                 outcome=str(item.get("outcome") or ""),
@@ -1772,7 +2359,26 @@ class SatelliteAgentService:
             )
         return ranked
 
-    def _build_prewatch_evaluation_payload(
+    def _build_prewatch_candidates(
+        self,
+        watchlist: set[str],
+        *,
+        confirmation_cards: list,
+        snapshot_cache: dict[tuple[str, str], object],
+        saved_snapshot_keys: set[tuple[str, str]],
+        run_context: RunContext,
+        logger: StructuredLogger,
+    ) -> list[CandidatePoolCandidate]:
+        return self._build_candidate_pool_candidates(
+            watchlist,
+            confirmation_cards=confirmation_cards,
+            snapshot_cache=snapshot_cache,
+            saved_snapshot_keys=saved_snapshot_keys,
+            run_context=run_context,
+            logger=logger,
+        )
+
+    def _build_candidate_pool_evaluation_payload(
         self,
         *,
         snapshot=None,
@@ -1782,7 +2388,7 @@ class SatelliteAgentService:
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "source": source,
-            "min_score": round(float(self.settings.prewatch_min_score), 2),
+            "min_score": round(float(self.settings.candidate_pool_min_score), 2),
         }
         if snapshot is not None:
             payload.update(
@@ -1799,6 +2405,7 @@ class SatelliteAgentService:
         if evaluation:
             payload.update(
                 {
+                    "candidate_score": round(float(evaluation.get("total_score") or 0.0), 2),
                     "prewatch_score": round(float(evaluation.get("total_score") or 0.0), 2),
                     "setup_type": str(evaluation.get("setup_type") or ""),
                     "rejection_reason": str(evaluation.get("rejection_reason") or ""),
@@ -1814,6 +2421,7 @@ class SatelliteAgentService:
         if candidate is not None:
             payload.update(
                 {
+                    "candidate_score": round(float(candidate.score), 2),
                     "prewatch_score": round(float(candidate.score), 2),
                     "setup_type": str(candidate.setup_type),
                     "trigger_mode": str(candidate.trigger_mode),
@@ -1821,6 +2429,35 @@ class SatelliteAgentService:
                 }
             )
         return payload
+
+    def _build_prewatch_evaluation_payload(
+        self,
+        *,
+        snapshot=None,
+        candidate=None,
+        evaluation: dict[str, object] | None = None,
+        source: str = "",
+    ) -> dict[str, Any]:
+        return self._build_candidate_pool_evaluation_payload(
+            snapshot=snapshot,
+            candidate=candidate,
+            evaluation=evaluation,
+            source=source,
+        )
+
+    def _build_single_candidate_pool_candidate(
+        self,
+        symbol: str,
+        horizon: str,
+        horizon_settings,
+        snapshot_cache: dict[tuple[str, str], object],
+    ):
+        return self._build_single_prewatch_candidate(
+            symbol,
+            horizon,
+            horizon_settings,
+            snapshot_cache,
+        )
 
     def _build_single_prewatch_candidate(
         self,
@@ -1832,13 +2469,20 @@ class SatelliteAgentService:
         snapshot_key = (symbol, horizon)
         snapshot = snapshot_cache.get(snapshot_key)
         if snapshot is None:
-            snapshot = self.prewatch_market_data.snapshot(symbol, horizon, include_intraday=False)
-        candidate = build_prewatch_candidate(
+            snapshot = self._candidate_pool_market_data_engine().snapshot(symbol, horizon, include_intraday=False)
+        candidate = build_candidate_pool_candidate(
             snapshot,
             horizon_settings,
-            min_score=self.settings.prewatch_min_score,
+            min_score=self.settings.candidate_pool_min_score,
         )
         return snapshot, candidate
+
+    def _select_candidate_pool_scan_symbols(
+        self,
+        watchlist: set[str],
+        snapshot_cache: dict[tuple[str, str], object],
+    ) -> list[str]:
+        return self._select_prewatch_scan_symbols(watchlist, snapshot_cache)
 
     def _select_prewatch_scan_symbols(
         self,
@@ -1853,33 +2497,33 @@ class SatelliteAgentService:
             normalized = symbol.upper()
             if normalized not in watchlist or normalized in seen:
                 return
-            if not self._is_prewatch_symbol_eligible(normalized):
+            if not self._is_candidate_pool_symbol_eligible(normalized):
                 return
-            if self._is_prewatch_failure_cooled_down(normalized):
+            if self._is_candidate_pool_failure_cooled_down(normalized):
                 return
             seen.add(normalized)
             ordered.append(normalized)
 
         for symbol in current_symbols:
             append_symbol(symbol)
-        for symbol in self.prewatch_symbols:
+        for symbol in self._candidate_pool_watch_symbols():
             append_symbol(symbol)
         remaining = sorted(
             (symbol for symbol in watchlist if symbol.upper() not in seen),
             key=lambda symbol: (
-                self._prewatch_theme_scan_priority(symbol),
+                self._candidate_pool_theme_scan_priority(symbol),
                 symbol,
             ),
             reverse=True,
         )
         for symbol in remaining:
             append_symbol(symbol)
-        cap = self.settings.max_prewatch_scan_symbols_per_run
+        cap = self.settings.max_candidate_pool_scan_symbols_per_run
         if cap > 0:
             return ordered[:cap]
         return ordered
 
-    def _prewatch_theme_scan_priority(self, symbol: str) -> float:
+    def _candidate_pool_theme_scan_priority(self, symbol: str) -> float:
         normalized = symbol.upper()
         max_score = 0
         for theme_key in self.symbol_theme_map.get(normalized, []):
@@ -1887,7 +2531,10 @@ class SatelliteAgentService:
             max_score = max(max_score, member_count)
         return max_score + self._recent_theme_scan_bonus(normalized)
 
-    def _is_prewatch_symbol_eligible(self, symbol: str) -> bool:
+    def _prewatch_theme_scan_priority(self, symbol: str) -> float:
+        return self._candidate_pool_theme_scan_priority(symbol)
+
+    def _is_candidate_pool_symbol_eligible(self, symbol: str) -> bool:
         normalized = symbol.upper()
         if "." in normalized or "-" in normalized:
             return False
@@ -1895,24 +2542,41 @@ class SatelliteAgentService:
             return False
         return True
 
-    def _is_prewatch_failure_cooled_down(self, symbol: str) -> bool:
-        raw = self.store.get_state(self._prewatch_failure_state_key(symbol))
+    def _is_prewatch_symbol_eligible(self, symbol: str) -> bool:
+        return self._is_candidate_pool_symbol_eligible(symbol)
+
+    def _is_candidate_pool_failure_cooled_down(self, symbol: str) -> bool:
+        raw = self.store.get_state(self._candidate_pool_failure_state_key(symbol))
+        if not raw:
+            raw = self.store.get_state(self._prewatch_failure_state_key(symbol))
         if not raw:
             return False
         try:
             previous = datetime.fromisoformat(raw)
         except ValueError:
             return False
-        cooldown_seconds = self.settings.prewatch_failure_cooldown_minutes * 60
+        cooldown_seconds = self.settings.candidate_pool_failure_cooldown_minutes * 60
         return (utcnow() - previous).total_seconds() < cooldown_seconds
 
-    def _record_prewatch_failure(self, symbol: str) -> None:
-        self.store.set_state(self._prewatch_failure_state_key(symbol), utcnow().isoformat())
+    def _is_prewatch_failure_cooled_down(self, symbol: str) -> bool:
+        return self._is_candidate_pool_failure_cooled_down(symbol)
 
-    def _clear_prewatch_failure(self, symbol: str) -> None:
+    def _record_candidate_pool_failure(self, symbol: str) -> None:
+        timestamp = utcnow().isoformat()
+        self.store.set_state(self._candidate_pool_failure_state_key(symbol), timestamp)
+        self.store.set_state(self._prewatch_failure_state_key(symbol), timestamp)
+
+    def _record_prewatch_failure(self, symbol: str) -> None:
+        self._record_candidate_pool_failure(symbol)
+
+    def _clear_candidate_pool_failure(self, symbol: str) -> None:
+        self.store.set_state(self._candidate_pool_failure_state_key(symbol), "")
         self.store.set_state(self._prewatch_failure_state_key(symbol), "")
 
-    def _dispatch_prewatch_notifications(
+    def _clear_prewatch_failure(self, symbol: str) -> None:
+        self._clear_candidate_pool_failure(symbol)
+
+    def _dispatch_candidate_optional_notifications(
         self,
         candidates,
         *,
@@ -1924,55 +2588,70 @@ class SatelliteAgentService:
             return []
         sent_symbols: list[str] = []
         for candidate in candidates:
-            if candidate.score < self.settings.prewatch_alert_min_score:
+            if candidate.score < self.settings.candidate_optional_alert_min_score:
                 continue
             if (
-                self.settings.max_prewatch_alerts_per_run > 0
-                and len(sent_symbols) >= self.settings.max_prewatch_alerts_per_run
+                self.settings.max_candidate_optional_alerts_per_run > 0
+                and len(sent_symbols) >= self.settings.max_candidate_optional_alerts_per_run
             ):
                 break
-            should_skip, skip_reason = self._should_skip_prewatch_alert(candidate)
+            should_skip, skip_reason = self._should_skip_candidate_optional_alert(candidate)
             if should_skip:
                 logger.info(
-                    "prewatch_alert_skipped",
-                    "Prewatch light alert skipped.",
-                    stage="prewatch_notify",
+                    "candidate_optional_alert_skipped",
+                    "Candidate optional alert skipped.",
+                    stage="candidate_optional_notify",
                     symbol=candidate.symbol,
                     context={"reason": skip_reason},
                 )
                 continue
-            notification_card = self._build_prewatch_notification_card(
+            notification_card = self._build_candidate_optional_notification_card(
                 candidate,
                 macro_context=macro_context,
                 run_id=run_context.run_id,
             )
-            title = f"[预备池] {self.notifier._title(notification_card)}"
+            title = f"[候选池] {self.notifier._title(notification_card)}"
             body = self.notifier._body(notification_card)
             try:
                 self.notifier.transport.send(title, body)
             except Exception as exc:
                 run_context.metrics.notification_failures += 1
                 logger.error(
-                    "prewatch_alert_failed",
-                    "Prewatch light alert failed to deliver.",
-                    stage="prewatch_notify",
+                    "candidate_optional_alert_failed",
+                    "Candidate optional alert failed to deliver.",
+                    stage="candidate_optional_notify",
                     symbol=candidate.symbol,
                     context={"error": exc.__class__.__name__},
                 )
                 continue
-            self._record_prewatch_alert_sent(candidate)
-            run_context.metrics.prewatch_alerts_sent += 1
+            self._record_candidate_optional_alert_sent(candidate)
+            run_context.metrics.candidate_optional_alerts_sent_count += 1
             sent_symbols.append(candidate.symbol)
             logger.info(
-                "prewatch_alert_sent",
-                "Prewatch light alert delivered.",
-                stage="prewatch_notify",
+                "candidate_optional_alert_sent",
+                "Candidate optional alert delivered.",
+                stage="candidate_optional_notify",
                 symbol=candidate.symbol,
                 context={"score": candidate.score, "horizon": candidate.horizon},
             )
         return sent_symbols
 
-    def _build_prewatch_notification_card(
+    def _dispatch_prewatch_notifications(
+        self,
+        candidates,
+        *,
+        macro_context: dict[str, object],
+        run_context: RunContext,
+        logger: StructuredLogger,
+    ) -> list[str]:
+        return self._dispatch_candidate_optional_notifications(
+            candidates,
+            macro_context=macro_context,
+            run_context=run_context,
+            logger=logger,
+        )
+
+    def _build_candidate_optional_notification_card(
         self,
         candidate,
         *,
@@ -1987,29 +2666,29 @@ class SatelliteAgentService:
             self.theme_display_name_map,
         )
         event_type = candidate.trigger_event_type or "news"
-        confidence_label = "中" if candidate.score >= self.settings.prewatch_alert_min_score else "低"
+        confidence_label = "中" if candidate.score >= self.settings.candidate_optional_alert_min_score else "低"
         base_card = OpportunityCard(
-            card_id=f"prewatch-notify:{symbol}:{int(now.timestamp())}",
-            event_id=f"prewatch-notify:{symbol}:{candidate.as_of.isoformat()}",
+            card_id=f"candidate-notify:{symbol}:{int(now.timestamp())}",
+            event_id=f"candidate-notify:{symbol}:{candidate.as_of.isoformat()}",
             symbol=symbol,
             horizon=candidate.horizon,
             event_type=event_type,
             headline_summary=candidate.headline_summary,
-            bull_case="若后续催化继续兑现、价格结构转强，这条预备池机会有望升级。",
-            bear_case="若量能衰减或价格结构转弱，这条预备池机会可能快速失去跟踪价值。",
+            bull_case="若后续催化继续兑现、价格结构转强，这条候选机会有望升级。",
+            bear_case="若量能衰减或价格结构转弱，这条候选机会可能快速失去跟踪价值。",
             event_score=round(candidate.score if candidate.trigger_mode == "event" else 0.0, 2),
             market_score=round(candidate.score if candidate.trigger_mode != "event" else candidate.score * 0.6, 2),
             final_score=round(candidate.score, 2),
             entry_range=PriceRange(candidate.last_price, candidate.last_price),
             take_profit_range=PriceRange(candidate.last_price, candidate.last_price),
             invalidation_level=round(candidate.support_20, 2),
-            invalidation_reason="观察提醒，仅供观察，不作为正式交易依据。",
-            risk_notes=["观察提醒", "正式执行前需结合真实行情与事件确认"],
+            invalidation_reason="观察卡，仅供观察，不作为正式交易依据。",
+            risk_notes=["观察卡", "正式执行前需结合真实行情与事件确认"],
             source_refs=[],
             created_at=now,
             ttl=now + timedelta(days=10 if candidate.horizon == "position" else 5),
             priority="suppressed",
-            dedup_key=f"prewatch-notify:{symbol}:{candidate.horizon}",
+            dedup_key=f"candidate-notify:{symbol}:{candidate.horizon}",
             bias="long",
             display_name=self._display_name_for(symbol),
             action_label="加入观察",
@@ -2021,23 +2700,38 @@ class SatelliteAgentService:
             relative_volume=round(candidate.relative_volume, 2),
             theme_tags=theme_tags,
             market_data_complete=True,
+            lifecycle_pool="candidate",
+            delivery_category="candidate_optional",
             promoted_from_prewatch=True,
-            prewatch_score=round(candidate.score, 2),
-            prewatch_setup_type=candidate.setup_type,
-            positioning_hint="当前先放入观察名单，不追价，等结构和催化进一步确认后再升级。",
+            candidate_score=round(candidate.score, 2),
+            candidate_setup_type=candidate.setup_type,
+            positioning_hint="当前先放入候选池，不追价，等结构和催化进一步确认后再升级。",
         )
         return self._decorate_card_with_runtime_context(
             base_card,
-            insight=self._synthetic_prewatch_insight(candidate, theme_tags=theme_tags),
+            insight=self._synthetic_candidate_pool_insight(candidate, theme_tags=theme_tags),
             macro_context=macro_context,
             run_id=run_id,
             lite_narration=True,
         )
 
-    def _synthetic_prewatch_insight(self, candidate, *, theme_tags: list[str]) -> EventInsight:
+    def _build_prewatch_notification_card(
+        self,
+        candidate,
+        *,
+        macro_context: dict[str, object],
+        run_id: str = "",
+    ) -> OpportunityCard:
+        return self._build_candidate_optional_notification_card(
+            candidate,
+            macro_context=macro_context,
+            run_id=run_id,
+        )
+
+    def _synthetic_candidate_pool_insight(self, candidate, *, theme_tags: list[str]) -> EventInsight:
         event_type = candidate.trigger_event_type or "news"
         return EventInsight(
-            event_id=f"prewatch-insight:{candidate.symbol.upper()}:{candidate.as_of.isoformat()}",
+            event_id=f"candidate-insight:{candidate.symbol.upper()}:{candidate.as_of.isoformat()}",
             symbol=candidate.symbol.upper(),
             event_type=event_type,
             headline_summary=candidate.headline_summary,
@@ -2049,13 +2743,16 @@ class SatelliteAgentService:
             sentiment=0.45,
             theme_relevance=82.0 if theme_tags else 60.0,
             llm_confidence=0.0,
-            risk_notes=["预备池阶段更重视后续确认，不宜把观察信号直接等同于正式执行信号。"],
+            risk_notes=["候选池阶段更重视后续确认，不宜把观察信号直接等同于正式执行信号。"],
             source_refs=[],
-            raw_payload={"mode": "synthetic_prewatch"},
+            raw_payload={"mode": "synthetic_candidate"},
             created_at=utcnow(),
         )
 
-    def _build_theme_supported_prewatch_candidates(
+    def _synthetic_prewatch_insight(self, candidate, *, theme_tags: list[str]) -> EventInsight:
+        return self._synthetic_candidate_pool_insight(candidate, theme_tags=theme_tags)
+
+    def _build_theme_supported_candidate_pool_candidates(
         self,
         snapshots: dict[str, object],
         *,
@@ -2074,7 +2771,7 @@ class SatelliteAgentService:
         if not confirmed_symbols and not recent_theme_memory:
             return []
         relaxed_min_score = max(
-            self.settings.prewatch_min_score - self.settings.prewatch_theme_relaxed_margin,
+            self.settings.candidate_pool_min_score - self.settings.candidate_pool_theme_relaxed_margin,
             0.0,
         )
         candidates = []
@@ -2087,14 +2784,14 @@ class SatelliteAgentService:
                 symbol_theme_map=self.symbol_theme_map,
                 theme_memberships=self.theme_memberships,
                 confirmed_symbols=confirmed_symbols,
-                prewatch_symbols=existing_symbols,
+                candidate_symbols=existing_symbols,
             )
             if not context["confirmed_peer_symbols"] and not self._strongest_recent_theme_for_symbol(
                 normalized,
                 recent_theme_memory,
             ):
                 continue
-            candidate = build_prewatch_candidate(
+            candidate = build_candidate_pool_candidate(
                 snapshot,
                 horizon_settings,
                 min_score=relaxed_min_score,
@@ -2104,7 +2801,22 @@ class SatelliteAgentService:
             candidates.append(candidate)
         return candidates
 
-    def _build_event_supported_prewatch_candidates(
+    def _build_theme_supported_prewatch_candidates(
+        self,
+        snapshots: dict[str, object],
+        *,
+        horizon_settings,
+        confirmation_cards: list,
+        existing_symbols: set[str],
+    ) -> list:
+        return self._build_theme_supported_candidate_pool_candidates(
+            snapshots,
+            horizon_settings=horizon_settings,
+            confirmation_cards=confirmation_cards,
+            existing_symbols=existing_symbols,
+        )
+
+    def _build_event_supported_candidate_pool_candidates(
         self,
         watchlist: set[str],
         *,
@@ -2118,7 +2830,7 @@ class SatelliteAgentService:
     ) -> list:
         if not watchlist or not confirmation_cards or not self.symbol_theme_map:
             return []
-        active_themes = self._build_event_prewatch_theme_seeds(confirmation_cards)
+        active_themes = self._build_event_candidate_pool_theme_seeds(confirmation_cards)
         if not active_themes:
             return []
         confirmed_symbols = {
@@ -2138,15 +2850,15 @@ class SatelliteAgentService:
                     continue
                 if normalized in existing_symbols or normalized in confirmed_symbols:
                     continue
-                if not self._is_prewatch_symbol_eligible(normalized):
+                if not self._is_candidate_pool_symbol_eligible(normalized):
                     continue
-                if self._is_prewatch_failure_cooled_down(normalized):
+                if self._is_candidate_pool_failure_cooled_down(normalized):
                     continue
                 snapshot_key = (normalized, "position")
                 snapshot = snapshot_cache.get(snapshot_key)
                 try:
                     if snapshot is None:
-                        snapshot = self.prewatch_market_data.snapshot(
+                        snapshot = self._candidate_pool_market_data_engine().snapshot(
                             normalized,
                             "position",
                             include_intraday=False,
@@ -2156,18 +2868,18 @@ class SatelliteAgentService:
                         self.store.save_indicator_snapshot(snapshot)
                         saved_snapshot_keys.add(snapshot_key)
                 except Exception as exc:
-                    self._record_prewatch_failure(normalized)
-                    run_context.metrics.prewatch_failures += 1
+                    self._record_candidate_pool_failure(normalized)
+                    run_context.metrics.candidate_pool_failures += 1
                     logger.warning(
-                        "prewatch_failed",
-                        "Event-driven prewatch candidate generation failed for symbol.",
-                        stage="prewatch",
+                        "candidate_pool_failed",
+                        "Event-driven candidate-pool generation failed for symbol.",
+                        stage="candidate_pool",
                         symbol=normalized,
                         context={"error": exc.__class__.__name__, "mode": "event"},
                     )
                     continue
-                self._clear_prewatch_failure(normalized)
-                base_candidate = build_prewatch_candidate(
+                self._clear_candidate_pool_failure(normalized)
+                base_candidate = build_candidate_pool_candidate(
                     snapshot,
                     horizon_settings,
                     min_score=0.0,
@@ -2175,17 +2887,17 @@ class SatelliteAgentService:
                 if base_candidate is None:
                     continue
                 boosted_score = round(base_candidate.score + seed["bonus"], 2)
-                if boosted_score < self.settings.prewatch_event_min_score:
+                if boosted_score < self.settings.candidate_pool_event_min_score:
                     continue
                 trigger_symbols = list(seed["trigger_symbols"])[:3]
                 theme_name = display_theme_name(theme_key, self.theme_display_name_map)
                 event_type_label = EVENT_TYPE_DISPLAY_NAMES.get(seed["event_type"], "事件")
                 headline_summary = (
-                    f"{normalized} 受到{theme_name}题材事件催化带动，适合先加入观察名单，"
+                    f"{normalized} 受到{theme_name}题材事件催化带动，适合先进入候选池，"
                     "等待个股结构和量价跟上。"
                 )
                 action_hint = (
-                    "题材出现事件催化，可先加入观察；若后续出现回踩承接、放量突破或新增催化，"
+                    "题材出现事件催化，可先进入候选池；若后续出现回踩承接、放量突破或新增催化，"
                     "再考虑升入确认池。"
                 )
                 reason_note = (
@@ -2219,9 +2931,32 @@ class SatelliteAgentService:
                     break
         return candidates
 
-    def _build_event_prewatch_theme_seeds(self, confirmation_cards: list) -> list[tuple[str, dict]]:
+    def _build_event_supported_prewatch_candidates(
+        self,
+        watchlist: set[str],
+        *,
+        horizon_settings,
+        confirmation_cards: list,
+        snapshot_cache: dict[tuple[str, str], object],
+        saved_snapshot_keys: set[tuple[str, str]],
+        existing_symbols: set[str],
+        run_context: RunContext,
+        logger: StructuredLogger,
+    ) -> list:
+        return self._build_event_supported_candidate_pool_candidates(
+            watchlist,
+            horizon_settings=horizon_settings,
+            confirmation_cards=confirmation_cards,
+            snapshot_cache=snapshot_cache,
+            saved_snapshot_keys=saved_snapshot_keys,
+            existing_symbols=existing_symbols,
+            run_context=run_context,
+            logger=logger,
+        )
+
+    def _build_event_candidate_pool_theme_seeds(self, confirmation_cards: list) -> list[tuple[str, dict]]:
         seeds: dict[str, dict] = {}
-        min_event_score = self.settings.prewatch_event_trigger_min_event_score
+        min_event_score = self.settings.candidate_pool_event_trigger_min_event_score
         for card in confirmation_cards:
             if card.priority == "suppressed" and getattr(card, "execution_eligible", True):
                 continue
@@ -2248,7 +2983,7 @@ class SatelliteAgentService:
             event_bonus = min(
                 EVENT_PREWATCH_BASE_BONUS
                 + max(seed["max_event_score"] - min_event_score, 0.0) / 2.0,
-                self.settings.prewatch_event_bonus_cap,
+                self.settings.candidate_pool_event_bonus_cap,
             )
             seed["bonus"] = round(event_bonus, 2)
             ranked.append((theme_key, seed))
@@ -2261,20 +2996,32 @@ class SatelliteAgentService:
         )
         return ranked
 
-    def _is_prewatch_alert_cooled_down(self, symbol: str) -> bool:
-        previous = self._load_prewatch_alert_state(symbol).get("sent_at")
+    def _build_event_prewatch_theme_seeds(self, confirmation_cards: list) -> list[tuple[str, dict]]:
+        return self._build_event_candidate_pool_theme_seeds(confirmation_cards)
+
+    def _is_candidate_optional_alert_cooled_down(self, symbol: str) -> bool:
+        previous = self._load_candidate_optional_alert_state(symbol).get("sent_at")
         if previous is None:
             return False
-        return (utcnow() - previous).total_seconds() < self.settings.prewatch_alert_cooldown_minutes * 60
+        return (utcnow() - previous).total_seconds() < self.settings.candidate_optional_alert_cooldown_minutes * 60
 
-    def _should_skip_prewatch_alert(self, candidate) -> tuple[bool, str]:
-        if self._is_prewatch_alert_cooled_down(candidate.symbol):
+    def _is_prewatch_alert_cooled_down(self, symbol: str) -> bool:
+        return self._is_candidate_optional_alert_cooled_down(symbol)
+
+    def _should_skip_candidate_optional_alert(self, candidate) -> tuple[bool, str]:
+        cycle_state = self._load_active_cycle_state(candidate.symbol)
+        cycle_status = str(cycle_state.get("status") or "terminal")
+        if cycle_status == "holding_active":
+            return True, "holding_active"
+        if cycle_status == "pending_entry":
+            return True, "pending_entry"
+        if self._is_candidate_optional_alert_cooled_down(candidate.symbol):
             return True, "cooldown_active"
-        state = self._load_prewatch_alert_state(candidate.symbol)
+        state = self._load_candidate_optional_alert_state(candidate.symbol)
         previous = state.get("sent_at")
         if previous is None:
             return False, ""
-        repeat_window_seconds = max(self.settings.prewatch_alert_repeat_window_minutes, 0) * 60
+        repeat_window_seconds = max(self.settings.candidate_optional_alert_repeat_window_minutes, 0) * 60
         if repeat_window_seconds <= 0:
             return False, ""
         if (utcnow() - previous).total_seconds() >= repeat_window_seconds:
@@ -2282,20 +3029,28 @@ class SatelliteAgentService:
         previous_signature = str(state.get("signature") or "").strip()
         if not previous_signature:
             return False, ""
-        current_signature = self._prewatch_alert_signature(candidate)
+        current_signature = self._candidate_optional_alert_signature(candidate)
         score_delta = abs(float(candidate.score) - float(state.get("score") or 0.0))
         if (
             current_signature == previous_signature
-            and score_delta < max(self.settings.prewatch_alert_repeat_min_score_delta, 0.0)
+            and score_delta < max(self.settings.candidate_optional_alert_repeat_min_score_delta, 0.0)
         ):
             return True, "content_unchanged_within_repeat_window"
         return False, ""
 
+    def _should_skip_prewatch_alert(self, candidate) -> tuple[bool, str]:
+        return self._should_skip_candidate_optional_alert(candidate)
+
+    def _candidate_optional_alert_state_key(self, symbol: str) -> str:
+        return f"candidate_optional_alert:{symbol.upper()}"
+
     def _prewatch_alert_state_key(self, symbol: str) -> str:
         return f"prewatch_alert:{symbol.upper()}"
 
-    def _load_prewatch_alert_state(self, symbol: str) -> dict[str, Any]:
-        raw = self.store.get_state(self._prewatch_alert_state_key(symbol))
+    def _load_candidate_optional_alert_state(self, symbol: str) -> dict[str, Any]:
+        raw = self.store.get_state(self._candidate_optional_alert_state_key(symbol))
+        if not raw:
+            raw = self.store.get_state(self._prewatch_alert_state_key(symbol))
         if not raw:
             return {}
         raw = raw.strip()
@@ -2320,7 +3075,10 @@ class SatelliteAgentService:
             "signature": str(payload.get("signature") or ""),
         }
 
-    def _prewatch_alert_signature(self, candidate) -> str:
+    def _load_prewatch_alert_state(self, symbol: str) -> dict[str, Any]:
+        return self._load_candidate_optional_alert_state(symbol)
+
+    def _candidate_optional_alert_signature(self, candidate) -> str:
         payload = {
             "symbol": candidate.symbol,
             "horizon": candidate.horizon,
@@ -2332,38 +3090,51 @@ class SatelliteAgentService:
         serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         return hashlib.sha1(serialized.encode("utf-8")).hexdigest()
 
-    def _record_prewatch_alert_sent(self, candidate) -> None:
+    def _prewatch_alert_signature(self, candidate) -> str:
+        return self._candidate_optional_alert_signature(candidate)
+
+    def _record_candidate_optional_alert_sent(self, candidate) -> None:
         sent_at = utcnow().isoformat()
-        self.store.set_state(
-            self._prewatch_alert_state_key(candidate.symbol),
-            json.dumps(
-                {
-                    "sent_at": sent_at,
-                    "score": round(float(candidate.score), 2),
-                    "signature": self._prewatch_alert_signature(candidate),
-                },
-                sort_keys=True,
-                ensure_ascii=False,
-            ),
+        payload = json.dumps(
+            {
+                "sent_at": sent_at,
+                "score": round(float(candidate.score), 2),
+                "signature": self._candidate_optional_alert_signature(candidate),
+            },
+            sort_keys=True,
+            ensure_ascii=False,
         )
-        state = self._load_prewatch_candidate_state(candidate.symbol)
+        self.store.set_state(self._candidate_optional_alert_state_key(candidate.symbol), payload)
+        self.store.set_state(self._prewatch_alert_state_key(candidate.symbol), payload)
+        state = self._load_candidate_pool_state(candidate.symbol)
         if not state:
-            self._record_prewatch_candidate(candidate)
-            state = self._load_prewatch_candidate_state(candidate.symbol)
+            self._record_candidate_pool_candidate(candidate)
+            state = self._load_candidate_pool_state(candidate.symbol)
         if not state:
             return
         state["alert_sent_count"] = max(int(state.get("alert_sent_count") or 0) + 1, 1)
         state["last_alert_sent_at"] = sent_at
-        self._save_prewatch_candidate_state(candidate.symbol, state)
+        self._save_candidate_pool_state(candidate.symbol, state)
+
+    def _record_prewatch_alert_sent(self, candidate) -> None:
+        self._record_candidate_optional_alert_sent(candidate)
+
+    def _candidate_pool_failure_state_key(self, symbol: str) -> str:
+        return f"candidate_pool_failure:{symbol.upper()}"
 
     def _prewatch_failure_state_key(self, symbol: str) -> str:
         return f"prewatch_failure:{symbol.upper()}"
 
+    def _candidate_pool_state_key(self, symbol: str) -> str:
+        return f"candidate_pool:{symbol.upper()}"
+
     def _prewatch_candidate_state_key(self, symbol: str) -> str:
         return f"prewatch_candidate:{symbol.upper()}"
 
-    def _load_prewatch_candidate_state(self, symbol: str) -> dict[str, Any]:
-        raw = self.store.get_state(self._prewatch_candidate_state_key(symbol))
+    def _load_candidate_pool_state(self, symbol: str) -> dict[str, Any]:
+        raw = self.store.get_state(self._candidate_pool_state_key(symbol))
+        if not raw:
+            raw = self.store.get_state(self._prewatch_candidate_state_key(symbol))
         if not raw:
             return {}
         try:
@@ -2388,20 +3159,34 @@ class SatelliteAgentService:
             "observation_count": max(int(payload.get("observation_count") or 1), 1),
             "alert_sent_count": max(int(payload.get("alert_sent_count") or 0), 0),
             "last_alert_sent_at": str(payload.get("last_alert_sent_at") or ""),
+            "latest_candidate_decision_id": str(
+                payload.get("latest_candidate_decision_id") or payload.get("latest_prewatch_decision_id") or ""
+            ),
+            "latest_candidate_event_id": str(
+                payload.get("latest_candidate_event_id") or payload.get("latest_prewatch_event_id") or ""
+            ),
+            "latest_candidate_run_id": str(
+                payload.get("latest_candidate_run_id") or payload.get("latest_prewatch_run_id") or ""
+            ),
             "latest_prewatch_decision_id": str(payload.get("latest_prewatch_decision_id") or ""),
             "latest_prewatch_event_id": str(payload.get("latest_prewatch_event_id") or ""),
             "latest_prewatch_run_id": str(payload.get("latest_prewatch_run_id") or ""),
         }
 
-    def _save_prewatch_candidate_state(self, symbol: str, state: dict[str, Any]) -> None:
-        self.store.set_state(
-            self._prewatch_candidate_state_key(symbol),
-            json.dumps(state, sort_keys=True, ensure_ascii=False),
-        )
+    def _load_prewatch_candidate_state(self, symbol: str) -> dict[str, Any]:
+        return self._load_candidate_pool_state(symbol)
 
-    def _record_prewatch_candidate(self, candidate) -> None:
+    def _save_candidate_pool_state(self, symbol: str, state: dict[str, Any]) -> None:
+        payload = json.dumps(state, sort_keys=True, ensure_ascii=False)
+        self.store.set_state(self._candidate_pool_state_key(symbol), payload)
+        self.store.set_state(self._prewatch_candidate_state_key(symbol), payload)
+
+    def _save_prewatch_candidate_state(self, symbol: str, state: dict[str, Any]) -> None:
+        self._save_candidate_pool_state(symbol, state)
+
+    def _record_candidate_pool_candidate(self, candidate) -> None:
         candidate_record = candidate.to_record()
-        previous_state = self._load_prewatch_candidate_state(candidate.symbol)
+        previous_state = self._load_candidate_pool_state(candidate.symbol)
         previous_candidate = previous_state.get("candidate") or {}
         repeated_same_observation = (
             str(previous_candidate.get("as_of") or "") == str(candidate_record.get("as_of") or "")
@@ -2418,14 +3203,32 @@ class SatelliteAgentService:
             "observation_count": max(observation_count, 1),
             "alert_sent_count": max(int(previous_state.get("alert_sent_count") or 0), 0),
             "last_alert_sent_at": str(previous_state.get("last_alert_sent_at") or ""),
+            "latest_candidate_decision_id": str(
+                previous_state.get("latest_candidate_decision_id")
+                or previous_state.get("latest_prewatch_decision_id")
+                or ""
+            ),
+            "latest_candidate_event_id": str(
+                previous_state.get("latest_candidate_event_id")
+                or previous_state.get("latest_prewatch_event_id")
+                or ""
+            ),
+            "latest_candidate_run_id": str(
+                previous_state.get("latest_candidate_run_id")
+                or previous_state.get("latest_prewatch_run_id")
+                or ""
+            ),
             "latest_prewatch_decision_id": str(previous_state.get("latest_prewatch_decision_id") or ""),
             "latest_prewatch_event_id": str(previous_state.get("latest_prewatch_event_id") or ""),
             "latest_prewatch_run_id": str(previous_state.get("latest_prewatch_run_id") or ""),
         }
-        self._save_prewatch_candidate_state(candidate.symbol, state)
+        self._save_candidate_pool_state(candidate.symbol, state)
 
-    def _load_recent_prewatch_candidate(self, symbol: str) -> dict | None:
-        state = self._load_prewatch_candidate_state(symbol)
+    def _record_prewatch_candidate(self, candidate) -> None:
+        self._record_candidate_pool_candidate(candidate)
+
+    def _load_recent_candidate_pool_context(self, symbol: str) -> dict | None:
+        state = self._load_candidate_pool_state(symbol)
         if not state:
             return None
         payload = dict(state.get("candidate") or {})
@@ -2435,17 +3238,48 @@ class SatelliteAgentService:
         except (ValueError, TypeError):
             return None
         age_seconds = (utcnow() - as_of).total_seconds()
-        if age_seconds > max(self.settings.prewatch_promotion_window_hours, 0) * 3600:
+        if age_seconds > max(self.settings.candidate_pool_promotion_window_hours, 0) * 3600:
             return None
         payload["observation_count"] = max(int(state.get("observation_count") or 1), 1)
         payload["first_seen_at"] = str(state.get("first_seen_at") or payload.get("as_of") or "")
         payload["last_seen_at"] = str(state.get("last_seen_at") or payload.get("as_of") or "")
         payload["alert_sent_count"] = max(int(state.get("alert_sent_count") or 0), 0)
         payload["last_alert_sent_at"] = str(state.get("last_alert_sent_at") or "")
+        payload["latest_candidate_decision_id"] = str(
+            state.get("latest_candidate_decision_id") or state.get("latest_prewatch_decision_id") or ""
+        )
+        payload["latest_candidate_event_id"] = str(
+            state.get("latest_candidate_event_id") or state.get("latest_prewatch_event_id") or ""
+        )
+        payload["latest_candidate_run_id"] = str(
+            state.get("latest_candidate_run_id") or state.get("latest_prewatch_run_id") or ""
+        )
         payload["latest_prewatch_decision_id"] = str(state.get("latest_prewatch_decision_id") or "")
         payload["latest_prewatch_event_id"] = str(state.get("latest_prewatch_event_id") or "")
         payload["latest_prewatch_run_id"] = str(state.get("latest_prewatch_run_id") or "")
         return payload
+
+    def _load_recent_prewatch_candidate(self, symbol: str) -> dict | None:
+        return self._load_recent_candidate_pool_context(symbol)
+
+    def _record_candidate_pool_decision_reference(
+        self,
+        *,
+        symbol: str,
+        decision_id: str,
+        event_id: str,
+        run_id: str,
+    ) -> None:
+        state = self._load_candidate_pool_state(symbol)
+        if not state:
+            return
+        state["latest_candidate_decision_id"] = decision_id
+        state["latest_candidate_event_id"] = event_id
+        state["latest_candidate_run_id"] = run_id
+        state["latest_prewatch_decision_id"] = decision_id
+        state["latest_prewatch_event_id"] = event_id
+        state["latest_prewatch_run_id"] = run_id
+        self._save_candidate_pool_state(symbol, state)
 
     def _record_prewatch_decision_reference(
         self,
@@ -2455,61 +3289,68 @@ class SatelliteAgentService:
         event_id: str,
         run_id: str,
     ) -> None:
-        state = self._load_prewatch_candidate_state(symbol)
-        if not state:
-            return
-        state["latest_prewatch_decision_id"] = decision_id
-        state["latest_prewatch_event_id"] = event_id
-        state["latest_prewatch_run_id"] = run_id
-        self._save_prewatch_candidate_state(symbol, state)
+        self._record_candidate_pool_decision_reference(
+            symbol=symbol,
+            decision_id=decision_id,
+            event_id=event_id,
+            run_id=run_id,
+        )
+
+    def _build_candidate_pool_promotion_reason(self, candidate_pool_context: dict[str, Any]) -> str:
+        symbol = str(candidate_pool_context.get("symbol") or "").strip().upper()
+        observation_count = max(self._recent_candidate_observation_count_72h(symbol), 1) if symbol else 1
+        alert_sent_count = max(int(candidate_pool_context.get("alert_sent_count") or 0), 0)
+        detail = f"近72h进入候选池 {observation_count} 次"
+        if alert_sent_count > 0:
+            last_alert_text = format_beijing_minute(candidate_pool_context.get("last_alert_sent_at"))
+            detail += f"，期间已发观察卡 {alert_sent_count} 次（最近一次 {last_alert_text}）"
+        return f"此前已进入候选池，{detail}，本轮事件达到确认条件。"
 
     def _build_prewatch_promotion_reason(self, prewatch_context: dict[str, Any]) -> str:
-        observation_count = max(int(prewatch_context.get("observation_count") or 1), 1)
-        alert_sent_count = max(int(prewatch_context.get("alert_sent_count") or 0), 0)
-        first_seen_text = format_beijing_minute(prewatch_context.get("first_seen_at"))
-        last_seen_text = format_beijing_minute(prewatch_context.get("last_seen_at"))
-        detail = f"累计观察 {observation_count} 次（首次 {first_seen_text}，最近一次 {last_seen_text}）"
-        if alert_sent_count > 0:
-            last_alert_text = format_beijing_minute(prewatch_context.get("last_alert_sent_at"))
-            detail += f"，期间已观察提醒 {alert_sent_count} 次（最近一次 {last_alert_text}）"
-        return f"此前已进入预备池，{detail}，本轮事件达到确认条件。"
+        return self._build_candidate_pool_promotion_reason(prewatch_context)
 
-    def _apply_prewatch_promotion(self, card, *, insight, prewatch_context: dict | None):
-        if not prewatch_context:
+    def _apply_candidate_pool_promotion(self, card, *, insight, candidate_pool_context: dict | None):
+        if not candidate_pool_context:
             return card
-        if card.event_score < self.settings.prewatch_confirmation_min_event_score:
+        if card.event_score < self.settings.candidate_confirmation_min_event_score:
             return card
-        setup_type = str(prewatch_context.get("setup_type", ""))
+        setup_type = str(candidate_pool_context.get("setup_type", ""))
         setup_label = {
             "breakout_watch": "突破预热",
             "pullback_watch": "回踩蓄势",
             "relative_strength_watch": "相对强势",
-        }.get(setup_type, setup_type or "预备池")
-        observation_count = max(int(prewatch_context.get("observation_count") or 1), 1)
-        alert_sent_count = max(int(prewatch_context.get("alert_sent_count") or 0), 0)
-        lifecycle_hint = f"累计观察 {observation_count} 次"
+        }.get(setup_type, setup_type or "候选池")
+        observation_count = max(int(candidate_pool_context.get("observation_count") or 1), 1)
+        recent_observation_count_72h = max(self._recent_candidate_observation_count_72h(card.symbol), 1)
+        alert_sent_count = max(int(candidate_pool_context.get("alert_sent_count") or 0), 0)
+        lifecycle_hint = f"近72h进入候选池 {recent_observation_count_72h} 次"
         if alert_sent_count > 0:
-            lifecycle_hint += f"，期间已观察提醒 {alert_sent_count} 次"
+            lifecycle_hint += f"，期间已发观察卡 {alert_sent_count} 次"
         positioning_hint = (
-            f"该标的此前已进入预备池（{setup_label}，{float(prewatch_context.get('score', 0.0)):.1f} 分，{lifecycle_hint}），"
+            f"该标的此前已进入候选池（{setup_label}，{float(candidate_pool_context.get('score', 0.0)):.1f} 分，{lifecycle_hint}），"
             "本次事件触发确认，可从观察/轻仓阶段切换到正式确认。"
         )
-        promotion_reason = self._build_prewatch_promotion_reason(prewatch_context)
+        promotion_reason = self._build_candidate_pool_promotion_reason(candidate_pool_context)
         reason_to_watch = card.reason_to_watch
         if promotion_reason not in reason_to_watch:
             reason_to_watch = f"{reason_to_watch} {promotion_reason}".strip()
         promoted_card = replace(
             card,
             promoted_from_prewatch=True,
-            prewatch_score=round(float(prewatch_context.get("score", 0.0)), 2),
-            prewatch_setup_type=setup_type,
-            prewatch_observation_count=observation_count,
-            prewatch_alert_sent_count=alert_sent_count,
-            prewatch_first_seen_at=str(prewatch_context.get("first_seen_at") or ""),
-            prewatch_last_seen_at=str(prewatch_context.get("last_seen_at") or ""),
-            prewatch_last_alert_sent_at=str(prewatch_context.get("last_alert_sent_at") or ""),
-            prewatch_source_decision_id=str(prewatch_context.get("latest_prewatch_decision_id") or ""),
-            prewatch_promotion_reason=promotion_reason,
+            candidate_score=round(float(candidate_pool_context.get("score", 0.0)), 2),
+            candidate_setup_type=setup_type,
+            candidate_observation_count=observation_count,
+            candidate_alert_sent_count=alert_sent_count,
+            candidate_first_seen_at=str(candidate_pool_context.get("first_seen_at") or ""),
+            candidate_last_seen_at=str(candidate_pool_context.get("last_seen_at") or ""),
+            candidate_last_alert_sent_at=str(candidate_pool_context.get("last_alert_sent_at") or ""),
+            candidate_source_decision_id=str(
+                candidate_pool_context.get("latest_candidate_decision_id")
+                or candidate_pool_context.get("latest_prewatch_decision_id")
+                or ""
+            ),
+            candidate_promotion_reason=promotion_reason,
+            recent_candidate_observation_count_72h=recent_observation_count_72h,
             action_label="确认做多" if card.bias == "long" else card.action_label,
             positioning_hint=positioning_hint,
             reason_to_watch=reason_to_watch,
@@ -2519,7 +3360,7 @@ class SatelliteAgentService:
         horizon_settings = self.settings.horizons[card.horizon]
         if promoted_card.market_score < horizon_settings.market_score_threshold:
             return promoted_card
-        bonus = max(self.settings.prewatch_confirmation_bonus, 0.0)
+        bonus = max(self.settings.candidate_confirmation_bonus, 0.0)
         if bonus <= 0:
             return promoted_card
         boosted_final = round(promoted_card.final_score + bonus, 2)
@@ -2534,7 +3375,19 @@ class SatelliteAgentService:
             priority=boosted_priority,
         )
 
-    def _apply_theme_linkage_to_prewatch_candidates(self, candidates: list, *, confirmation_cards: list) -> list:
+    def _apply_prewatch_promotion(self, card, *, insight, prewatch_context: dict | None):
+        return self._apply_candidate_pool_promotion(
+            card,
+            insight=insight,
+            candidate_pool_context=prewatch_context,
+        )
+
+    def _apply_theme_linkage_to_candidate_pool_candidates(
+        self,
+        candidates: list,
+        *,
+        confirmation_cards: list,
+    ) -> list:
         if not candidates or not self.symbol_theme_map:
             return candidates
         recent_theme_memory = self._load_recent_theme_heat_memory()
@@ -2543,7 +3396,7 @@ class SatelliteAgentService:
             for card in confirmation_cards
             if card.priority != "suppressed"
         }
-        prewatch_symbols = {candidate.symbol.upper() for candidate in candidates}
+        candidate_symbols = {candidate.symbol.upper() for candidate in candidates}
         themed_candidates = []
         for candidate in candidates:
             context = summarize_symbol_theme_context(
@@ -2551,16 +3404,16 @@ class SatelliteAgentService:
                 symbol_theme_map=self.symbol_theme_map,
                 theme_memberships=self.theme_memberships,
                 confirmed_symbols=confirmed_symbols,
-                prewatch_symbols=prewatch_symbols,
+                candidate_symbols=candidate_symbols,
             )
             bonus = 0.0
             notes: list[str] = []
             if context["confirmed_peer_symbols"]:
                 bonus += THEME_PREWATCH_CONFIRMED_BONUS
                 notes.append(f"同题材已有确认标的：{', '.join(context['confirmed_peer_symbols'][:3])}")
-            elif context["prewatch_peer_symbols"]:
+            elif context["candidate_peer_symbols"]:
                 bonus += THEME_PREWATCH_CLUSTER_BONUS
-                notes.append(f"同题材预热共振：{', '.join(context['prewatch_peer_symbols'][:3])}")
+                notes.append(f"同题材预热共振：{', '.join(context['candidate_peer_symbols'][:3])}")
             else:
                 recent_theme = self._strongest_recent_theme_for_symbol(
                     candidate.symbol,
@@ -2571,7 +3424,7 @@ class SatelliteAgentService:
                     heat_score = float(entry.get("heat_score", 0.0))
                     memory_bonus = min(
                         max(heat_score, 0.0),
-                        self.settings.prewatch_theme_memory_bonus,
+                        self.settings.candidate_pool_theme_memory_bonus,
                     )
                     if memory_bonus > 0:
                         bonus += memory_bonus
@@ -2594,6 +3447,12 @@ class SatelliteAgentService:
             )
         return themed_candidates
 
+    def _apply_theme_linkage_to_prewatch_candidates(self, candidates: list, *, confirmation_cards: list) -> list:
+        return self._apply_theme_linkage_to_candidate_pool_candidates(
+            candidates,
+            confirmation_cards=confirmation_cards,
+        )
+
     def _recent_theme_scan_bonus(self, symbol: str) -> float:
         recent_theme = self._strongest_recent_theme_for_symbol(
             symbol,
@@ -2604,7 +3463,7 @@ class SatelliteAgentService:
         _, entry = recent_theme
         return min(
             max(float(entry.get("heat_score", 0.0)), 0.0),
-            self.settings.prewatch_theme_memory_scan_bonus,
+            self.settings.candidate_pool_theme_memory_scan_bonus,
         )
 
     def _strongest_recent_theme_for_symbol(
@@ -2622,7 +3481,7 @@ class SatelliteAgentService:
             entry = memory.get(theme_key)
             if entry is None:
                 continue
-            if float(entry.get("heat_score", 0.0)) < self.settings.prewatch_theme_memory_min_heat_score:
+            if float(entry.get("heat_score", 0.0)) < self.settings.candidate_pool_theme_memory_min_heat_score:
                 continue
             if strongest is None or float(entry.get("heat_score", 0.0)) > float(
                 strongest[1].get("heat_score", 0.0)
@@ -2641,7 +3500,7 @@ class SatelliteAgentService:
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             return {}
         age_seconds = (utcnow() - as_of).total_seconds()
-        if age_seconds > max(self.settings.prewatch_theme_memory_window_hours, 0) * 3600:
+        if age_seconds > max(self.settings.candidate_pool_theme_memory_window_hours, 0) * 3600:
             return {}
         memory: dict[str, dict] = {}
         for row in rows:
@@ -2651,11 +3510,12 @@ class SatelliteAgentService:
             memory[theme_key] = {
                 "heat_score": float(row.get("heat_score", 0.0)),
                 "confirmed_symbols": list(row.get("confirmed_symbols", [])),
-                "prewatch_symbols": list(row.get("prewatch_symbols", [])),
+                "candidate_pool_symbols": list(row.get("candidate_pool_symbols", row.get("prewatch_symbols", []))),
+                "prewatch_symbols": list(row.get("prewatch_symbols", row.get("candidate_pool_symbols", []))),
             }
         return memory
 
-    def _persist_theme_heat_memory(self, confirmation_cards: list, prewatch_candidates: list) -> None:
+    def _persist_theme_heat_memory(self, confirmation_cards: list, candidate_pool_candidates: list) -> None:
         if not self.symbol_theme_map:
             self.store.set_state(
                 THEME_MEMORY_STATE_KEY,
@@ -2664,7 +3524,7 @@ class SatelliteAgentService:
             return
         theme_confirmed: dict[str, set[str]] = {}
         theme_promoted: dict[str, set[str]] = {}
-        theme_prewatch: dict[str, set[str]] = {}
+        theme_candidate_pool: dict[str, set[str]] = {}
         for card in confirmation_cards:
             if card.priority == "suppressed":
                 continue
@@ -2673,23 +3533,24 @@ class SatelliteAgentService:
                 theme_confirmed.setdefault(theme_key, set()).add(symbol)
                 if card.promoted_from_prewatch:
                     theme_promoted.setdefault(theme_key, set()).add(symbol)
-        for candidate in prewatch_candidates:
+        for candidate in candidate_pool_candidates:
             symbol = candidate.symbol.upper()
             for theme_key in self.symbol_theme_map.get(symbol, []):
-                theme_prewatch.setdefault(theme_key, set()).add(symbol)
+                theme_candidate_pool.setdefault(theme_key, set()).add(symbol)
         rows = []
-        all_theme_keys = set(theme_confirmed) | set(theme_promoted) | set(theme_prewatch)
+        all_theme_keys = set(theme_confirmed) | set(theme_promoted) | set(theme_candidate_pool)
         for theme_key in sorted(all_theme_keys):
             confirmed_symbols = sorted(theme_confirmed.get(theme_key, set()))
             promoted_symbols = sorted(theme_promoted.get(theme_key, set()))
-            prewatch_symbols = sorted(theme_prewatch.get(theme_key, set()))
-            heat_score = len(promoted_symbols) * 3 + len(confirmed_symbols) * 2 + len(prewatch_symbols)
+            candidate_pool_symbols = sorted(theme_candidate_pool.get(theme_key, set()))
+            heat_score = len(promoted_symbols) * 3 + len(confirmed_symbols) * 2 + len(candidate_pool_symbols)
             rows.append(
                 {
                     "theme_key": theme_key,
                     "heat_score": float(heat_score),
                     "confirmed_symbols": confirmed_symbols,
-                    "prewatch_symbols": prewatch_symbols,
+                    "candidate_pool_symbols": candidate_pool_symbols,
+                    "prewatch_symbols": candidate_pool_symbols,
                 }
             )
         self.store.set_state(
@@ -2842,7 +3703,7 @@ class SatelliteAgentService:
                 ),
                 theme=theme_assessment.theme_chain_note or (f"题材：{' / '.join(theme_assessment.theme_ids)}" if theme_assessment.theme_ids else ""),
                 positioning=(
-                    f"{card.positioning_hint} 此前已进入预备池，当前事件与市场确认形成共振。"
+                    f"{card.positioning_hint} 此前已进入候选池，当前事件与市场确认形成共振。"
                     if card.promoted_from_prewatch
                     else card.positioning_hint
                 ),
@@ -2857,7 +3718,7 @@ class SatelliteAgentService:
             packets.append(
                 DecisionPacket(
                     pool="confirmation",
-                    action=card.action_label,
+                    action=self._resolved_confirmation_action(card),
                     priority=card.priority,
                     confidence=card.confidence_label,
                     symbol=card.symbol,
@@ -2893,7 +3754,7 @@ class SatelliteAgentService:
             updated.append(decision_packet_to_card(packet, card))
         return updated
 
-    def _build_prewatch_decision_packets(
+    def _build_candidate_pool_decision_packets(
         self,
         candidates: list,
         *,
@@ -2907,15 +3768,15 @@ class SatelliteAgentService:
         prewatch_symbols = {candidate.symbol.upper() for candidate in candidates}
         packets: list[DecisionPacket] = []
         for candidate in candidates:
-            theme_assessment = self.theme_engine.assess_prewatch(
+            theme_assessment = self.theme_engine.assess_candidate_pool(
                 candidate,
                 confirmed_symbols=confirmed_symbols,
-                prewatch_symbols=prewatch_symbols,
+                candidate_symbols=prewatch_symbols,
             )
             event_strength = candidate.score if candidate.trigger_mode == "event" else 0.0
             market_strength = candidate.score if candidate.trigger_mode != "event" else 0.0
-            event_assessment = self._synthetic_prewatch_event_assessment(candidate)
-            market_assessment = self._synthetic_prewatch_market_assessment(candidate)
+            event_assessment = self._synthetic_candidate_pool_event_assessment(candidate)
+            market_assessment = self._synthetic_candidate_pool_market_assessment(candidate)
             reason_sections = ReasonSections(
                 event=event_assessment.headline_summary,
                 market=(
@@ -2927,13 +3788,13 @@ class SatelliteAgentService:
             )
             packets.append(
                 DecisionPacket(
-                    pool="prewatch",
-                    action="加入观察" if candidate.trigger_mode == "event" else "试探建仓",
+                    pool="candidate_pool",
+                    action="加入观察",
                     priority="normal",
-                    confidence="中" if candidate.score >= self.settings.prewatch_alert_min_score else "低",
+                    confidence="中" if candidate.score >= self.settings.candidate_optional_alert_min_score else "低",
                     symbol=candidate.symbol,
                     horizon=candidate.horizon,
-                    event_id=f"prewatch:{candidate.symbol}:{candidate.as_of.isoformat()}",
+                    event_id=f"candidate_pool:{candidate.symbol}:{candidate.as_of.isoformat()}",
                     event_assessment=event_assessment,
                     market_assessment=market_assessment,
                     theme_assessment=theme_assessment,
@@ -2950,7 +3811,18 @@ class SatelliteAgentService:
             )
         return packets
 
-    def _synthetic_prewatch_event_assessment(self, candidate) -> object:
+    def _build_prewatch_decision_packets(
+        self,
+        candidates: list,
+        *,
+        confirmation_cards: list,
+    ) -> list[DecisionPacket]:
+        return self._build_candidate_pool_decision_packets(
+            candidates,
+            confirmation_cards=confirmation_cards,
+        )
+
+    def _synthetic_candidate_pool_event_assessment(self, candidate) -> object:
         from .decision_engines.types import EventAssessment
 
         return EventAssessment(
@@ -2965,13 +3837,16 @@ class SatelliteAgentService:
             reason_fragments=[candidate.headline_summary, candidate.reason_to_watch],
             llm_used=False,
             llm_confidence=0.0,
-            event_prewatch_eligible=True,
+            event_candidate_pool_eligible=True,
             headline_summary=candidate.headline_summary,
             source_refs=[],
             risk_notes=[],
         )
 
-    def _synthetic_prewatch_market_assessment(self, candidate) -> object:
+    def _synthetic_prewatch_event_assessment(self, candidate) -> object:
+        return self._synthetic_candidate_pool_event_assessment(candidate)
+
+    def _synthetic_candidate_pool_market_assessment(self, candidate) -> object:
         from .decision_engines.types import MarketAssessment
 
         return MarketAssessment(
@@ -2983,7 +3858,7 @@ class SatelliteAgentService:
             market_confirmation_score=round(candidate.score, 2),
             entry_plan=None,
             risk_flags=[],
-            prewatch_structure_eligible=True,
+            candidate_pool_structure_eligible=True,
             exit_signal_state="hold",
             market_data_complete=True,
             market_data_note="",
@@ -2991,8 +3866,12 @@ class SatelliteAgentService:
             relative_volume=round(candidate.relative_volume, 2),
         )
 
+    def _synthetic_prewatch_market_assessment(self, candidate) -> object:
+        return self._synthetic_candidate_pool_market_assessment(candidate)
+
     def _record_decision_packets(self, packets: list[DecisionPacket], *, run_id: str) -> None:
         for packet in packets:
+            packet_pool = "candidate_pool" if packet.pool in {"candidate_pool", "prewatch"} else packet.pool
             price_plan = packet.price_plan.to_record() if packet.price_plan is not None else {}
             invalidation = (
                 {
@@ -3003,32 +3882,57 @@ class SatelliteAgentService:
                 else {}
             )
             decision_id = hashlib.sha1(
-                f"{run_id}:{packet.pool}:{packet.symbol}:{packet.horizon}:{packet.event_id}:{packet.trigger_mode}".encode("utf-8")
+                f"{run_id}:{packet_pool}:{packet.symbol}:{packet.horizon}:{packet.event_id}:{packet.trigger_mode}".encode("utf-8")
             ).hexdigest()
             packet_record = packet.to_record()
-            if packet.pool == "prewatch":
-                prewatch_state = self._load_recent_prewatch_candidate(packet.symbol) or {}
-                if prewatch_state:
+            packet_record["pool"] = packet_pool
+            if packet_pool == "candidate_pool":
+                candidate_pool_state = self._load_recent_candidate_pool_context(packet.symbol) or {}
+                if candidate_pool_state:
+                    packet_record["candidate_lifecycle"] = {
+                        "observation_count": max(int(candidate_pool_state.get("observation_count") or 1), 1),
+                        "first_seen_at": str(candidate_pool_state.get("first_seen_at") or ""),
+                        "last_seen_at": str(candidate_pool_state.get("last_seen_at") or ""),
+                        "alert_sent_count": max(int(candidate_pool_state.get("alert_sent_count") or 0), 0),
+                        "last_alert_sent_at": str(candidate_pool_state.get("last_alert_sent_at") or ""),
+                    }
                     packet_record["prewatch_lifecycle"] = {
-                        "observation_count": max(int(prewatch_state.get("observation_count") or 1), 1),
-                        "first_seen_at": str(prewatch_state.get("first_seen_at") or ""),
-                        "last_seen_at": str(prewatch_state.get("last_seen_at") or ""),
-                        "alert_sent_count": max(int(prewatch_state.get("alert_sent_count") or 0), 0),
-                        "last_alert_sent_at": str(prewatch_state.get("last_alert_sent_at") or ""),
+                        "observation_count": max(int(candidate_pool_state.get("observation_count") or 1), 1),
+                        "first_seen_at": str(candidate_pool_state.get("first_seen_at") or ""),
+                        "last_seen_at": str(candidate_pool_state.get("last_seen_at") or ""),
+                        "alert_sent_count": max(int(candidate_pool_state.get("alert_sent_count") or 0), 0),
+                        "last_alert_sent_at": str(candidate_pool_state.get("last_alert_sent_at") or ""),
                     }
             elif packet.pool == "confirmation" and packet.trigger_mode == "promoted":
-                prewatch_state = self._load_recent_prewatch_candidate(packet.symbol) or {}
-                if prewatch_state:
+                candidate_pool_state = self._load_recent_candidate_pool_context(packet.symbol) or {}
+                if candidate_pool_state:
                     packet_record["promoted_from_prewatch"] = True
-                    packet_record["prewatch_score"] = round(float(prewatch_state.get("score") or 0.0), 2)
-                    packet_record["prewatch_setup_type"] = str(prewatch_state.get("setup_type") or "")
-                    packet_record["prewatch_observation_count"] = max(int(prewatch_state.get("observation_count") or 1), 1)
-                    packet_record["prewatch_alert_sent_count"] = max(int(prewatch_state.get("alert_sent_count") or 0), 0)
-                    packet_record["prewatch_first_seen_at"] = str(prewatch_state.get("first_seen_at") or "")
-                    packet_record["prewatch_last_seen_at"] = str(prewatch_state.get("last_seen_at") or "")
-                    packet_record["prewatch_last_alert_sent_at"] = str(prewatch_state.get("last_alert_sent_at") or "")
-                    packet_record["source_decision_id"] = str(prewatch_state.get("latest_prewatch_decision_id") or "")
-                    packet_record["prewatch_promotion_reason"] = self._build_prewatch_promotion_reason(prewatch_state)
+                    packet_record["candidate_score"] = round(float(candidate_pool_state.get("score") or 0.0), 2)
+                    packet_record["candidate_setup_type"] = str(candidate_pool_state.get("setup_type") or "")
+                    packet_record["candidate_observation_count"] = max(int(candidate_pool_state.get("observation_count") or 1), 1)
+                    packet_record["candidate_alert_sent_count"] = max(int(candidate_pool_state.get("alert_sent_count") or 0), 0)
+                    packet_record["candidate_first_seen_at"] = str(candidate_pool_state.get("first_seen_at") or "")
+                    packet_record["candidate_last_seen_at"] = str(candidate_pool_state.get("last_seen_at") or "")
+                    packet_record["candidate_last_alert_sent_at"] = str(candidate_pool_state.get("last_alert_sent_at") or "")
+                    packet_record["candidate_source_decision_id"] = str(
+                        candidate_pool_state.get("latest_candidate_decision_id")
+                        or candidate_pool_state.get("latest_prewatch_decision_id")
+                        or ""
+                    )
+                    packet_record["candidate_promotion_reason"] = self._build_candidate_pool_promotion_reason(candidate_pool_state)
+                    packet_record["prewatch_score"] = round(float(candidate_pool_state.get("score") or 0.0), 2)
+                    packet_record["prewatch_setup_type"] = str(candidate_pool_state.get("setup_type") or "")
+                    packet_record["prewatch_observation_count"] = max(int(candidate_pool_state.get("observation_count") or 1), 1)
+                    packet_record["prewatch_alert_sent_count"] = max(int(candidate_pool_state.get("alert_sent_count") or 0), 0)
+                    packet_record["prewatch_first_seen_at"] = str(candidate_pool_state.get("first_seen_at") or "")
+                    packet_record["prewatch_last_seen_at"] = str(candidate_pool_state.get("last_seen_at") or "")
+                    packet_record["prewatch_last_alert_sent_at"] = str(candidate_pool_state.get("last_alert_sent_at") or "")
+                    packet_record["source_decision_id"] = str(
+                        candidate_pool_state.get("latest_candidate_decision_id")
+                        or candidate_pool_state.get("latest_prewatch_decision_id")
+                        or ""
+                    )
+                    packet_record["prewatch_promotion_reason"] = self._build_candidate_pool_promotion_reason(candidate_pool_state)
             packet_record["strategy_version"] = self.strategy_version
             self.store.save_decision_record(
                 decision_id=decision_id,
@@ -3036,7 +3940,7 @@ class SatelliteAgentService:
                 event_id=packet.event_id,
                 symbol=packet.symbol,
                 event_type=packet.event_assessment.event_type,
-                pool=packet.pool,
+                pool=packet_pool,
                 action=packet.action,
                 priority=packet.priority,
                 confidence=packet.confidence,
@@ -3053,8 +3957,8 @@ class SatelliteAgentService:
                 packet=packet_record,
                 created_at=utcnow().isoformat(),
             )
-            if packet.pool == "prewatch":
-                self._record_prewatch_decision_reference(
+            if packet_pool == "candidate_pool":
+                self._record_candidate_pool_decision_reference(
                     symbol=packet.symbol,
                     decision_id=decision_id,
                     event_id=packet.event_id,
@@ -3093,7 +3997,13 @@ class SatelliteAgentService:
         for card in cards:
             outcome = "selected"
             reason = "confirmation_opportunity"
-            if not getattr(card, "execution_eligible", True):
+            if bool(getattr(card, "downgraded_from_formal", False)):
+                outcome = "not_selected"
+                reason = "formal_downgraded_to_watch_unentered"
+            elif str(getattr(card, "delivery_category", "") or "").strip() == "watch":
+                outcome = "not_selected"
+                reason = "candidate_watch"
+            elif not getattr(card, "execution_eligible", True):
                 outcome = "rejected"
                 reason = "execution_ineligible"
             elif card.priority == "suppressed":

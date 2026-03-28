@@ -21,6 +21,14 @@ def _resolve_default_path(preferred: Path, legacy: Path) -> Path:
     return legacy
 
 
+def _env_first(*keys: str, default: str) -> str:
+    for key in keys:
+        value = os.getenv(key)
+        if value is not None:
+            return value
+    return default
+
+
 def _load_local_env_file(path: Path) -> None:
     if not path.exists():
         return
@@ -142,6 +150,94 @@ class Settings:
         }
     )
 
+    @property
+    def candidate_pool_min_score(self) -> float:
+        return self.prewatch_min_score
+
+    @property
+    def max_candidate_pool_candidates_per_run(self) -> int:
+        return self.max_prewatch_candidates_per_run
+
+    @property
+    def max_candidate_pool_scan_symbols_per_run(self) -> int:
+        return self.max_prewatch_scan_symbols_per_run
+
+    @property
+    def candidate_optional_alert_min_score(self) -> float:
+        return self.prewatch_alert_min_score
+
+    @property
+    def max_candidate_optional_alerts_per_run(self) -> int:
+        return self.max_prewatch_alerts_per_run
+
+    @property
+    def candidate_optional_alert_cooldown_minutes(self) -> int:
+        return self.prewatch_alert_cooldown_minutes
+
+    @property
+    def candidate_optional_alert_repeat_window_minutes(self) -> int:
+        return self.prewatch_alert_repeat_window_minutes
+
+    @property
+    def candidate_optional_alert_repeat_min_score_delta(self) -> float:
+        return self.prewatch_alert_repeat_min_score_delta
+
+    @property
+    def candidate_pool_failure_cooldown_minutes(self) -> int:
+        return self.prewatch_failure_cooldown_minutes
+
+    @property
+    def candidate_pool_concurrency(self) -> int:
+        return self.prewatch_concurrency
+
+    @property
+    def candidate_pool_theme_relaxed_margin(self) -> float:
+        return self.prewatch_theme_relaxed_margin
+
+    @property
+    def candidate_pool_theme_memory_window_hours(self) -> int:
+        return self.prewatch_theme_memory_window_hours
+
+    @property
+    def candidate_pool_theme_memory_bonus(self) -> float:
+        return self.prewatch_theme_memory_bonus
+
+    @property
+    def candidate_pool_theme_memory_scan_bonus(self) -> float:
+        return self.prewatch_theme_memory_scan_bonus
+
+    @property
+    def candidate_pool_theme_memory_min_heat_score(self) -> float:
+        return self.prewatch_theme_memory_min_heat_score
+
+    @property
+    def candidate_pool_event_trigger_min_event_score(self) -> float:
+        return self.prewatch_event_trigger_min_event_score
+
+    @property
+    def candidate_pool_event_min_score(self) -> float:
+        return self.prewatch_event_min_score
+
+    @property
+    def candidate_pool_event_bonus_cap(self) -> float:
+        return self.prewatch_event_bonus_cap
+
+    @property
+    def max_event_candidate_pool_symbols_per_theme_per_run(self) -> int:
+        return self.max_event_prewatch_symbols_per_theme_per_run
+
+    @property
+    def candidate_pool_promotion_window_hours(self) -> int:
+        return self.prewatch_promotion_window_hours
+
+    @property
+    def candidate_confirmation_min_event_score(self) -> float:
+        return self.prewatch_confirmation_min_event_score
+
+    @property
+    def candidate_confirmation_bonus(self) -> float:
+        return self.prewatch_confirmation_bonus
+
     @classmethod
     def from_env(cls) -> "Settings":
         db_path = Path(os.getenv("SATELLITE_DB_PATH", str(_resolve_default_path(DEFAULT_DB_PATH, LEGACY_DB_PATH))))
@@ -173,67 +269,151 @@ class Settings:
             event_only_alert_min_event_score=float(
                 os.getenv("SATELLITE_EVENT_ONLY_ALERT_MIN_EVENT_SCORE", "78")
             ),
-            prewatch_min_score=float(os.getenv("SATELLITE_PREWATCH_MIN_SCORE", "60")),
+            prewatch_min_score=float(
+                _env_first("SATELLITE_CANDIDATE_POOL_MIN_SCORE", "SATELLITE_PREWATCH_MIN_SCORE", default="60")
+            ),
             max_prewatch_candidates_per_run=int(
-                os.getenv("SATELLITE_MAX_PREWATCH_CANDIDATES_PER_RUN", "8")
+                _env_first(
+                    "SATELLITE_MAX_CANDIDATE_POOL_CANDIDATES_PER_RUN",
+                    "SATELLITE_MAX_PREWATCH_CANDIDATES_PER_RUN",
+                    default="8",
+                )
             ),
             max_prewatch_scan_symbols_per_run=int(
-                os.getenv("SATELLITE_MAX_PREWATCH_SCAN_SYMBOLS_PER_RUN", "24")
+                _env_first(
+                    "SATELLITE_MAX_CANDIDATE_POOL_SCAN_SYMBOLS_PER_RUN",
+                    "SATELLITE_MAX_PREWATCH_SCAN_SYMBOLS_PER_RUN",
+                    default="24",
+                )
             ),
             prewatch_alert_min_score=float(
-                os.getenv("SATELLITE_PREWATCH_ALERT_MIN_SCORE", "78")
+                _env_first(
+                    "SATELLITE_CANDIDATE_OPTIONAL_ALERT_MIN_SCORE",
+                    "SATELLITE_PREWATCH_ALERT_MIN_SCORE",
+                    default="78",
+                )
             ),
             max_prewatch_alerts_per_run=int(
-                os.getenv("SATELLITE_MAX_PREWATCH_ALERTS_PER_RUN", "2")
+                _env_first(
+                    "SATELLITE_MAX_CANDIDATE_OPTIONAL_ALERTS_PER_RUN",
+                    "SATELLITE_MAX_PREWATCH_ALERTS_PER_RUN",
+                    default="2",
+                )
             ),
             prewatch_alert_cooldown_minutes=int(
-                os.getenv("SATELLITE_PREWATCH_ALERT_COOLDOWN_MINUTES", "240")
+                _env_first(
+                    "SATELLITE_CANDIDATE_OPTIONAL_ALERT_COOLDOWN_MINUTES",
+                    "SATELLITE_PREWATCH_ALERT_COOLDOWN_MINUTES",
+                    default="240",
+                )
             ),
             prewatch_alert_repeat_window_minutes=int(
-                os.getenv("SATELLITE_PREWATCH_ALERT_REPEAT_WINDOW_MINUTES", "720")
+                _env_first(
+                    "SATELLITE_CANDIDATE_OPTIONAL_ALERT_REPEAT_WINDOW_MINUTES",
+                    "SATELLITE_PREWATCH_ALERT_REPEAT_WINDOW_MINUTES",
+                    default="720",
+                )
             ),
             prewatch_alert_repeat_min_score_delta=float(
-                os.getenv("SATELLITE_PREWATCH_ALERT_REPEAT_MIN_SCORE_DELTA", "4")
+                _env_first(
+                    "SATELLITE_CANDIDATE_OPTIONAL_ALERT_REPEAT_MIN_SCORE_DELTA",
+                    "SATELLITE_PREWATCH_ALERT_REPEAT_MIN_SCORE_DELTA",
+                    default="4",
+                )
             ),
             prewatch_failure_cooldown_minutes=int(
-                os.getenv("SATELLITE_PREWATCH_FAILURE_COOLDOWN_MINUTES", "90")
+                _env_first(
+                    "SATELLITE_CANDIDATE_POOL_FAILURE_COOLDOWN_MINUTES",
+                    "SATELLITE_PREWATCH_FAILURE_COOLDOWN_MINUTES",
+                    default="90",
+                )
             ),
-            prewatch_concurrency=int(os.getenv("SATELLITE_PREWATCH_CONCURRENCY", "8")),
+            prewatch_concurrency=int(
+                _env_first("SATELLITE_CANDIDATE_POOL_CONCURRENCY", "SATELLITE_PREWATCH_CONCURRENCY", default="8")
+            ),
             prewatch_theme_relaxed_margin=float(
-                os.getenv("SATELLITE_PREWATCH_THEME_RELAXED_MARGIN", "6")
+                _env_first(
+                    "SATELLITE_CANDIDATE_POOL_THEME_RELAXED_MARGIN",
+                    "SATELLITE_PREWATCH_THEME_RELAXED_MARGIN",
+                    default="6",
+                )
             ),
             prewatch_theme_memory_window_hours=int(
-                os.getenv("SATELLITE_PREWATCH_THEME_MEMORY_WINDOW_HOURS", "36")
+                _env_first(
+                    "SATELLITE_CANDIDATE_POOL_THEME_MEMORY_WINDOW_HOURS",
+                    "SATELLITE_PREWATCH_THEME_MEMORY_WINDOW_HOURS",
+                    default="36",
+                )
             ),
             prewatch_theme_memory_bonus=float(
-                os.getenv("SATELLITE_PREWATCH_THEME_MEMORY_BONUS", "3")
+                _env_first(
+                    "SATELLITE_CANDIDATE_POOL_THEME_MEMORY_BONUS",
+                    "SATELLITE_PREWATCH_THEME_MEMORY_BONUS",
+                    default="3",
+                )
             ),
             prewatch_theme_memory_scan_bonus=float(
-                os.getenv("SATELLITE_PREWATCH_THEME_MEMORY_SCAN_BONUS", "4")
+                _env_first(
+                    "SATELLITE_CANDIDATE_POOL_THEME_MEMORY_SCAN_BONUS",
+                    "SATELLITE_PREWATCH_THEME_MEMORY_SCAN_BONUS",
+                    default="4",
+                )
             ),
             prewatch_theme_memory_min_heat_score=float(
-                os.getenv("SATELLITE_PREWATCH_THEME_MEMORY_MIN_HEAT_SCORE", "4")
+                _env_first(
+                    "SATELLITE_CANDIDATE_POOL_THEME_MEMORY_MIN_HEAT_SCORE",
+                    "SATELLITE_PREWATCH_THEME_MEMORY_MIN_HEAT_SCORE",
+                    default="4",
+                )
             ),
             prewatch_event_trigger_min_event_score=float(
-                os.getenv("SATELLITE_PREWATCH_EVENT_TRIGGER_MIN_EVENT_SCORE", "76")
+                _env_first(
+                    "SATELLITE_CANDIDATE_POOL_EVENT_TRIGGER_MIN_EVENT_SCORE",
+                    "SATELLITE_PREWATCH_EVENT_TRIGGER_MIN_EVENT_SCORE",
+                    default="76",
+                )
             ),
             prewatch_event_min_score=float(
-                os.getenv("SATELLITE_PREWATCH_EVENT_MIN_SCORE", "54")
+                _env_first(
+                    "SATELLITE_CANDIDATE_POOL_EVENT_MIN_SCORE",
+                    "SATELLITE_PREWATCH_EVENT_MIN_SCORE",
+                    default="54",
+                )
             ),
             prewatch_event_bonus_cap=float(
-                os.getenv("SATELLITE_PREWATCH_EVENT_BONUS_CAP", "10")
+                _env_first(
+                    "SATELLITE_CANDIDATE_POOL_EVENT_BONUS_CAP",
+                    "SATELLITE_PREWATCH_EVENT_BONUS_CAP",
+                    default="10",
+                )
             ),
             max_event_prewatch_symbols_per_theme_per_run=int(
-                os.getenv("SATELLITE_MAX_EVENT_PREWATCH_SYMBOLS_PER_THEME_PER_RUN", "2")
+                _env_first(
+                    "SATELLITE_MAX_EVENT_CANDIDATE_POOL_SYMBOLS_PER_THEME_PER_RUN",
+                    "SATELLITE_MAX_EVENT_PREWATCH_SYMBOLS_PER_THEME_PER_RUN",
+                    default="2",
+                )
             ),
             prewatch_promotion_window_hours=int(
-                os.getenv("SATELLITE_PREWATCH_PROMOTION_WINDOW_HOURS", "72")
+                _env_first(
+                    "SATELLITE_CANDIDATE_POOL_PROMOTION_WINDOW_HOURS",
+                    "SATELLITE_PREWATCH_PROMOTION_WINDOW_HOURS",
+                    default="72",
+                )
             ),
             prewatch_confirmation_min_event_score=float(
-                os.getenv("SATELLITE_PREWATCH_CONFIRMATION_MIN_EVENT_SCORE", "74")
+                _env_first(
+                    "SATELLITE_CANDIDATE_CONFIRMATION_MIN_EVENT_SCORE",
+                    "SATELLITE_PREWATCH_CONFIRMATION_MIN_EVENT_SCORE",
+                    default="74",
+                )
             ),
             prewatch_confirmation_bonus=float(
-                os.getenv("SATELLITE_PREWATCH_CONFIRMATION_BONUS", "2")
+                _env_first(
+                    "SATELLITE_CANDIDATE_CONFIRMATION_BONUS",
+                    "SATELLITE_PREWATCH_CONFIRMATION_BONUS",
+                    default="2",
+                )
             ),
             feishu_webhook=os.getenv("SATELLITE_FEISHU_WEBHOOK", ""),
             openai_api_key=os.getenv("SATELLITE_OPENAI_API_KEY", ""),
@@ -341,27 +521,49 @@ class Settings:
             "max_alerts_per_symbol_per_run": self.max_alerts_per_symbol_per_run,
             "normal_alert_min_final_score": self.normal_alert_min_final_score,
             "event_only_alert_min_event_score": self.event_only_alert_min_event_score,
+            "candidate_pool_min_score": self.candidate_pool_min_score,
             "prewatch_min_score": self.prewatch_min_score,
+            "max_candidate_pool_candidates_per_run": self.max_candidate_pool_candidates_per_run,
             "max_prewatch_candidates_per_run": self.max_prewatch_candidates_per_run,
+            "max_candidate_pool_scan_symbols_per_run": self.max_candidate_pool_scan_symbols_per_run,
             "max_prewatch_scan_symbols_per_run": self.max_prewatch_scan_symbols_per_run,
+            "candidate_optional_alert_min_score": self.candidate_optional_alert_min_score,
             "prewatch_alert_min_score": self.prewatch_alert_min_score,
+            "max_candidate_optional_alerts_per_run": self.max_candidate_optional_alerts_per_run,
             "max_prewatch_alerts_per_run": self.max_prewatch_alerts_per_run,
+            "candidate_optional_alert_cooldown_minutes": self.candidate_optional_alert_cooldown_minutes,
             "prewatch_alert_cooldown_minutes": self.prewatch_alert_cooldown_minutes,
+            "candidate_optional_alert_repeat_window_minutes": self.candidate_optional_alert_repeat_window_minutes,
             "prewatch_alert_repeat_window_minutes": self.prewatch_alert_repeat_window_minutes,
+            "candidate_optional_alert_repeat_min_score_delta": self.candidate_optional_alert_repeat_min_score_delta,
             "prewatch_alert_repeat_min_score_delta": self.prewatch_alert_repeat_min_score_delta,
+            "candidate_pool_failure_cooldown_minutes": self.candidate_pool_failure_cooldown_minutes,
             "prewatch_failure_cooldown_minutes": self.prewatch_failure_cooldown_minutes,
+            "candidate_pool_concurrency": self.candidate_pool_concurrency,
             "prewatch_concurrency": self.prewatch_concurrency,
+            "candidate_pool_theme_relaxed_margin": self.candidate_pool_theme_relaxed_margin,
             "prewatch_theme_relaxed_margin": self.prewatch_theme_relaxed_margin,
+            "candidate_pool_theme_memory_window_hours": self.candidate_pool_theme_memory_window_hours,
             "prewatch_theme_memory_window_hours": self.prewatch_theme_memory_window_hours,
+            "candidate_pool_theme_memory_bonus": self.candidate_pool_theme_memory_bonus,
             "prewatch_theme_memory_bonus": self.prewatch_theme_memory_bonus,
+            "candidate_pool_theme_memory_scan_bonus": self.candidate_pool_theme_memory_scan_bonus,
             "prewatch_theme_memory_scan_bonus": self.prewatch_theme_memory_scan_bonus,
+            "candidate_pool_theme_memory_min_heat_score": self.candidate_pool_theme_memory_min_heat_score,
             "prewatch_theme_memory_min_heat_score": self.prewatch_theme_memory_min_heat_score,
+            "candidate_pool_event_trigger_min_event_score": self.candidate_pool_event_trigger_min_event_score,
             "prewatch_event_trigger_min_event_score": self.prewatch_event_trigger_min_event_score,
+            "candidate_pool_event_min_score": self.candidate_pool_event_min_score,
             "prewatch_event_min_score": self.prewatch_event_min_score,
+            "candidate_pool_event_bonus_cap": self.candidate_pool_event_bonus_cap,
             "prewatch_event_bonus_cap": self.prewatch_event_bonus_cap,
+            "max_event_candidate_pool_symbols_per_theme_per_run": self.max_event_candidate_pool_symbols_per_theme_per_run,
             "max_event_prewatch_symbols_per_theme_per_run": self.max_event_prewatch_symbols_per_theme_per_run,
+            "candidate_pool_promotion_window_hours": self.candidate_pool_promotion_window_hours,
             "prewatch_promotion_window_hours": self.prewatch_promotion_window_hours,
+            "candidate_confirmation_min_event_score": self.candidate_confirmation_min_event_score,
             "prewatch_confirmation_min_event_score": self.prewatch_confirmation_min_event_score,
+            "candidate_confirmation_bonus": self.candidate_confirmation_bonus,
             "prewatch_confirmation_bonus": self.prewatch_confirmation_bonus,
             "feishu_webhook_configured": bool(self.feishu_webhook),
             "openai_model": self.openai_model,

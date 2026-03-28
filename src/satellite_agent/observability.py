@@ -19,6 +19,14 @@ if not LOGGER.handlers:
 LOGGER.setLevel(logging.INFO)
 
 
+def _with_legacy_run_metric_aliases(payload: dict[str, int]) -> dict[str, int]:
+    merged = dict(payload)
+    merged["prewatch_candidates"] = int(payload.get("candidate_pool_count", 0))
+    merged["prewatch_alerts_sent"] = int(payload.get("candidate_optional_alerts_sent_count", 0))
+    merged["prewatch_failures"] = int(payload.get("candidate_pool_failures", 0))
+    return merged
+
+
 @dataclass
 class RunMetrics:
     source_health_failures: int = 0
@@ -27,9 +35,9 @@ class RunMetrics:
     events_processed: int = 0
     cards_generated: int = 0
     alerts_sent: int = 0
-    prewatch_candidates: int = 0
-    prewatch_alerts_sent: int = 0
-    prewatch_failures: int = 0
+    candidate_pool_count: int = 0
+    candidate_optional_alerts_sent_count: int = 0
+    candidate_pool_failures: int = 0
     skipped_out_of_watchlist: int = 0
     skipped_cross_source_duplicate: int = 0
     skipped_duplicate_event_id: int = 0
@@ -41,17 +49,41 @@ class RunMetrics:
     scoring_failures: int = 0
     notification_failures: int = 0
 
+    @property
+    def prewatch_candidates(self) -> int:
+        return self.candidate_pool_count
+
+    @prewatch_candidates.setter
+    def prewatch_candidates(self, value: int) -> None:
+        self.candidate_pool_count = int(value)
+
+    @property
+    def prewatch_alerts_sent(self) -> int:
+        return self.candidate_optional_alerts_sent_count
+
+    @prewatch_alerts_sent.setter
+    def prewatch_alerts_sent(self, value: int) -> None:
+        self.candidate_optional_alerts_sent_count = int(value)
+
+    @property
+    def prewatch_failures(self) -> int:
+        return self.candidate_pool_failures
+
+    @prewatch_failures.setter
+    def prewatch_failures(self, value: int) -> None:
+        self.candidate_pool_failures = int(value)
+
     def as_dict(self) -> dict[str, int]:
-        return {
+        return _with_legacy_run_metric_aliases({
             "source_health_failures": self.source_health_failures,
             "source_fetch_failures": self.source_fetch_failures,
             "events_fetched": self.events_fetched,
             "events_processed": self.events_processed,
             "cards_generated": self.cards_generated,
             "alerts_sent": self.alerts_sent,
-            "prewatch_candidates": self.prewatch_candidates,
-            "prewatch_alerts_sent": self.prewatch_alerts_sent,
-            "prewatch_failures": self.prewatch_failures,
+            "candidate_pool_count": self.candidate_pool_count,
+            "candidate_optional_alerts_sent_count": self.candidate_optional_alerts_sent_count,
+            "candidate_pool_failures": self.candidate_pool_failures,
             "skipped_out_of_watchlist": self.skipped_out_of_watchlist,
             "skipped_cross_source_duplicate": self.skipped_cross_source_duplicate,
             "skipped_duplicate_event_id": self.skipped_duplicate_event_id,
@@ -62,7 +94,7 @@ class RunMetrics:
             "market_data_failures": self.market_data_failures,
             "scoring_failures": self.scoring_failures,
             "notification_failures": self.notification_failures,
-        }
+        })
 
 
 @dataclass
